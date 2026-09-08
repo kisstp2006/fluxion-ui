@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: BSL-1.0
+
+.{
+    .name = .fluxion_ui,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x50b56cb5b3160e97,
+    .dependencies = .{
+        // The library's one dependency, and it is one type deep: `Vec2`, for
+        // a point. A layout is arithmetic, and this is the package whose job
+        // that is.
+        .fluxion_math = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-math#92afdbddbf930369265d24136402c7eb5dd8f70e",
+            .hash = "fluxion_math-0.1.0-dfpZBeNUBAAwUMriLKaOTRBWGFmfY53_jyYuMUxkPYek",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+        "LICENSE",
+    },
+}
