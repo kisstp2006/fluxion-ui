@@ -613,29 +613,55 @@ problem.
 
 ## What is here, and what is not
 
-Ported and tested:
+Checked against Ply's own declaration surface - `ElementBuilder`,
+`LayoutBuilder`, `OverflowBuilder`, and the methods on `Ply` itself - rather
+than from memory.
 
-- Text: styling, measuring through a `Measurer`, word wrapping, hard newlines, per-line alignment
-- Sizing: fit, grow with weights, fixed, percent, ratio, with minima and maxima
-- `contain` and `cover`, holding a box to an aspect ratio inside its slot
-- Direction, padding, gaps, and alignment on both axes
-- The element tree, and a stable number per element for state to hang off
-- Rectangles, corner radii, borders, and the command list they come out as
-- Clipping and scrolling, with the position remembered between frames
-- Hit testing, hover, press and focus, with capture and clip-aware picking
-- Scrollbars, with a draggable thumb and an optional fade
-- Text input: selection, undo, word movement, click and drag, password, multiline
-- Rich text markup, drawn and edited: colour, opacity, hide, shadow
-- An optional renderer over Fluxion RHI: one instanced draw, an SDF for the shapes, a glyph atlas for the text
+### Here
 
-Not yet, in the order it is worth doing:
-
-| | Why it is not here |
+| | |
 | --- | --- |
-| **Floating elements, wrapping, shaders, images** | Ply has all of these. They sit above the core rather than inside it. |
-| **Animated text styles** | Ply's `wave`, `jitter`, `pulse`, `swing`, `type`, `fade`, `scale`, `transform`, `gradient`. Every one moves or resizes single glyphs, and a render command here describes a run rather than a glyph. They belong with rotation and effects. |
+| **Sizing** | `fit`, `grow` with weights, `fixed`, `percent`, `ratio`, with minima and maxima |
+| **Layout** | direction, padding, gaps, alignment on both axes, `contain` and `cover` |
+| **Painting** | background colours, corner radii, borders on any side with three positions, z-index |
+| **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
+| **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
+| **Clipping and scrolling** | per axis, with the position remembered between frames and clamped when the content shrinks |
+| **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
+| **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, and clip-aware picking |
+| **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup |
+| **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text |
+
+### Only in Ply
+
+Everything below is something Ply does and this does not. The order is roughly
+the order it is worth doing in.
+
+| | What it is, and what it needs |
+| --- | --- |
+| **Floating elements** | `.floating(...)`: an element positioned against another one rather than laid out in the flow, with an anchor pair, an offset, a z-index, and a choice of what to attach to. Menus, tooltips, dropdowns and dialogs are all this one feature. |
+| **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus`, `on_unfocus`. Everything but the focus pair can be had today by asking - `hovered()`, `justReleased()` - so this is about the shape of the API, not about what it can do. |
+| **Wrapping** | `.layout(\|l\| l.wrap())` and `wrap_gap`: children that run onto a second row when they do not fit. A tag list, a toolbar, a gallery. |
+| **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
+| **Images** | `.image(...)`, and TinyVG in Ply. The command list has an `Image` variant already; nothing fills it in. |
+| **Rotation** | `rotate_visual` and `rotate_shape`, with degrees or radians, a pivot, and flips. A render command here has no transform on it. |
+| **Shaders and effects** | `.effect(...)` and `.shader(...)`, per element, and Ply's own shader build step. |
+| **Animated text styles** | `wave`, `jitter`, `pulse`, `swing`, `type`, `fade`, `scale`, `transform`, `gradient`. Every one moves or resizes single glyphs, and a command here describes a run rather than a glyph - so these come with rotation and effects, not before them. |
+| **Drag scrolling** | Dragging the content itself, with momentum, a decay curve and a smoothing filter. This scrolls by wheel, by `scrollBy`, and by the scrollbar. Ply's `no_drag_scroll` exists to turn the thing off that is not here. |
+| **Smooth scrolling** | Ply animates towards a target position over a duration. Here a scroll position is a number, and it changes when something changes it. |
+| **`between_children` borders** | A line drawn between one child and the next, without an element per separator. |
+| **Easing and lerp** | Ply's `easing.rs` and `lerp.rs`: a curve library and a "move this towards that" helper, for animating anything. |
+| **The mouse cursor** | `set_cursor` / `get_cursor`, so hovering a text input gives an I-beam. A layout library can say *which* cursor; putting it on the screen is the window layer's. |
+| **A debug view** | `set_debug_mode`: Ply draws the tree beside the interface with every box and its numbers. |
+| **Culling** | `set_culling`: dropping commands that fall outside the surface before they reach the renderer. |
+| **A measure cache** | Ply remembers the width of words it has measured. This measures every time, which is the same answer more slowly. |
 | **Input methods** | Composing Japanese or Chinese needs preedit events this library never sees. `text_input.Action` has room for them. |
-| **Accessibility, networking, audio, storage** | Deliberately out of scope. Ply's are bound to its own subsystems, and this library builds on the fluxion ones. |
+| **Accessibility, networking, audio, storage, jobs** | Out of scope by decision, not by accident. Ply's are bound to its own subsystems; these belong to the fluxion ones. |
+
+Two deliberate departures worth knowing about, both explained where they are
+made: [colours are 0..1 floats](#colour) rather than Ply's 0..255, and the
+keyboard reaches a text input as [an action rather than a
+key](#the-keyboard-is-the-programs).
 
 A container too small for its fixed children still overflows rather than
 squeezing them, which is the right answer: a silent squeeze hides the problem,
