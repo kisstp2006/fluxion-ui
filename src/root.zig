@@ -60,6 +60,8 @@ pub const Border = layout.Border;
 pub const BorderWidth = layout.BorderWidth;
 pub const BorderPosition = layout.BorderPosition;
 pub const SlotFit = layout.SlotFit;
+pub const Clip = layout.Clip;
+pub const Scrollbar = layout.Scrollbar;
 
 pub const AlignX = geometry.AlignX;
 pub const AlignY = geometry.AlignY;

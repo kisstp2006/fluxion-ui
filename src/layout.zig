@@ -320,6 +320,32 @@ pub const BorderWidth = extern struct {
 /// which is why the middle one is `middle` rather than `center`.
 pub const BorderPosition = enum { outside, middle, inside };
 
+/// The bar drawn down the edge of a scroll container.
+///
+/// Ply's `ScrollbarConfig`, defaults and all, and the defaults are the whole
+/// design: a six pixel half-transparent grey overlay that sits on top of the
+/// content rather than taking room from it. Turning it on is one word -
+/// `.scrollbar = .{}` - and everything below has an answer already.
+pub const Scrollbar = struct {
+    /// How thick the bar is. Ply clamps this to at least one pixel and so
+    /// does the geometry, so a zero here draws a hairline rather than
+    /// nothing.
+    width: f32 = 6,
+    /// The thumb's rounding. Half the width gives the usual lozenge.
+    corner_radius: f32 = 3,
+    /// The part that moves.
+    thumb_color: Color = .bytes(128, 128, 128, 128),
+    /// The groove behind it, or null for none - which is the default, and is
+    /// what makes the bar an overlay rather than a gutter.
+    track_color: ?Color = null,
+    /// How short the thumb may get. Without a floor, a long enough document
+    /// gives a thumb of half a pixel that nobody can grab.
+    min_thumb_size: f32 = 20,
+    /// Fade the bar out after this many still frames, or null to leave it
+    /// showing. See `Ui.visibility` for the fade itself.
+    hide_after_frames: ?u32 = null,
+};
+
 /// What happens to content larger than the element holding it.
 ///
 /// Ply spells this with an `OverflowBuilder` - `clip()`, `scroll_y()`,
@@ -360,6 +386,14 @@ pub const Clip = struct {
     /// declares `.clip = .scrollY` and never touches it.
     offset: geometry.Vec2 = .{ .x = 0, .y = 0 },
 
+    /// Whether to draw a scrollbar, and what it looks like. Null for none,
+    /// which is Ply's default too - a container scrolls by wheel and by drag
+    /// whether or not anything is drawn down its edge.
+    ///
+    /// Only ever shown on an axis that both scrolls *and* overflows, so
+    /// turning it on for a list that turns out to be short costs nothing.
+    scrollbar: ?Scrollbar = null,
+
     pub const none: Clip = .{};
 
     /// Ply's `clip_x()`, `clip_y()`, `clip()`.
@@ -392,6 +426,20 @@ pub const Clip = struct {
     /// Whether it scrolls at all, and so needs its position remembered.
     pub inline fn scrolls(self: Clip) bool {
         return self.scroll_x or self.scroll_y;
+    }
+
+    /// The same clip with a scrollbar on it. Ply's
+    /// `.overflow(|o| o.scroll().scrollbar(|s| s))`, and written the same way
+    /// round: the scrolling is decided first and the bar is dressing on top.
+    ///
+    /// ```zig
+    /// .clip = Clip.scrollY.bar(.{}),
+    /// .clip = Clip.scroll.bar(.{ .width = 10, .track_color = .hex(0x202020) }),
+    /// ```
+    pub inline fn bar(self: Clip, config: Scrollbar) Clip {
+        var with = self;
+        with.scrollbar = config;
+        return with;
     }
 };
 

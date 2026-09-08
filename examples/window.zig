@@ -48,8 +48,8 @@ const body =
     "One instanced draw for the whole frame. Every rectangle, every border " ++
     "and every glyph is the same unit quad under a different set of numbers, " ++
     "and the fragment shader decides what it is looking at. The list on the " ++
-    "left scrolls with the wheel, and is clipped by a scissor rectangle that " ++
-    "breaks the batch in two.";
+    "left scrolls with the wheel or by dragging its bar, and is clipped by a " ++
+    "scissor rectangle that breaks the batch in two.";
 
 fn shell(u: *Ui, size: ui.Dimensions) void {
     u.open(.{
@@ -113,7 +113,15 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                 .height = .grow,
                 .gap = 6,
                 .direction = .top_to_bottom,
-                .clip = .scrollY,
+                // A bar down the right, in the theme's own ink rather than
+                // the grey the defaults give. It shows itself while the list
+                // is moving and fades out a couple of seconds after it
+                // stops, which is what `hide_after_frames` counts - in
+                // frames, because a layout library is never told the rate.
+                .clip = ui.layout.Clip.scrollY.bar(.{
+                    .thumb_color = .hexa(0x6E7681B0),
+                    .hide_after_frames = 120,
+                }),
             });
             defer u.close();
 
@@ -609,4 +617,95 @@ test "text reaches the pixels too" {
     }
     try testing.expect(lit > 200);
     try testing.expect(lit < 256 * 64 / 2);
+}
+
+test "the scrollbar reaches the pixels, and moves when the list does" {
+    // The layout tests say where the thumb goes; this one says it arrives.
+    // A rectangle emitted outside the batch the scissor split, or drawn in a
+    // colour the shader never sampled, passes every test but this one.
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    var window = Window.open(64, 64, false, true) catch |err|
+        if (Window.isAbsent(err)) return error.SkipZigTest else return err;
+    defer window.close();
+
+    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .gl = window.hooks() }) catch
+        return error.SkipZigTest;
+    defer device.deinit();
+
+    const target = try device.createTexture(.{
+        .width = 128,
+        .height = 128,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    var measured: Measured = .{ .face = try .init(bytes) };
+    var renderer: render.Renderer = try .init(testing.allocator, &device, &measured.face);
+    defer renderer.deinit();
+
+    const size: ui.Dimensions = .init(128, 128);
+
+    var layout: Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(measured.measurer());
+
+    // Eight pixels wide and orange, for the same reason the square in the
+    // test above is orange: white would survive a channel swap.
+    const frame = struct {
+        fn run(u: *Ui, at: ui.Dimensions) ![]const ui.RenderCommand {
+            u.begin(at);
+            {
+                u.open(.{
+                    .id = "list",
+                    .width = .grow,
+                    .height = .grow,
+                    .clip = ui.layout.Clip.scrollY.bar(.{
+                        .width = 8,
+                        .thumb_color = .hex(0xFF8000),
+                    }),
+                });
+                defer u.close();
+                u.empty(.{ .width = .fixed(40), .height = .fixed(512) });
+            }
+            return try u.end();
+        }
+    }.run;
+
+    const channel = struct {
+        fn at(data: []const u8, x: usize, y: usize, index: usize) u8 {
+            return data[(y * 128 + x) * 4 + index];
+        }
+    }.at;
+
+    // A hundred and twenty-eight pixel window onto five hundred and twelve:
+    // a quarter of the track, so thirty-two pixels of thumb at the top.
+    {
+        try renderer.draw(.{ .texture = target }, size, try frame(&layout, size), .black);
+        const pixels = try device.readTexture(target, testing.allocator);
+        defer testing.allocator.free(pixels);
+
+        // The middle of the thumb, in the order the format promised.
+        try testing.expect(channel(pixels, 124, 16, 0) > 200);
+        try testing.expectApproxEqAbs(128, @as(f32, @floatFromInt(channel(pixels, 124, 16, 1))), 12);
+        try testing.expect(channel(pixels, 124, 16, 2) < 50);
+
+        // Past the end of it, and beside it. Both dark, or the bar is the
+        // whole track and is telling the reader nothing.
+        try testing.expect(channel(pixels, 124, 100, 0) < 50);
+        try testing.expect(channel(pixels, 60, 16, 0) < 50);
+    }
+
+    // Scrolled to the bottom, the thumb is at the bottom - which is the check
+    // that the offset is applied in the direction the content moves.
+    {
+        layout.scrollTo("list", 0, 1000);
+        try renderer.draw(.{ .texture = target }, size, try frame(&layout, size), .black);
+        const pixels = try device.readTexture(target, testing.allocator);
+        defer testing.allocator.free(pixels);
+
+        try testing.expect(channel(pixels, 124, 112, 0) > 200);
+        try testing.expect(channel(pixels, 124, 16, 0) < 50);
+    }
 }

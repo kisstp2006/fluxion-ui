@@ -190,6 +190,15 @@ pub const Scroll = struct {
     /// remembering where it was scrolled to.
     live: bool = false,
 
+    /// How many frames since anything moved this container. What
+    /// `layout.Scrollbar.hide_after_frames` counts, and it counts frames
+    /// rather than seconds because that is what Ply does and because a
+    /// library that has never been told the frame rate cannot count seconds.
+    idle: u32 = 0,
+    /// Set by anything that moves the container, and folded into `idle` at
+    /// the top of the next frame. See `Ui.begin`.
+    active: bool = false,
+
     /// The furthest it can be scrolled: how much content there is past the
     /// window. Never negative - content smaller than its window does not
     /// scroll, and a stored position from when it was larger is clamped away.
@@ -225,6 +234,35 @@ pub const Scroll = struct {
             .y = if (self.scroll_y) std.math.clamp(self.position.y, 0, max.y) else 0,
         };
     }
+};
+
+/// One scrollbar, as the frame just finished drew it.
+///
+/// Kept so the next frame can answer "is the pointer on the thumb", which is
+/// the same one-frame lag every other hit test has and for the same reason:
+/// where the thumb is depends on a layout that has not run yet when the
+/// pointer is set.
+const Bar = struct {
+    /// The scroll container this belongs to.
+    element: u32,
+    vertical: bool,
+    thumb: BoundingBox,
+    /// How far the content can move, and how far the thumb can, which is the
+    /// ratio a drag is converted through.
+    max_scroll: f32,
+    thumb_travel: f32,
+};
+
+/// A scrollbar thumb with the pointer held down on it.
+const ThumbDrag = struct {
+    element: u32,
+    vertical: bool,
+    /// Where the pointer was when the drag started, along the dragged axis,
+    /// and where the content was. Both fixed for the length of the drag, so
+    /// the thumb tracks the pointer exactly rather than accumulating a
+    /// rounding error per frame.
+    origin: f32,
+    scrolled: f32,
 };
 
 /// A run of text, and where its lines ended up.
@@ -300,6 +338,11 @@ held: std.ArrayList(u32),
 /// Which element has the keyboard, or zero for none.
 focus: u32 = 0,
 
+/// The scrollbars drawn this frame, for the next frame to be pointed at.
+bars: std.ArrayList(Bar),
+/// The thumb the pointer went down on, until it comes up again.
+drag: ?ThumbDrag = null,
+
 /// What each scroll container was scrolled to, kept between frames.
 ///
 /// The one piece of state in this library that outlives a frame. A layout is
@@ -368,6 +411,7 @@ pub fn init(gpa: Allocator) Ui {
         .open_stack = .empty,
         .output = .empty,
         .hits = .empty,
+        .bars = .empty,
         .over = .empty,
         .held = .empty,
         .scrolls = .empty,
@@ -387,6 +431,7 @@ pub fn deinit(self: *Ui) void {
     self.open_stack.deinit(self.gpa);
     self.output.deinit(self.gpa);
     self.hits.deinit(self.gpa);
+    self.bars.deinit(self.gpa);
     self.over.deinit(self.gpa);
     self.held.deinit(self.gpa);
     self.scrolls.deinit(self.gpa);
@@ -419,8 +464,25 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
 
     // Nothing has been declared yet, so nothing is live. Whatever is still
     // not live when the frame ends was not on the page and is forgotten.
+    //
+    // The idle counter is folded in here rather than at the end of the frame
+    // because everything that moves a container - the wheel, a thumb drag,
+    // `scrollTo` - happens between one frame and the next. Counting here
+    // means a bar that hides itself comes back on the frame the wheel turned
+    // rather than the one after.
     var seen = self.scrolls.valueIterator();
-    while (seen.next()) |scroll| scroll.live = false;
+    while (seen.next()) |scroll| {
+        scroll.live = false;
+        if (scroll.active) scroll.idle = 0 else scroll.idle +|= 1;
+        scroll.active = false;
+    }
+}
+
+/// Which element is currently open, or zero when none is - which happens
+/// only for the root, whose parent is itself.
+fn innermost(self: *Ui) u32 {
+    if (self.open_stack.items.len == 0) return 0;
+    return self.open_stack.items[self.open_stack.items.len - 1].element;
 }
 
 /// The clip an element asked for, with the scroll position this `Ui`
@@ -430,13 +492,6 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
 /// the stored position as the element is configured - and the reason is that
 /// positioning happens long afterwards, by which time the declaration is
 /// gone. The caller writes `.clip = .scrollY` and never touches the offset.
-/// Which element is currently open, or zero when none is - which happens
-/// only for the root, whose parent is itself.
-fn innermost(self: *Ui) u32 {
-    if (self.open_stack.items.len == 0) return 0;
-    return self.open_stack.items[self.open_stack.items.len - 1].element;
-}
-
 fn remembered(self: *Ui, declaration: layout.Declaration) layout.Clip {
     var clip = declaration.clip;
     if (!clip.scrolls()) return clip;
@@ -466,6 +521,7 @@ pub fn scrollBy(self: *Ui, name: []const u8, dx: f32, dy: f32) void {
     scroll.position.x += dx;
     scroll.position.y += dy;
     scroll.position = scroll.clamped();
+    scroll.active = true;
 }
 
 /// Put a scroll container at this position, in pixels from the top left of
@@ -475,6 +531,7 @@ pub fn scrollTo(self: *Ui, name: []const u8, x: f32, y: f32) void {
     const scroll = self.scrolls.getPtr(key) orelse return;
     scroll.position = .{ .x = x, .y = y };
     scroll.position = scroll.clamped();
+    scroll.active = true;
 }
 
 /// Say how to measure text. See `text_mod.Measurer`.
@@ -1257,6 +1314,7 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
 /// before its children are visited, and its border after they are done.
 fn positionAndEmit(self: *Ui) Error!void {
     self.walk.clearRetainingCapacity();
+    self.bars.clearRetainingCapacity();
     try self.walk.append(self.gpa, .{
         .element = 0,
         .position = .zero,
@@ -1285,6 +1343,7 @@ fn positionAndEmit(self: *Ui) Error!void {
             // every side, which looks like a rounding bug and is not.
             if (element.clip.clips()) try self.emitScissor(.scissor_end, element.box);
             try self.emitBorder(frame.element, element.box);
+            try self.emitScrollbars(frame.element, element.box);
             _ = self.walk.pop();
             continue;
         }
@@ -1416,32 +1475,202 @@ fn emitBorder(self: *Ui, index: u32, box: BoundingBox) Error!void {
     });
 }
 
+/// Where one scrollbar goes, and what a drag of it is worth.
+const BarGeometry = struct {
+    track: BoundingBox,
+    thumb: BoundingBox,
+    /// How far the content can move.
+    max_scroll: f32,
+    /// How far the thumb can. A drag is `max_scroll / thumb_travel` pixels of
+    /// content per pixel of pointer, which is why both are kept.
+    thumb_travel: f32,
+};
+
+/// Ply's `compute_vertical_scrollbar_geometry` and its horizontal twin, which
+/// are the same function mirrored, so here they are one.
+///
+/// Null when there is nothing to scroll: a bar with no travel is not drawn
+/// short, it is not drawn.
+///
+/// The measurements are against the element's **whole** box, and `content`
+/// must include its padding to match - a bar runs the height of the container
+/// rather than the height of its inside, and sits on top of the content
+/// rather than beside it. That is Ply's choice and the browsers' one.
+fn barGeometry(
+    box: BoundingBox,
+    content: f32,
+    scrolled: f32,
+    config: layout.Scrollbar,
+    vertical: bool,
+) ?BarGeometry {
+    const viewport = if (vertical) box.height else box.width;
+    const max_scroll = @max(0, content - viewport);
+    if (viewport <= 0 or max_scroll <= 0) return null;
+
+    const thickness = @max(1, config.width);
+    const track_len = viewport;
+
+    // As much of the track as the window is of the content - so the thumb is
+    // a picture of how much there is to read - but never so short that it
+    // cannot be grabbed, and never longer than the track it slides in.
+    const share = track_len * (viewport / @max(content, viewport));
+    const thumb_len = @min(track_len, @max(share, @max(1, config.min_thumb_size)));
+    const thumb_travel = @max(0, track_len - thumb_len);
+
+    const offset: f32 = if (thumb_travel <= 0)
+        0
+    else
+        (std.math.clamp(scrolled, 0, max_scroll) / max_scroll) * thumb_travel;
+
+    return if (vertical) .{
+        .track = .init(box.x + box.width - thickness, box.y, thickness, track_len),
+        .thumb = .init(box.x + box.width - thickness, box.y + offset, thickness, thumb_len),
+        .max_scroll = max_scroll,
+        .thumb_travel = thumb_travel,
+    } else .{
+        .track = .init(box.x, box.y + box.height - thickness, track_len, thickness),
+        .thumb = .init(box.x + offset, box.y + box.height - thickness, thumb_len, thickness),
+        .max_scroll = max_scroll,
+        .thumb_travel = thumb_travel,
+    };
+}
+
+/// How visible a bar is, given how long its container has been still.
+///
+/// Ply's `scrollbar_visibility_alpha`, fade curve and all: it holds at full
+/// for `hide_after_frames`, then fades over a quarter as many frames again -
+/// so a bar told to hide after eighty frames spends twenty fading. A zero
+/// hides it always, which is how a caller turns the bar off without giving up
+/// the configuration.
+fn visibility(config: layout.Scrollbar, idle: u32) f32 {
+    const hide = config.hide_after_frames orelse return 1;
+    if (hide == 0) return 0;
+    if (idle <= hide) return 1;
+
+    const fade = @max(1, @ceil(@as(f32, @floatFromInt(hide)) * 0.25));
+    const through = @as(f32, @floatFromInt(idle - hide)) / fade;
+    return std.math.clamp(1 - through, 0, 1);
+}
+
+/// The same colour, dimmed by the fade.
+fn faded(base: Color, alpha: f32) Color {
+    var out = base;
+    out.a = std.math.clamp(base.a * alpha, 0, 1);
+    return out;
+}
+
+/// Draw the bars for one scroll container, and write down where their thumbs
+/// ended up so the next frame can be pointed at them.
+///
+/// Emitted after the element's scissor has closed, next to the border and for
+/// the same reason: the bar lies flush against the inside edge of the box, so
+/// clipping it with that very rectangle shaves the outer half-pixel of
+/// antialiasing off it. Ply draws it inside and pays that half pixel.
+fn emitScrollbars(self: *Ui, index: u32, box: BoundingBox) Error!void {
+    const element = self.elements.items[index];
+    const config = element.clip.scrollbar orelse return;
+    if (!element.clip.scrolls() or box.empty()) return;
+
+    // A container being declared for the first time has nothing stored yet -
+    // that is written when the frame ends - so it counts as freshly moved and
+    // its bar shows immediately. Waiting for the store would make every
+    // scrollbar in the program appear one frame after its content.
+    const idle = if (self.scrolls.get(element.id)) |scroll| scroll.idle else 0;
+    const alpha = visibility(config, idle);
+    if (alpha <= 0) return;
+
+    const padding = element.config.padding;
+    const content = self.contentOf(element);
+
+    // Vertical first, which is Ply's order, so where a container that scrolls
+    // both ways has its two thumbs meet in the corner the horizontal one is
+    // drawn on top. Which of them a press there *grabs* is a separate
+    // question, and `thumbUnder` answers it the other way round.
+    if (element.clip.scroll_y) {
+        if (barGeometry(box, content.height + padding.onAxis(false), element.clip.offset.y, config, true)) |bar| {
+            try self.emitBar(element, config, alpha, bar, true);
+        }
+    }
+    if (element.clip.scroll_x) {
+        if (barGeometry(box, content.width + padding.onAxis(true), element.clip.offset.x, config, false)) |bar| {
+            try self.emitBar(element, config, alpha, bar, false);
+        }
+    }
+}
+
+fn emitBar(
+    self: *Ui,
+    element: Element,
+    config: layout.Scrollbar,
+    alpha: f32,
+    bar: BarGeometry,
+    vertical: bool,
+) Error!void {
+    const radius: geometry.CornerRadius = .all(config.corner_radius);
+
+    if (config.track_color) |track| {
+        try self.output.append(self.gpa, .{
+            .bounding_box = bar.track,
+            .id = element.id,
+            .z_index = element.z_index,
+            .config = .{ .rectangle = .{
+                .color = faded(track, alpha),
+                .corner_radius = radius.clampTo(bar.track.width, bar.track.height),
+            } },
+        });
+    }
+
+    try self.output.append(self.gpa, .{
+        .bounding_box = bar.thumb,
+        .id = element.id,
+        .z_index = element.z_index,
+        .config = .{ .rectangle = .{
+            .color = faded(config.thumb_color, alpha),
+            .corner_radius = radius.clampTo(bar.thumb.width, bar.thumb.height),
+        } },
+    });
+
+    try self.bars.append(self.gpa, .{
+        .element = element.id,
+        .vertical = vertical,
+        .thumb = bar.thumb,
+        .max_scroll = bar.max_scroll,
+        .thumb_travel = bar.thumb_travel,
+    });
+}
+
+/// How big everything inside an element turned out to be, measured from where
+/// its first child would sit if it were not scrolled.
+///
+/// From the children's boxes rather than the sizes they asked for, because a
+/// child that grew or wrapped is a different size from the one it declared.
+/// The scroll position is added back because the children have already been
+/// moved by it - forgetting that gives a container whose limit shrinks as it
+/// is scrolled, and which creeps to a stop halfway down.
+fn contentOf(self: *Ui, element: Element) Dimensions {
+    const padding = element.config.padding;
+    const origin_x = element.box.x + @as(f32, @floatFromInt(padding.left));
+    const origin_y = element.box.y + @as(f32, @floatFromInt(padding.top));
+
+    var content: Dimensions = .zero;
+    for (self.childrenOf(element)) |child_index| {
+        const child = self.elements.items[child_index];
+        content.width = @max(content.width, child.box.right() + element.clip.offset.x - origin_x);
+        content.height = @max(content.height, child.box.bottom() + element.clip.offset.y - origin_y);
+    }
+    return content;
+}
+
 /// Work out how much content each scroll container has, and remember it.
 ///
-/// Only possible once everything has a box, which is why this runs last.
-/// The content is measured from the children's boxes rather than from the
-/// sizes they asked for, because a child that grew or wrapped is a different
-/// size from the one it declared - and it is where it ended up that decides
-/// whether there is anything to scroll to.
-///
-/// The children have already been moved by the scroll position, so it is
-/// added back to find where the content would sit unscrolled. Forgetting that
-/// gives a container whose scroll limit shrinks as it is scrolled, which
-/// creeps to a stop halfway down.
+/// Only possible once everything has a box, which is why this runs last. See
+/// `contentOf` for the measurement itself.
 fn measureScroll(self: *Ui) Error!void {
     for (self.elements.items) |element| {
         if (!element.clip.scrolls()) continue;
 
         const padding = element.config.padding;
-        const origin_x = element.box.x + @as(f32, @floatFromInt(padding.left));
-        const origin_y = element.box.y + @as(f32, @floatFromInt(padding.top));
-
-        var content: Dimensions = .zero;
-        for (self.childrenOf(element)) |child_index| {
-            const child = self.elements.items[child_index];
-            content.width = @max(content.width, child.box.right() + element.clip.offset.x - origin_x);
-            content.height = @max(content.height, child.box.bottom() + element.clip.offset.y - origin_y);
-        }
+        const content = self.contentOf(element);
 
         const entry = try self.scrolls.getOrPut(self.gpa, element.id);
         if (!entry.found_existing) entry.value_ptr.* = .{};
@@ -1527,18 +1756,118 @@ pub fn setPointer(self: *Ui, x: f32, y: f32, down: bool) void {
     self.pointer.position = .{ .x = x, .y = y };
     self.pointer.state = self.pointer.state.advance(down);
 
+    // A scrollbar is not an element, so it does not shadow what is under it
+    // for hovering - the pointer resting on a bar still hovers the row
+    // beneath, as it does in Ply. Only the press below is intercepted.
     self.over.clearRetainingCapacity();
     self.chainUnder(self.pointer.position) catch {};
 
     if (self.pointer.justPressed()) {
+        if (self.thumbUnder(self.pointer.position)) |grabbed| {
+            // Ply hands the whole press to the scrollbar and returns: nothing
+            // is under the pointer, nothing is pressed, and the focus stays
+            // where it was. Grabbing the bar beside a text field must not
+            // take the caret out of it.
+            self.drag = grabbed;
+            self.over.clearRetainingCapacity();
+            self.held.clearRetainingCapacity();
+            return;
+        }
         self.held.clearRetainingCapacity();
         self.held.appendSlice(self.gpa, self.over.items) catch {};
         self.takeFocus();
     } else if (self.pointer.isUp()) {
+        self.drag = null;
         // The chain is kept for the frame the button comes up in, so
         // `justReleased` has something to answer about, and dropped after.
         if (self.pointer.state == .idle) self.held.clearRetainingCapacity();
     }
+
+    // Not on the frame the button went down: the pointer has not moved yet,
+    // and Ply waits the same frame for the same reason.
+    if (self.drag) |grabbed| self.dragThumb(grabbed);
+}
+
+/// The bar for one axis of one container, as the last frame drew it.
+fn barOf(self: *Ui, element: u32, vertical: bool) ?Bar {
+    for (self.bars.items) |bar| {
+        if (bar.element == element and bar.vertical == vertical) return bar;
+    }
+    return null;
+}
+
+/// The thumb under a point, ready to be dragged, if there is one.
+///
+/// Backwards, which is paint order, so the bar of the innermost container
+/// wins where two containers overlap.
+fn thumbUnder(self: *Ui, point: geometry.Vec2) ?ThumbDrag {
+    var i = self.bars.items.len;
+    while (i > 0) {
+        i -= 1;
+        var bar = self.bars.items[i];
+        if (!bar.thumb.contains(point)) continue;
+
+        // One container's own two thumbs meet in the corner when both are
+        // scrolled to the end, and there the point is on both. Ply checks the
+        // vertical axis first and returns, so the vertical one wins - and
+        // since it is emitted first, it is the entry just before this one.
+        // Dragging sideways by accident when reaching for the bottom of a
+        // long list is the thing this avoids.
+        if (!bar.vertical and i > 0) {
+            const above = self.bars.items[i - 1];
+            if (above.element == bar.element and above.vertical and above.thumb.contains(point)) {
+                bar = above;
+            }
+        }
+
+        const scroll = self.scrolls.get(bar.element) orelse continue;
+        return .{
+            .element = bar.element,
+            .vertical = bar.vertical,
+            .origin = if (bar.vertical) point.y else point.x,
+            .scrolled = if (bar.vertical) scroll.position.y else scroll.position.x,
+        };
+    }
+    return null;
+}
+
+/// Move the content by as much as the thumb has been dragged.
+///
+/// Against where the drag started rather than against the last frame, so the
+/// thumb stays under the pointer however many frames the drag lasts. A
+/// per-frame delta would drift, and would drift most where it is most
+/// noticeable: a long document, where one pixel of thumb is many of content.
+///
+/// The travel and the limit are re-read from this frame's bar rather than
+/// remembered from the press, so a list that grows while it is being dragged
+/// is dragged at the new rate. Ply recomputes them too.
+fn dragThumb(self: *Ui, grabbed: ThumbDrag) void {
+    const bar = self.barOf(grabbed.element, grabbed.vertical) orelse return;
+    const scroll = self.scrolls.getPtr(grabbed.element) orelse return;
+
+    const now = if (grabbed.vertical) self.pointer.position.y else self.pointer.position.x;
+    const moved: f32 = if (bar.thumb_travel <= 0)
+        0
+    else
+        grabbed.scrolled + (now - grabbed.origin) * (bar.max_scroll / bar.thumb_travel);
+
+    const at = std.math.clamp(moved, 0, bar.max_scroll);
+    if (grabbed.vertical) {
+        scroll.position.y = at;
+    } else {
+        scroll.position.x = at;
+    }
+    scroll.position = scroll.clamped();
+    scroll.active = true;
+}
+
+/// Whether the pointer is dragging a scrollbar.
+///
+/// For a host that has its own idea of what a press means: while this is
+/// true, the press belongs to the scrollbar and nothing under it is being
+/// pressed.
+pub fn draggingScrollbar(self: *Ui) bool {
+    return self.drag != null;
 }
 
 /// Fill `over` with the elements under a point, outermost first.
@@ -3685,4 +4014,411 @@ test "the copies are thrown away and the buffer reused each frame" {
         // cleared and refilled, so a settled interface stops allocating.
         try testing.expectEqual(5, ui.strings.items.len);
     }
+}
+
+// -------------------------------------------------------------------------
+// Scrollbars
+// -------------------------------------------------------------------------
+
+// The numbers below are Ply's, from a container a hundred pixels square with
+// three hundred by two hundred and fifty of content in it - the same fixture
+// its own scrollbar test uses, so the arithmetic can be compared line by
+// line. A six pixel bar down the right of that box starts at x 94.
+
+/// The bar a container drew on one axis, as the record the pointer is
+/// answered from has it.
+fn barIn(ui: *Ui, name: []const u8, vertical: bool) ?Bar {
+    return ui.barOf(identify(name, 0), vertical);
+}
+
+/// Whether a rectangle really was emitted at this box - the record above says
+/// where the bar went, this says a renderer was told about it.
+fn drawnAt(drawn: []const commands.RenderCommand, box: BoundingBox) bool {
+    for (drawn) |command| {
+        if (std.meta.activeTag(command.config) != .rectangle) continue;
+        if (std.meta.eql(command.bounding_box, box)) return true;
+    }
+    return false;
+}
+
+/// Ply's own scrollbar fixture: a hundred square window onto 300x250.
+fn scrollFixture(u: *Ui, clip: layout.Clip) ![]const commands.RenderCommand {
+    u.begin(.init(400, 300));
+    openRoot(u);
+    {
+        u.open(.{ .id = "scroll", .width = .fixed(100), .height = .fixed(100), .clip = clip });
+        defer u.close();
+        leaf(u, "content", .{ .width = .fixed(300), .height = .fixed(250) });
+    }
+    u.close();
+    return try u.end();
+}
+
+test "a scroll container draws a thumb as long a share of the track as it shows of the content" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const drawn = try scrollFixture(&ui, layout.Clip.scroll.bar(.{}));
+
+    // A hundred pixel window onto two hundred and fifty: two fifths of the
+    // track, so forty pixels of thumb, at the top because nothing has been
+    // scrolled yet.
+    const down = barIn(&ui, "scroll", true).?;
+    try testing.expectEqual(BoundingBox.init(94, 0, 6, 40), down.thumb);
+    try testing.expectEqual(@as(f32, 150), down.max_scroll);
+    try testing.expectEqual(@as(f32, 60), down.thumb_travel);
+
+    // And across: a hundred onto three hundred is a third.
+    const across = barIn(&ui, "scroll", false).?;
+    try testing.expectEqual(@as(f32, 94), across.thumb.y);
+    try testing.expectApproxEqAbs(@as(f32, 100.0 / 3.0), across.thumb.width, 0.001);
+    try testing.expectEqual(@as(f32, 200), across.max_scroll);
+
+    // Both were handed to the renderer, and neither left a scissor open.
+    try testing.expect(drawnAt(drawn, down.thumb));
+    try testing.expect(drawnAt(drawn, across.thumb));
+    const emitted: commands.List = .{ .items = drawn };
+    try testing.expect(emitted.scissorsBalanced());
+}
+
+test "the thumb ends flush with the track when the content is scrolled to the end" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try scrollFixture(&ui, layout.Clip.scroll.bar(.{}));
+    ui.scrollTo("scroll", 200, 150);
+    _ = try scrollFixture(&ui, layout.Clip.scroll.bar(.{}));
+
+    // Scrolled to the bottom, the thumb is at the bottom - and exactly at it,
+    // which is the check that catches an off-by-a-thumb-length.
+    const down = barIn(&ui, "scroll", true).?;
+    try testing.expectEqual(@as(f32, 60), down.thumb.y);
+    try testing.expectEqual(@as(f32, 100), down.thumb.bottom());
+
+    const across = barIn(&ui, "scroll", false).?;
+    try testing.expectApproxEqAbs(@as(f32, 100), across.thumb.right(), 0.001);
+}
+
+test "halfway through the content puts the thumb halfway along its travel" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try scrollFixture(&ui, layout.Clip.scroll.bar(.{}));
+    ui.scrollTo("scroll", 0, 75);
+    _ = try scrollFixture(&ui, layout.Clip.scroll.bar(.{}));
+
+    // Half of a hundred and fifty scrolled, so half of sixty travelled - and
+    // not half the *track*, which is the mistake that puts the thumb past the
+    // end of a short one.
+    try testing.expectEqual(@as(f32, 30), barIn(&ui, "scroll", true).?.thumb.y);
+}
+
+test "a very long document still gets a thumb that can be grabbed" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "scroll",
+            .width = .fixed(100),
+            .height = .fixed(100),
+            .clip = layout.Clip.scrollY.bar(.{}),
+        });
+        defer ui.close();
+        leaf(&ui, "content", .{ .width = .fixed(50), .height = .fixed(5000) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Two per cent of a hundred pixel track is two pixels of thumb, which is
+    // not a thing anybody can hit. The floor is twenty.
+    try testing.expectEqual(@as(f32, 20), barIn(&ui, "scroll", true).?.thumb.height);
+}
+
+test "nothing is drawn where there is nothing to scroll" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "scroll",
+            .width = .fixed(100),
+            .height = .fixed(100),
+            .clip = layout.Clip.scroll.bar(.{}),
+        });
+        defer ui.close();
+        leaf(&ui, "content", .{ .width = .fixed(40), .height = .fixed(40) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // A bar with no travel is not drawn short, it is not drawn - so a list
+    // that turns out to fit costs nothing to have asked for one.
+    try testing.expectEqual(@as(usize, 0), ui.bars.items.len);
+}
+
+test "an axis that does not scroll gets no bar however far its content runs" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+
+    // The content is three times too wide, but the container was never asked
+    // to scroll sideways, so there is nothing for a bar there to move.
+    try testing.expect(barIn(&ui, "scroll", true) != null);
+    try testing.expect(barIn(&ui, "scroll", false) == null);
+}
+
+test "the track is drawn only when it is asked for" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const bare = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+    const without = (commands.List{ .items = bare }).count(.rectangle);
+
+    const dressed = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{ .track_color = .hex(0x202020) }));
+    const with = (commands.List{ .items = dressed }).count(.rectangle);
+
+    // The default bar is an overlay: a thumb and nothing behind it.
+    try testing.expectEqual(without + 1, with);
+    try testing.expect(drawnAt(dressed, .init(94, 0, 6, 100)));
+}
+
+test "dragging the thumb moves the content by the content's share of the drag" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+
+    // Down on the middle of the thumb, which spans y 0 to 40 at x 94.
+    ui.setPointer(97, 20, true);
+    try testing.expect(ui.draggingScrollbar());
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+
+    // Sixty pixels of thumb travel stand for a hundred and fifty of content,
+    // so each pixel of pointer is two and a half of content.
+    ui.setPointer(97, 32, true);
+    try testing.expectEqual(@as(f32, 30), ui.scrollOf("scroll").?.position.y);
+
+    // And the content really moved: the child is thirty pixels higher up.
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+    try testing.expectEqual(@as(f32, -30), ui.boxOf("content").?.y);
+}
+
+test "the drag is measured from where it started, not from the last frame" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+    ui.setPointer(97, 20, true);
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+
+    // Wander down, back up past the start, and down again. Anything that
+    // accumulated per-frame deltas would drift; this ends where the arithmetic
+    // says it should, which is at the start.
+    for ([_]f32{ 30, 40, 24, 10 }) |y| {
+        ui.setPointer(97, y, true);
+        _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+    }
+    // Ten pixels above where it started, which is four below the top of the
+    // content - so the drag is doing something, and doing it from the origin.
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("scroll").?.position.y);
+
+    ui.setPointer(97, 36, true);
+    try testing.expectEqual(@as(f32, 40), ui.scrollOf("scroll").?.position.y);
+    ui.setPointer(97, 20, true);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("scroll").?.position.y);
+}
+
+test "dragging past the end of the track stops at the end of the content" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+    ui.setPointer(97, 20, true);
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+
+    ui.setPointer(97, 4000, true);
+    try testing.expectEqual(@as(f32, 150), ui.scrollOf("scroll").?.position.y);
+
+    // Letting go ends the drag, and moving afterwards moves nothing.
+    ui.setPointer(97, 0, false);
+    try testing.expect(!ui.draggingScrollbar());
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{}));
+    ui.setPointer(97, 0, false);
+    try testing.expectEqual(@as(f32, 150), ui.scrollOf("scroll").?.position.y);
+}
+
+test "grabbing the bar does not press what is underneath it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{
+                    .id = "scroll",
+                    .width = .fixed(100),
+                    .height = .fixed(100),
+                    .clip = layout.Clip.scrollY.bar(.{}),
+                });
+                defer u.close();
+                leaf(u, "row", .{ .width = .fixed(100), .height = .fixed(250) });
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+    ui.setFocus("elsewhere");
+
+    // The row runs the full width, so this press is on the thumb *and* on the
+    // row. Ply gives the whole press to the bar: nothing under it is pressed,
+    // and the focus stays where it was put.
+    ui.setPointer(97, 20, true);
+    try testing.expect(ui.draggingScrollbar());
+    try testing.expect(!ui.isElementPressed("row"));
+    try testing.expect(!ui.isPointerOver("row"));
+    try testing.expect(ui.isFocused("elsewhere"));
+}
+
+test "a press beside the thumb is an ordinary press" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try (struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{
+                    .id = "scroll",
+                    .width = .fixed(100),
+                    .height = .fixed(100),
+                    .clip = layout.Clip.scrollY.bar(.{}),
+                });
+                defer u.close();
+                leaf(u, "row", .{ .width = .fixed(100), .height = .fixed(250) });
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.run)(&ui);
+
+    // Ten pixels in from the left, nowhere near the bar.
+    ui.setPointer(10, 20, true);
+    try testing.expect(!ui.draggingScrollbar());
+    try testing.expect(ui.isElementPressed("row"));
+}
+
+test "where the two thumbs meet in the corner, the vertical one is grabbed" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try scrollFixture(&ui, layout.Clip.scroll.bar(.{}));
+    ui.scrollTo("scroll", 200, 150);
+    _ = try scrollFixture(&ui, layout.Clip.scroll.bar(.{}));
+
+    // Scrolled to the end both ways, the two thumbs overlap in the bottom
+    // right corner and a press there is on both of them. Ply checks the
+    // vertical axis first, so that is the one that moves - reaching for the
+    // bottom of a long list should not send it sideways.
+    const before = ui.scrollOf("scroll").?.position;
+    ui.setPointer(97, 97, true);
+    _ = try scrollFixture(&ui, layout.Clip.scroll.bar(.{}));
+
+    ui.setPointer(97, 77, true);
+    const after = ui.scrollOf("scroll").?.position;
+    try testing.expect(after.y < before.y);
+    try testing.expectEqual(before.x, after.x);
+}
+
+test "a bar told to hide fades out when nothing moves, and comes straight back" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const config: layout.Scrollbar = .{ .hide_after_frames = 2 };
+
+    // Shown on the very first frame, before anything is stored about it.
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+    try testing.expect(barIn(&ui, "scroll", true) != null);
+
+    // Two idle frames are still within the hold.
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+    try testing.expect(barIn(&ui, "scroll", true) != null);
+
+    // A quarter of two, rounded up, is one frame of fade - and then it is
+    // gone, and cannot be grabbed either.
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+    try testing.expect(barIn(&ui, "scroll", true) == null);
+    ui.setPointer(97, 20, true);
+    try testing.expect(!ui.draggingScrollbar());
+    ui.setPointer(97, 20, false);
+
+    // Scrolling brings it back on the next frame rather than the one after,
+    // which is the whole point of counting the idle frames at the top of the
+    // frame instead of the bottom.
+    ui.scrollTo("scroll", 0, 40);
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+    try testing.expect(barIn(&ui, "scroll", true) != null);
+}
+
+test "hide_after_frames of zero is a bar that is never drawn" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{ .hide_after_frames = 0 }));
+    try testing.expectEqual(@as(usize, 0), ui.bars.items.len);
+}
+
+test "a padded container's bar runs its whole height" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "scroll",
+            .width = .fixed(100),
+            .height = .fixed(100),
+            .padding = .all(10),
+            .clip = layout.Clip.scrollY.bar(.{ .track_color = .hex(0x202020) }),
+        });
+        defer ui.close();
+        leaf(&ui, "content", .{ .width = .fixed(50), .height = .fixed(230) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // Ply measures the bar against the whole box and against a content size
+    // that includes the padding, so the track is the full hundred and the
+    // limit is the same hundred and fifty as the unpadded fixture. A bar
+    // measured against the inside instead would be eighty long and would
+    // disagree with the wheel about how far there is to go.
+    try testing.expect(drawnAt(drawn, .init(94, 0, 6, 100)));
+    try testing.expectEqual(@as(f32, 150), barIn(&ui, "scroll", true).?.max_scroll);
+    try testing.expectEqual(@as(f32, 150), ui.scrollOf("scroll").?.limit().y);
+}
+
+test "the fade curve is Ply's" {
+    // Held for the whole hold, then a quarter as many frames of fade.
+    const config: layout.Scrollbar = .{ .hide_after_frames = 80 };
+    try testing.expectEqual(@as(f32, 1), visibility(config, 0));
+    try testing.expectEqual(@as(f32, 1), visibility(config, 80));
+    try testing.expectEqual(@as(f32, 0.75), visibility(config, 85));
+    try testing.expectEqual(@as(f32, 0.5), visibility(config, 90));
+    try testing.expectEqual(@as(f32, 0), visibility(config, 100));
+    try testing.expectEqual(@as(f32, 0), visibility(config, 4000));
+
+    // No hold at all means always shown, which is the default.
+    try testing.expectEqual(@as(f32, 1), visibility(.{}, 4000));
 }

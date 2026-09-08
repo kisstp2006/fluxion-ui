@@ -113,6 +113,7 @@ the differences are the ones Zig forces, and there are three of them.
 | `.overflow(\|o\| o.clip())` | `.clip = .both` |
 | `.overflow(\|o\| o.scroll_y())` | `.clip = .scrollY` |
 | `.overflow(\|o\| o.clip_x())` | `.clip = .x` |
+| `.overflow(\|o\| o.scroll().scrollbar(\|s\| s))` | `.clip = Clip.scroll.bar(.{})` |
 | `ui.scroll_offset()` | `ui.scrollOf("list").?.position` |
 | `ui.hovered()` | `ui.hovered()` |
 | `ui.pressed()`, `ui.just_pressed()` | `ui.pressed()`, `ui.justPressed()` |
@@ -339,6 +340,46 @@ boxes by the time the commands come out.
 
 Wiring a wheel to `scrollBy` is the program's business, and
 `examples/window.zig` is four lines of it.
+
+### Scrollbars
+
+```zig
+ui.open(.{
+    .id = "list",
+    .height = .grow,
+    .clip = layout.Clip.scrollY.bar(.{}),
+});
+```
+
+`bar` takes any of the five clip constants and dresses it, because the
+scrolling is decided first and the bar is what is drawn on top of it. The
+defaults are Ply's: a six pixel half-transparent grey thumb, rounded, with no
+track behind it and no fading. Every one of them has a name -
+`.bar(.{ .width = 10, .thumb_color = .hexa(0x6E7681B0), .track_color = .hex(0x202020) })` -
+and `min_thumb_size` is the one worth knowing about, because two per cent of a
+short track is a thumb nobody can grab.
+
+**Only drawn on an axis that both scrolls and overflows**, so turning it on
+for a list that turns out to be short costs nothing. The thumb is as long a
+share of the track as the window is of the content, and sits as far along it
+as the reader has scrolled - both measured against the container's *whole*
+box, so a bar runs the full height of a padded container rather than the
+height of its inside.
+
+**Dragging the thumb is handled**, from the same `setPointer` everything else
+uses, and a press that lands on a thumb belongs to the scrollbar: nothing
+underneath it is pressed and the focus stays where it was. `draggingScrollbar`
+says whether that is happening, for a program that has its own idea of what a
+press means.
+
+```zig
+.bar(.{ .hide_after_frames = 120 })
+```
+
+Fades the bar out after that many still frames and brings it straight back
+when anything moves - in frames rather than seconds, because a layout library
+is never told the frame rate. Ply's curve exactly: it holds for the whole
+count, then fades over a quarter as many frames again.
 
 ## The renderer
 
