@@ -47,8 +47,8 @@ fn shell(ui: *Ui, cards: usize) void {
             .width = .grow,
             .height = .fixed(40),
             .padding = .xy(12, 0),
-            .child_gap = 8,
-            .child_alignment = .{ .x = .left, .y = .centre },
+            .gap = 8,
+            .align_y = .center,
             .background_color = theme.bar,
             .border = .all(theme.line, 1),
         });
@@ -56,13 +56,12 @@ fn shell(ui: *Ui, cards: usize) void {
 
         // Three round dots, as every title bar has.
         for (0..3) |_| {
-            ui.open(.{
+            ui.empty(.{
                 .width = .fixed(12),
                 .height = .fixed(12),
                 .corner_radius = .all(9999), // clamped to a circle
                 .background_color = theme.accent,
             });
-            ui.close();
         }
     }
 
@@ -76,20 +75,19 @@ fn shell(ui: *Ui, cards: usize) void {
             .width = .fixed(220),
             .height = .grow,
             .padding = .all(12),
-            .child_gap = 6,
+            .gap = 6,
             .direction = .top_to_bottom,
             .background_color = theme.sidebar,
         });
         {
             defer ui.close();
             for (0..4) |_| {
-                ui.open(.{
+                ui.empty(.{
                     .width = .grow,
                     .height = .fixed(32),
                     .corner_radius = .all(6),
                     .background_color = theme.card,
                 });
-                ui.close();
             }
         }
 
@@ -99,13 +97,13 @@ fn shell(ui: *Ui, cards: usize) void {
             .width = .grow,
             .height = .grow,
             .padding = .all(20),
-            .child_gap = 16,
+            .gap = 16,
             .background_color = theme.content,
         });
         {
             defer ui.close();
             for (0..cards) |i| {
-                ui.open(.{
+                ui.empty(.{
                     // The first card is twice the share of the others, which
                     // is what grow weights are for: no arithmetic here knows
                     // how wide the content pane is.
@@ -115,21 +113,17 @@ fn shell(ui: *Ui, cards: usize) void {
                     .background_color = theme.card,
                     .border = .all(theme.line, 1),
                 });
-                ui.close();
             }
         }
     }
 
     // The status bar.
-    {
-        ui.open(.{
-            .id = "statusbar",
-            .width = .grow,
-            .height = .fixed(24),
-            .background_color = theme.bar,
-        });
-        defer ui.close();
-    }
+    ui.empty(.{
+        .id = "statusbar",
+        .width = .grow,
+        .height = .fixed(24),
+        .background_color = theme.bar,
+    });
 }
 
 pub fn main(init: std.process.Init) !void {

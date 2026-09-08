@@ -22,16 +22,13 @@ ui.begin(.init(1280, 720));
         .width = .grow,
         .height = .grow,
         .padding = .all(24),
-        .child_gap = 12,
+        .gap = 12,
         .background_color = .hex(0x14161A),
     });
     defer ui.close();
 
-    ui.open(.{ .width = .fixed(220), .height = .grow, .background_color = .hex(0x191C21) });
-    ui.close();
-
-    ui.open(.{ .width = .grow, .height = .grow, .corner_radius = .all(10) });
-    ui.close();
+    ui.empty(.{ .width = .fixed(220), .height = .grow, .background_color = .hex(0x191C21) });
+    ui.empty(.{ .width = .grow, .height = .grow, .corner_radius = .all(10) });
 }
 for (try ui.end()) |command| draw(command);
 ```
@@ -88,6 +85,82 @@ A grow pass cannot run before its parent has a size, and a parent that fits
 its children cannot have one before they do. That is the whole ordering
 argument.
 
+## Ply, line by line
+
+The aim is that somebody who knows Ply can read this and type it without
+looking anything up. Everything below is the same call under the same name;
+the differences are the ones Zig forces, and there are three of them.
+
+| Ply | Fluxion UI |
+| --- | --- |
+| `ui.element()` … `.children(\|ui\| ...)` | `ui.open(.{ ... })` … `defer ui.close()` |
+| `ui.element()` … `.empty()` | `ui.empty(.{ ... })` |
+| `.width(grow!())` | `.width = .grow` |
+| `.width(fixed!(200))` | `.width = .fixed(200)` |
+| `.width(percent!(0.5))` | `.width = .percent(0.5)` |
+| `.width(ratio!(16.0/9.0))` | `.width = .ratio(16.0 / 9.0)` |
+| `.width(fit!(100, 400))` | `.width = .fitBetween(100, 400)` |
+| `.width(grow!(min: 0, max: 400, weight: 2.0))` | `.width = .growWith(.{ .max = 400, .weight = 2 })` |
+| `.layout(\|l\| l.gap(8))` | `.gap = 8` |
+| `.layout(\|l\| l.padding(24))` | `.padding = .all(24)` |
+| `.layout(\|l\| l.padding((10, 20, 30, 40)))` | `.padding = .trbl(10, 20, 30, 40)` |
+| `.layout(\|l\| l.direction(TopToBottom))` | `.direction = .top_to_bottom` |
+| `.layout(\|l\| l.align(CenterX, CenterY))` | `.align_x = .center, .align_y = .center` |
+| `.background_color(0x262220)` | `.background_color = .hex(0x262220)` |
+| `.corner_radius(12.0)` | `.corner_radius = .all(12)` |
+| `.corner_radius((8, 8, 0, 0))` | `.corner_radius = .corners(8, 8, 0, 0)` |
+| `.contain(16.0/9.0)` | `.contain = 16.0 / 9.0` |
+| `.cover(16.0/9.0)` | `.cover = 16.0 / 9.0` |
+| `.id("save")` | `.id = "save"` |
+| `AlignX::{Left, CenterX, Right}` | `.left`, `.center`, `.right` |
+| `AlignY::{Top, CenterY, Bottom}` | `.top`, `.center`, `.bottom` |
+| `LayoutDirection::{LeftToRight, TopToBottom}` | `.left_to_right`, `.top_to_bottom` |
+| `BorderPosition::{Outside, Middle, Inside}` | `.outside`, `.middle`, `.inside` |
+
+Side by side, the skeleton from Ply's own README:
+
+```rust
+ui.element().width(grow!()).height(grow!())
+  .background_color(0x262220)
+  .corner_radius(12.0)
+  .layout(|l| l.direction(TopToBottom).padding(24))
+  .children(|ui| {
+    ui.text("Hello, Ply!", |t| t.font_size(32).color(0xFFFFFF));
+  });
+```
+
+```zig
+ui.open(.{
+    .width = .grow,
+    .height = .grow,
+    .background_color = .hex(0x262220),
+    .corner_radius = .all(12),
+    .direction = .top_to_bottom,
+    .padding = .all(24),
+});
+defer ui.close();
+ui.text("Hello, Fluxion!", .{ .font_size = 32, .color = .hex(0xFFFFFF) });
+```
+
+### The three things Zig changes
+
+**1. `open` and `close` instead of a `children` closure.** Zig has no
+closures, so the tree is a block and `defer` guarantees the pairing. This is
+the one structural difference, and it buys something back: an early `return`
+inside a subtree still closes it.
+
+**2. `layout(...)` is flattened.** Ply nests `gap`, `padding`, `align` and
+`direction` behind a builder because a Rust builder needs somewhere to put
+them. A Zig struct literal has defaults, so they sit beside `width` and
+`height` and the nesting would be punctuation for its own sake.
+
+**3. `align` is two fields.** `align` is a keyword in Zig and cannot be the
+name of one, so `align(CenterX, CenterY)` is `.align_x = .center, .align_y = .center`.
+The enum values lost their axis suffix because Zig namespaces enums and Rust
+globs them into the prelude.
+
+Everything else is the same word.
+
 ## Sizing
 
 Five ways to be a size, and the list is the algorithm:
@@ -103,41 +176,28 @@ Five ways to be a size, and the list is the algorithm:
 Ply spells these with macros - `grow!()`, `fixed!(100)` - because Rust needs
 one to give a struct literal default arguments. Zig does not: a declaration
 literal resolves against the type the field already has, so there is no macro
-anywhere:
+anywhere.
 
-```zig
-ui.open(.{ .width = .grow, .height = .fixed(40), .padding = .all(12) });
-```
-
-**Grow weights** are Ply's addition over Clay, and they are worth having:
+**Grow weights** are Ply's addition over Clay:
 
 ```zig
 ui.open(.{ .width = .growWeighted(2) });   // twice the share of a plain .grow
 ```
 
 Without them the only way to make one pane twice the width of another is to
-know the container's size, which is exactly what `grow` exists to avoid.
+know the container's size, which is exactly what `grow` exists to avoid. Two
+of Ply's rules about them are kept exactly, and both are tested:
 
-## The API is `open` and `close`
+- **A weight of zero is `fit`**, not "grows by nothing". An element that took
+  no share but still counted as growable would keep the spare space away from
+  its siblings, which is the opposite of what writing zero asks for.
+- **A negative weight is a mistake** and trips an assertion, rather than
+  producing a layout that leans.
 
-Ply passes children as a closure. Zig has no closures, so the tree is a block
-and `defer` is what guarantees the pairing:
-
-```zig
-{
-    ui.open(.{ .direction = .top_to_bottom, .child_gap = 8 });
-    defer ui.close();
-
-    ui.open(.{ .height = .fixed(40) });
-    ui.close();
-}
-```
-
-`open` and `close` report nothing. A UI declaration is a hundred calls in a
-row and `try` on every one of them would drown the thing being described, so
-the first failure is kept and `end` reports it - `error.ElementLeftOpen` for a
-missing `close`, and the rest in `Ui.Error`. An unbalanced tree is a
-programming error, not a layout that leans.
+**`contain` and `cover`** hold the resolved box to an aspect ratio *after* the
+layout has run, so a picture is letterboxed inside the room it was given
+without moving anything beside it. That is what makes them different from
+`.ratio` sizing, which takes part in the sharing out of space.
 
 ## Colour
 
@@ -164,7 +224,8 @@ problem.
 Ported and tested:
 
 - Sizing: fit, grow with weights, fixed, percent, ratio, with minima and maxima
-- Direction, padding, child gaps, and alignment on both axes
+- `contain` and `cover`, holding a box to an aspect ratio inside its slot
+- Direction, padding, gaps, and alignment on both axes
 - The element tree, and a stable number per element for state to hang off
 - Rectangles, corner radii, borders, and the command list they come out as
 

@@ -25,7 +25,7 @@
 //!
 //! ui.begin(.init(1280, 720));
 //! {
-//!     ui.open(.{ .width = .grow, .height = .grow, .padding = .all(24), .child_gap = 12 });
+//!     ui.open(.{ .width = .grow, .height = .grow, .padding = .all(24), .gap = 12 });
 //!     defer ui.close();
 //!
 //!     ui.open(.{ .width = .fixed(200), .height = .grow, .background_color = .hex(0x262220) });
@@ -109,6 +109,9 @@ const Element = struct {
     corner_radius: CornerRadius,
     border: ?layout.Border,
     z_index: i16,
+    /// An aspect ratio the resolved box is held to once the layout has run.
+    /// See `layout.SlotFit`.
+    slot_fit: ?layout.SlotFit,
 
     /// The size it currently believes it is. Filled by the fit pass, then
     /// adjusted by the grow and shrink passes.
@@ -250,6 +253,7 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
         .corner_radius = declaration.corner_radius,
         .border = declaration.border,
         .z_index = declaration.z_index,
+        .slot_fit = declaration.slotFit(),
     });
 
     // The new element is a child of whatever is open, unless it is the root.
@@ -259,6 +263,21 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
         .element = index,
         .pending_at = @intCast(self.pending.items.len),
     });
+}
+
+/// An element with no children: `open` and `close` in one call.
+///
+/// Ply spells this `ui.element()...empty()`, and it is worth having for the
+/// same reason Ply has it - a leaf is the commonest thing in any UI, and
+/// writing an `open` and a `close` around nothing is two lines saying one
+/// thing. Everything `open` takes, this takes.
+///
+/// ```zig
+/// ui.empty(.{ .width = .fixed(12), .height = .fixed(12), .background_color = .hex(0x53A3F2) });
+/// ```
+pub fn empty(self: *Ui, declaration: layout.Declaration) void {
+    self.open(declaration);
+    self.close();
 }
 
 /// Close the innermost open element, and give it the size its children need.
@@ -284,7 +303,7 @@ fn closeChecked(self: *Ui) Error!void {
     const padding_x = config.padding.onAxis(true);
     const padding_y = config.padding.onAxis(false);
     const gaps: f32 = if (child_count > 1)
-        @floatFromInt((child_count - 1) * config.child_gap)
+        @floatFromInt((child_count - 1) * config.gap)
     else
         0;
 
@@ -368,10 +387,11 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
     // The root is the surface, whatever it asked for.
     self.elements.items[0].dimensions = self.surface;
 
-    try self.sizeAlongAxis(true);
+    try self.sizeAlongAxis(true, 0);
     self.resolveRatios(true);
-    try self.sizeAlongAxis(false);
+    try self.sizeAlongAxis(false, 0);
     self.resolveRatios(false);
+    try self.applySlotFit();
 
     try self.positionAndEmit();
     return self.output.items;
@@ -409,9 +429,9 @@ fn resolveRatios(self: *Ui, x_axis_settled: bool) void {
 ///
 /// Breadth first, because a child cannot know its share until its parent has
 /// a final size, and a parent's is final as soon as *its* parent's is.
-fn sizeAlongAxis(self: *Ui, x_axis: bool) Error!void {
+fn sizeAlongAxis(self: *Ui, x_axis: bool, from: u32) Error!void {
     self.queue.clearRetainingCapacity();
-    try self.queue.append(self.gpa, 0);
+    try self.queue.append(self.gpa, from);
 
     var at: usize = 0;
     while (at < self.queue.items.len) : (at += 1) {
@@ -457,7 +477,7 @@ fn distributeMainAxis(self: *Ui, parent_index: u32, x_axis: bool, inner: f32) Er
     if (children.len == 0) return;
 
     var content: f32 = if (children.len > 1)
-        @floatFromInt(@as(u32, @intCast(children.len - 1)) * parent.config.child_gap)
+        @floatFromInt(@as(u32, @intCast(children.len - 1)) * parent.config.gap)
     else
         0;
     for (children) |child_index| {
@@ -645,6 +665,45 @@ inline fn setSize(element: *Element, x_axis: bool, size: f32) void {
     if (x_axis) element.dimensions.width = size else element.dimensions.height = size;
 }
 
+/// Hold the elements that asked for an aspect ratio to it, and re-solve what
+/// is inside them.
+///
+/// This runs after both axes have settled, and that is the whole difference
+/// between `contain` and a `ratio` sizing. A `ratio` takes part in the
+/// sharing out of space, so it moves its siblings. `contain` and `cover`
+/// change only the box the element already won, so a picture is letterboxed
+/// inside its slot and nothing beside it notices.
+///
+/// The children have to be solved again afterwards, because they were sized
+/// against a box that has just changed underneath them.
+fn applySlotFit(self: *Ui) Error!void {
+    for (0..self.elements.items.len) |i| {
+        const index: u32 = @intCast(i);
+        const fit = self.elements.items[index].slot_fit orelse continue;
+
+        const size = self.elements.items[index].dimensions;
+        if (size.width <= 0 or size.height <= 0 or fit.ratio <= 0) continue;
+
+        self.elements.items[index].dimensions = switch (fit.mode) {
+            // The largest box of this ratio that fits inside the room given.
+            .contain => .init(
+                @min(size.width, size.height * fit.ratio),
+                @min(size.height, size.width / fit.ratio),
+            ),
+            // The smallest box of this ratio that covers it.
+            .cover => .init(
+                @max(size.width, size.height * fit.ratio),
+                @max(size.height, size.width / fit.ratio),
+            ),
+        };
+
+        if (self.elements.items[index].children_length > 0) {
+            try self.sizeAlongAxis(true, index);
+            try self.sizeAlongAxis(false, index);
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // Phase three: position, and write the commands out
 // -------------------------------------------------------------------------
@@ -690,16 +749,16 @@ fn positionAndEmit(self: *Ui) Error!void {
             element.config.padding.onAxis(!along_x) -
             child.dimensions.onAxis(!along_x));
         const cross = if (along_x)
-            geometry.leadingSpaceY(cross_room, element.config.child_alignment.y)
+            geometry.leadingSpaceY(cross_room, element.config.align_y)
         else
-            geometry.leadingSpaceX(cross_room, element.config.child_alignment.x);
+            geometry.leadingSpaceX(cross_room, element.config.align_x);
 
         const x = frame.position.x + frame.next_child.x + (if (along_x) 0 else cross);
         const y = frame.position.y + frame.next_child.y + (if (along_x) cross else 0);
 
         // Advance the parent's cursor past this child and the gap after it.
         const gap: f32 = if (frame.placed + 1 < children.len)
-            @floatFromInt(element.config.child_gap)
+            @floatFromInt(element.config.gap)
         else
             0;
         const step = child.dimensions.onAxis(along_x) + gap;
@@ -736,7 +795,7 @@ fn startOffset(self: *Ui, element: Element) Point {
     if (children.len == 0) return offset;
 
     var content: f32 = if (children.len > 1)
-        @floatFromInt(@as(u32, @intCast(children.len - 1)) * config.child_gap)
+        @floatFromInt(@as(u32, @intCast(children.len - 1)) * config.gap)
     else
         0;
     for (children) |child_index| {
@@ -745,9 +804,9 @@ fn startOffset(self: *Ui, element: Element) Point {
 
     const room = @max(0, element.dimensions.onAxis(along_x) - config.padding.onAxis(along_x) - content);
     if (along_x) {
-        offset.x += geometry.leadingSpaceX(room, config.child_alignment.x);
+        offset.x += geometry.leadingSpaceX(room, config.align_x);
     } else {
-        offset.y += geometry.leadingSpaceY(room, config.child_alignment.y);
+        offset.y += geometry.leadingSpaceY(room, config.align_y);
     }
     return offset;
 }
@@ -958,7 +1017,7 @@ test "the gap goes between children and not after the last one" {
 
     ui.begin(.init(320, 100));
     {
-        ui.open(.{ .width = .grow, .height = .grow, .child_gap = 10 });
+        ui.open(.{ .width = .grow, .height = .grow, .gap = 10 });
         defer ui.close();
         leaf(&ui, "a", .{ .width = .grow, .height = .grow });
         leaf(&ui, "b", .{ .width = .grow, .height = .grow });
@@ -983,7 +1042,7 @@ test "a parent that fits is exactly as big as what is in it" {
         ui.open(.{ .width = .grow, .height = .grow });
         defer ui.close();
 
-        ui.open(.{ .id = "fitted", .padding = .all(10), .child_gap = 5, .background_color = paint });
+        ui.open(.{ .id = "fitted", .padding = .all(10), .gap = 5, .background_color = paint });
         defer ui.close();
         leaf(&ui, "x", .{ .width = .fixed(30), .height = .fixed(40) });
         leaf(&ui, "y", .{ .width = .fixed(50), .height = .fixed(20) });
@@ -1002,7 +1061,7 @@ test "a column stacks downwards" {
 
     ui.begin(.init(800, 600));
     {
-        ui.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom, .child_gap = 8 });
+        ui.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom, .gap = 8 });
         defer ui.close();
         leaf(&ui, "top", .{ .width = .grow, .height = .fixed(40) });
         leaf(&ui, "bottom", .{ .width = .grow, .height = .fixed(60) });
@@ -1019,7 +1078,7 @@ test "centring puts the spare space on both sides" {
 
     ui.begin(.init(800, 600));
     {
-        ui.open(.{ .width = .grow, .height = .grow, .child_alignment = .centre });
+        ui.open(.{ .width = .grow, .height = .grow, .align_x = .center, .align_y = .center });
         defer ui.close();
         leaf(&ui, "middle", .{ .width = .fixed(200), .height = .fixed(100) });
     }
@@ -1037,7 +1096,8 @@ test "aligning to the far edge puts all the spare space in front" {
         ui.open(.{
             .width = .grow,
             .height = .grow,
-            .child_alignment = .{ .x = .right, .y = .bottom },
+            .align_x = .right,
+            .align_y = .bottom,
         });
         defer ui.close();
         leaf(&ui, "corner", .{ .width = .fixed(100), .height = .fixed(50) });
@@ -1267,7 +1327,7 @@ test "the same declaration gives the same layout every frame" {
     for (0..3) |i| {
         ui.begin(.init(800, 600));
         {
-            ui.open(.{ .width = .grow, .height = .grow, .padding = .all(16), .child_gap = 8 });
+            ui.open(.{ .width = .grow, .height = .grow, .padding = .all(16), .gap = 8 });
             defer ui.close();
             leaf(&ui, "a", .{ .width = .grow, .height = .fixed(40) });
             leaf(&ui, "b", .{ .width = .fixed(120), .height = .fixed(40) });
@@ -1296,4 +1356,151 @@ test "a named element keeps its number wherever it moves" {
     // Which is what will let hover and focus follow it between frames.
     try testing.expectEqual(identify("save-button", 0), identify("save-button", 99));
     try testing.expect(identify("save", 0) != identify("load", 0));
+}
+
+// -------------------------------------------------------------------------
+// Parity with Ply
+// -------------------------------------------------------------------------
+//
+// The rules below are Ply's, not this library's, and each of them is a place
+// where a reasonable-looking implementation would differ. They are written
+// down as tests because "behaves like the original" is a claim, and a claim
+// with no test under it is a hope.
+
+test "a grow weight of zero behaves as fit, not as grow-by-nothing" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(600, 100));
+    {
+        ui.open(.{ .width = .grow, .height = .grow });
+        defer ui.close();
+        leaf(&ui, "zero", .{ .width = .growWeighted(0), .height = .grow });
+        leaf(&ui, "one", .{ .width = .grow, .height = .grow });
+    }
+    _ = try ui.end();
+
+    // Ply turns a zero weight into `fit` when the declaration is made, and
+    // the difference is visible: an element that stayed growable with no
+    // share would keep the space away from its sibling. Here the sibling
+    // takes all of it.
+    try testing.expectEqual(layout.Sizing.Kind.fit, layout.Sizing.growWeighted(0).kind);
+    try testing.expectApproxEqAbs(0, ui.boxOf("zero").?.width, 0.01);
+    try testing.expectApproxEqAbs(600, ui.boxOf("one").?.width, 0.01);
+}
+
+test "a zero weight keeps the bounds it was given" {
+    // Turning into `fit` must not throw the min and max away, or
+    // `grow!(min: 100, weight: 0)` would collapse to nothing.
+    const bounded = layout.Sizing.growWith(.{ .min = 100, .max = 200, .weight = 0 });
+    try testing.expectEqual(layout.Sizing.Kind.fit, bounded.kind);
+    try testing.expectEqual(@as(f32, 100), bounded.min);
+    try testing.expectEqual(@as(f32, 200), bounded.max);
+}
+
+test "contain letterboxes inside the room it was given" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    {
+        ui.open(.{ .width = .grow, .height = .grow });
+        defer ui.close();
+        // A slot 400 wide and 600 tall, holding a 16:9 picture.
+        leaf(&ui, "picture", .{ .width = .fixed(400), .height = .fixed(600), .contain = 16.0 / 9.0 });
+    }
+    _ = try ui.end();
+
+    // The widest 16:9 box that fits in 400x600 is 400x225. The width was
+    // already the limit, so it stays and the height comes down.
+    const picture = ui.boxOf("picture").?;
+    try testing.expectApproxEqAbs(400, picture.width, 0.01);
+    try testing.expectApproxEqAbs(225, picture.height, 0.01);
+}
+
+test "cover fills the room and spills past it" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    {
+        ui.open(.{ .width = .grow, .height = .grow });
+        defer ui.close();
+        leaf(&ui, "picture", .{ .width = .fixed(400), .height = .fixed(600), .cover = 16.0 / 9.0 });
+    }
+    _ = try ui.end();
+
+    // The smallest 16:9 box that covers 400x600 is 1066x600 - wider than the
+    // slot, which is the point: a cropped background fills its corner.
+    const picture = ui.boxOf("picture").?;
+    try testing.expectApproxEqAbs(1066.67, picture.width, 0.1);
+    try testing.expectApproxEqAbs(600, picture.height, 0.01);
+}
+
+test "slot fit changes the box and not its siblings" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    {
+        ui.open(.{ .width = .grow, .height = .grow });
+        defer ui.close();
+        leaf(&ui, "shrunk", .{ .width = .fixed(400), .height = .fixed(600), .contain = 1.0 });
+        leaf(&ui, "beside", .{ .width = .grow, .height = .grow });
+    }
+    _ = try ui.end();
+
+    // This is the whole difference between `contain` and a `ratio` sizing. A
+    // ratio would have taken part in the sharing out of space and moved the
+    // sibling; contain runs afterwards, so the sibling is where it was.
+    try testing.expectApproxEqAbs(400, ui.boxOf("shrunk").?.height, 0.01);
+    try testing.expectApproxEqAbs(400, ui.boxOf("beside").?.x, 0.01);
+    try testing.expectApproxEqAbs(400, ui.boxOf("beside").?.width, 0.01);
+}
+
+test "empty is open and close in one call" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    {
+        ui.open(.{ .width = .grow, .height = .grow, .gap = 10 });
+        defer ui.close();
+        ui.empty(.{ .id = "a", .width = .fixed(100), .height = .fixed(50), .background_color = paint });
+        ui.empty(.{ .id = "b", .width = .fixed(100), .height = .fixed(50), .background_color = paint });
+    }
+    const drawn = try ui.end();
+
+    try testing.expectEqual(2, drawn.len);
+    try testing.expectEqual(BoundingBox.init(0, 0, 100, 50), ui.boxOf("a").?);
+    try testing.expectEqual(BoundingBox.init(110, 0, 100, 50), ui.boxOf("b").?);
+}
+
+test "padding is written in the order CSS writes it" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    {
+        // Top 10, right 20, bottom 30, left 40 - Ply's `padding((t, r, b, l))`.
+        ui.open(.{ .width = .grow, .height = .grow, .padding = .trbl(10, 20, 30, 40) });
+        defer ui.close();
+        leaf(&ui, "inner", .{ .width = .grow, .height = .grow });
+    }
+    _ = try ui.end();
+
+    const inner = ui.boxOf("inner").?;
+    try testing.expectEqual(@as(f32, 40), inner.x);
+    try testing.expectEqual(@as(f32, 10), inner.y);
+    try testing.expectEqual(@as(f32, 800 - 60), inner.width);
+    try testing.expectEqual(@as(f32, 600 - 40), inner.height);
+}
+
+test "the alignment names are the ones a reader of Ply will type" {
+    // Not a behaviour test - a spelling one. `center`, not `centre`, and
+    // `middle` for the border, because that is what Ply calls them.
+    try testing.expectEqual(geometry.AlignX.center, @as(geometry.AlignX, .center));
+    try testing.expectEqual(geometry.AlignY.center, @as(geometry.AlignY, .center));
+    try testing.expectEqual(layout.BorderPosition.middle, @as(layout.BorderPosition, .middle));
+    try testing.expectEqual(layout.BorderPosition.inside, layout.Border.all(paint, 1).position);
 }

@@ -16,7 +16,7 @@
 //!
 //! ui.begin(.init(1280, 720));
 //! {
-//!     ui.open(.{ .width = .grow, .height = .grow, .padding = .all(24), .child_gap = 12 });
+//!     ui.open(.{ .width = .grow, .height = .grow, .padding = .all(24), .gap = 12 });
 //!     defer ui.close();
 //!
 //!     ui.open(.{ .width = .fixed(200), .height = .grow, .background_color = .hex(0x262220) });
@@ -55,6 +55,12 @@ pub const Declaration = layout.Declaration;
 pub const Sizing = layout.Sizing;
 pub const Direction = layout.Direction;
 pub const Border = layout.Border;
+pub const BorderWidth = layout.BorderWidth;
+pub const BorderPosition = layout.BorderPosition;
+pub const SlotFit = layout.SlotFit;
+
+pub const AlignX = geometry.AlignX;
+pub const AlignY = geometry.AlignY;
 
 pub const RenderCommand = commands.RenderCommand;
 pub const Config = commands.Config;

@@ -84,7 +84,7 @@ pub const BoundingBox = extern struct {
         return self.y + self.height;
     }
 
-    pub inline fn centre(self: BoundingBox) Vec2 {
+    pub inline fn center(self: BoundingBox) Vec2 {
         return .init(self.x + self.width / 2, self.y + self.height / 2);
     }
 
@@ -163,6 +163,17 @@ pub const Padding = extern struct {
         };
     }
 
+    /// Top, right, bottom, left - the order CSS writes a four-value padding
+    /// in, and the order Ply's `padding((t, r, b, l))` takes.
+    pub inline fn trbl(top_amount: u16, right_amount: u16, bottom_amount: u16, left_amount: u16) Padding {
+        return .{
+            .top = top_amount,
+            .right = right_amount,
+            .bottom = bottom_amount,
+            .left = left_amount,
+        };
+    }
+
     pub inline fn horizontal(self: Padding) u16 {
         return self.left + self.right;
     }
@@ -230,19 +241,15 @@ pub const CornerRadius = extern struct {
 };
 
 /// Where children sit along the horizontal axis when there is room to spare.
-pub const AlignX = enum { left, centre, right };
+///
+/// Spelled the American way, as `center`, because Ply spells it that way and
+/// an API that is ninety per cent the same is worth more than a consistent
+/// dictionary. The prose in this library still says centre; the identifiers
+/// say what a reader coming from Ply will type.
+pub const AlignX = enum { left, center, right };
 
 /// Where children sit along the vertical axis when there is room to spare.
-pub const AlignY = enum { top, centre, bottom };
-
-/// Both at once, which is how an element declares it.
-pub const ChildAlignment = struct {
-    x: AlignX = .left,
-    y: AlignY = .top,
-
-    pub const default: ChildAlignment = .{};
-    pub const centre: ChildAlignment = .{ .x = .centre, .y = .centre };
-};
+pub const AlignY = enum { top, center, bottom };
 
 /// The share of the space left over that goes *before* the content.
 ///
@@ -255,7 +262,7 @@ pub const ChildAlignment = struct {
 pub inline fn leadingSpaceX(extra: f32, alignment: AlignX) f32 {
     return switch (alignment) {
         .left => 0,
-        .centre => extra / 2,
+        .center => extra / 2,
         .right => extra,
     };
 }
@@ -263,7 +270,7 @@ pub inline fn leadingSpaceX(extra: f32, alignment: AlignX) f32 {
 pub inline fn leadingSpaceY(extra: f32, alignment: AlignY) f32 {
     return switch (alignment) {
         .top => 0,
-        .centre => extra / 2,
+        .center => extra / 2,
         .bottom => extra,
     };
 }
@@ -272,8 +279,8 @@ test "a bounding box knows its own edges" {
     const box: BoundingBox = .init(10, 20, 100, 50);
     try testing.expectEqual(@as(f32, 110), box.right());
     try testing.expectEqual(@as(f32, 70), box.bottom());
-    try testing.expectEqual(@as(f32, 60), box.centre().x);
-    try testing.expectEqual(@as(f32, 45), box.centre().y);
+    try testing.expectEqual(@as(f32, 60), box.center().x);
+    try testing.expectEqual(@as(f32, 45), box.center().y);
 }
 
 test "the left and top edges are inside, the right and bottom are not" {
@@ -372,8 +379,8 @@ test "alignment gives the leading edge its share and no more" {
     try testing.expectEqual(@as(f32, 0), leadingSpaceY(100, .top));
 
     // Centre splits it, which is the only one that divides.
-    try testing.expectEqual(@as(f32, 50), leadingSpaceX(100, .centre));
-    try testing.expectEqual(@as(f32, 50), leadingSpaceY(100, .centre));
+    try testing.expectEqual(@as(f32, 50), leadingSpaceX(100, .center));
+    try testing.expectEqual(@as(f32, 50), leadingSpaceY(100, .center));
 
     // Right and bottom push the content the whole way across.
     try testing.expectEqual(@as(f32, 100), leadingSpaceX(100, .right));

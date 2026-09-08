@@ -15,7 +15,7 @@
 //!     .width = .grow,             // Sizing.grow
 //!     .height = .fixed(40),       // Sizing.fixed(40)
 //!     .padding = .all(12),
-//!     .child_gap = 8,
+//!     .gap = 8,
 //!     .direction = .left_to_right,
 //! });
 //! defer ui.close();
@@ -38,7 +38,8 @@ const testing = std.testing;
 
 const geometry = @import("geometry.zig");
 
-const ChildAlignment = geometry.ChildAlignment;
+const AlignX = geometry.AlignX;
+const AlignY = geometry.AlignY;
 const Padding = geometry.Padding;
 
 /// Which way children are stacked.
@@ -98,24 +99,64 @@ pub const Sizing = struct {
         return .{ .kind = .percent, .fraction = of_parent };
     }
 
+    /// The bounds and share `fitWith` and `growWith` take. Between them they
+    /// are Ply's `fit!(min, max)` and `grow!(min, max, weight)`, with every
+    /// argument optional and named rather than positional.
+    pub const Bounds = struct {
+        min: f32 = 0,
+        max: f32 = std.math.floatMax(f32),
+        /// Only read by `growWith`.
+        weight: f32 = 1,
+    };
+
     /// As small as the children allow, but never outside these bounds.
+    /// Ply's `fit!(min, max)`.
+    pub inline fn fitWith(bounds: Bounds) Sizing {
+        return .{ .kind = .fit, .min = bounds.min, .max = bounds.max };
+    }
+
+    /// As small as the children allow, between these two. The shorthand most
+    /// callers want.
     pub inline fn fitBetween(min: f32, max: f32) Sizing {
-        return .{ .kind = .fit, .min = min, .max = max };
+        return fitWith(.{ .min = min, .max = max });
+    }
+
+    /// Grow, with bounds and a share. Ply's `grow!(min, max, weight)`.
+    ///
+    /// Two of Ply's rules live here rather than in the solver, because they
+    /// are about what the declaration means rather than about arithmetic:
+    ///
+    ///   * **A weight of zero is `fit`.** Not "grows by nothing" - an element
+    ///     that took no share but still counted as growable would keep the
+    ///     spare space away from its siblings, which is the opposite of what
+    ///     writing zero asks for.
+    ///   * **A negative weight is a mistake**, caught here rather than
+    ///     producing a layout that leans. Ply panics; so does this, in a
+    ///     build with safety on.
+    pub inline fn growWith(bounds: Bounds) Sizing {
+        std.debug.assert(bounds.weight >= 0);
+        if (bounds.weight == 0) return fitWith(bounds);
+        return .{
+            .kind = .grow,
+            .min = bounds.min,
+            .max = bounds.max,
+            .weight = bounds.weight,
+        };
     }
 
     /// Grow, but never outside these bounds.
     pub inline fn growBetween(min: f32, max: f32) Sizing {
-        return .{ .kind = .grow, .min = min, .max = max };
+        return growWith(.{ .min = min, .max = max });
     }
 
     /// Grow with a share other than one. See `weight`.
     pub inline fn growWeighted(share: f32) Sizing {
-        return .{ .kind = .grow, .weight = share };
+        return growWith(.{ .weight = share });
     }
 
     /// Never smaller than this, whatever else applies.
     pub inline fn atLeast(size: f32) Sizing {
-        return .{ .kind = .fit, .min = size };
+        return fitWith(.{ .min = size });
     }
 
     /// This multiple of the *other* axis - `.ratio(16.0 / 9.0)` on width
@@ -153,9 +194,14 @@ pub const SizingConfig = struct {
 pub const LayoutConfig = struct {
     sizing: SizingConfig = .{},
     padding: Padding = .none,
-    /// Space between one child and the next, along the main axis.
-    child_gap: u16 = 0,
-    child_alignment: ChildAlignment = .{},
+    /// Space between one child and the next, along the main axis. Ply's
+    /// `layout(|l| l.gap(8))`.
+    gap: u16 = 0,
+    /// Where the children sit when there is room to spare. Ply writes the
+    /// pair as `align(CenterX, CenterY)`; here they are two fields, because
+    /// `align` is a keyword in Zig and cannot be the name of one.
+    align_x: AlignX = .left,
+    align_y: AlignY = .top,
     direction: Direction = .left_to_right,
 
     pub const default: LayoutConfig = .{};
@@ -176,9 +222,19 @@ pub const Declaration = struct {
     width: Sizing = .fit,
     height: Sizing = .fit,
     padding: Padding = .none,
-    child_gap: u16 = 0,
-    child_alignment: ChildAlignment = .{},
+    gap: u16 = 0,
+    align_x: AlignX = .left,
+    align_y: AlignY = .top,
     direction: Direction = .left_to_right,
+
+    /// Shrink the resolved box to this aspect ratio, inside the room the
+    /// layout gave it. Ply's `contain(ratio)`, and what a letterboxed image
+    /// wants.
+    contain: ?f32 = null,
+    /// Grow the resolved box to this aspect ratio, past the room the layout
+    /// gave it. Ply's `cover(ratio)`, and what a cropped background wants.
+    /// Only one of the two applies; `contain` wins if both are given.
+    cover: ?f32 = null,
 
     background_color: Color = .transparent,
     corner_radius: CornerRadius = .sharp,
@@ -193,10 +249,19 @@ pub const Declaration = struct {
         return .{
             .sizing = .{ .width = self.width, .height = self.height },
             .padding = self.padding,
-            .child_gap = self.child_gap,
-            .child_alignment = self.child_alignment,
+            .gap = self.gap,
+            .align_x = self.align_x,
+            .align_y = self.align_y,
             .direction = self.direction,
         };
+    }
+
+    /// The aspect ratio this element is held to after the layout has run, and
+    /// which way it is held. See `SlotFit`.
+    pub fn slotFit(self: Declaration) ?SlotFit {
+        if (self.contain) |ratio| return .{ .ratio = ratio, .mode = .contain };
+        if (self.cover) |ratio| return .{ .ratio = ratio, .mode = .cover };
+        return null;
     }
 };
 
@@ -239,14 +304,36 @@ pub const BorderWidth = extern struct {
     }
 };
 
-pub const BorderPosition = enum { inside, outside, centre };
+/// Where the line sits relative to the box. Ply's three, under Ply's names -
+/// which is why the middle one is `middle` rather than `center`.
+pub const BorderPosition = enum { outside, middle, inside };
+
+/// Holding a resolved box to an aspect ratio, after the layout has decided
+/// how much room it gets.
+///
+/// Not a `Sizing`, and the difference is worth being clear about. A `ratio`
+/// sizing decides how big an element *asks* to be, and takes part in the
+/// sharing out of space. `contain` and `cover` run afterwards and change only
+/// the box, so a picture can be letterboxed inside the room it was given
+/// without moving anything beside it.
+pub const SlotFit = struct {
+    ratio: f32,
+    mode: Mode,
+
+    pub const Mode = enum {
+        /// The largest box of this ratio that fits inside the room given.
+        contain,
+        /// The smallest box of this ratio that covers the room given.
+        cover,
+    };
+};
 
 test "the defaults are what an element that says nothing gets" {
     const d: Declaration = .{};
     try testing.expectEqual(Sizing.Kind.fit, d.width.kind);
     try testing.expectEqual(Sizing.Kind.fit, d.height.kind);
     try testing.expectEqual(Padding.none, d.padding);
-    try testing.expectEqual(@as(u16, 0), d.child_gap);
+    try testing.expectEqual(@as(u16, 0), d.gap);
     try testing.expectEqual(Direction.left_to_right, d.direction);
     try testing.expect(d.background_color.invisible());
 }
@@ -258,7 +345,7 @@ test "declaration literals read as the API is meant to be written" {
         .width = .grow,
         .height = .fixed(40),
         .padding = .all(12),
-        .child_gap = 8,
+        .gap = 8,
         .direction = .top_to_bottom,
     };
 
@@ -310,7 +397,8 @@ test "a declaration hands back the layout it asked for" {
     const d: Declaration = .{
         .width = .percent(0.5),
         .padding = .xy(16, 8),
-        .child_alignment = .centre,
+        .align_x = .center,
+        .align_y = .center,
         .direction = .top_to_bottom,
     };
     const l = d.layout();
@@ -318,7 +406,7 @@ test "a declaration hands back the layout it asked for" {
     try testing.expectEqual(Sizing.Kind.percent, l.sizing.width.kind);
     try testing.expectEqual(@as(f32, 0.5), l.sizing.width.fraction);
     try testing.expectEqual(@as(u16, 32), l.padding.horizontal());
-    try testing.expectEqual(geometry.AlignX.centre, l.child_alignment.x);
+    try testing.expectEqual(geometry.AlignX.center, l.align_x);
     try testing.expectEqual(Direction.top_to_bottom, l.direction);
 
     // And `onAxis` answers for whichever axis is being solved.
