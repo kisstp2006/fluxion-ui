@@ -42,6 +42,7 @@ pub const commands = @import("commands.zig");
 pub const geometry = @import("geometry.zig");
 pub const input = @import("input.zig");
 pub const layout = @import("layout.zig");
+pub const markup = @import("markup.zig");
 pub const text = @import("text.zig");
 pub const text_input = @import("text_input.zig");
 
@@ -83,6 +84,7 @@ test {
     _ = geometry;
     _ = input;
     _ = layout;
+    _ = markup;
     _ = text;
     _ = text_input;
     _ = Ui;

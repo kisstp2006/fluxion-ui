@@ -51,6 +51,7 @@ const commands = @import("commands.zig");
 const geometry = @import("geometry.zig");
 const input = @import("input.zig");
 const layout = @import("layout.zig");
+const markup_mod = @import("markup.zig");
 const text_mod = @import("text.zig");
 const text_input = @import("text_input.zig");
 
@@ -320,6 +321,11 @@ const TextRun = struct {
     element: u32,
     lines_start: u32 = 0,
     lines_len: u32 = 0,
+    /// Where this run's markup spans are in `spans`, or a length of zero for
+    /// a run of plain text - which takes a shorter path through `emitText`
+    /// and comes out as exactly the commands it always did.
+    spans_start: u32 = 0,
+    spans_len: u32 = 0,
 };
 
 /// One line of a wrapped run.
@@ -429,6 +435,9 @@ runs: std.ArrayList(TextRun),
 /// Every run's lines, flattened, after wrapping.
 lines: std.ArrayList(Line),
 
+/// Every markup run's spans, flattened. See `markup_mod.Span`.
+spans: std.ArrayList(markup_mod.Span),
+
 /// The text declared this frame, copied.
 ///
 /// **Copied, not borrowed**, and that is worth the paragraph. A caller writes
@@ -494,6 +503,7 @@ pub fn init(gpa: Allocator) Ui {
         .scrolls = .empty,
         .runs = .empty,
         .lines = .empty,
+        .spans = .empty,
         .strings = .empty,
         .queue = .empty,
         .resizable = .empty,
@@ -520,6 +530,7 @@ pub fn deinit(self: *Ui) void {
     self.scrolls.deinit(self.gpa);
     self.runs.deinit(self.gpa);
     self.lines.deinit(self.gpa);
+    self.spans.deinit(self.gpa);
     self.strings.deinit(self.gpa);
     self.queue.deinit(self.gpa);
     self.resizable.deinit(self.gpa);
@@ -543,6 +554,7 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
     self.output.clearRetainingCapacity();
     self.runs.clearRetainingCapacity();
     self.lines.clearRetainingCapacity();
+    self.spans.clearRetainingCapacity();
     self.strings.clearRetainingCapacity();
 
     // Nothing has been declared yet, so nothing is live. Whatever is still
@@ -686,13 +698,61 @@ pub fn text(self: *Ui, content: []const u8, style: text_mod.TextStyle) void {
 }
 
 fn textChecked(self: *Ui, run: []const u8, style: text_mod.TextStyle) Error!void {
-    const index: u32 = @intCast(self.elements.items.len);
-
     // Copied first, and everything below measures the copy - so a caller
     // whose buffer is about to go out of scope is already safe.
     const start: u32 = @intCast(self.strings.items.len);
     try self.strings.appendSlice(self.gpa, run);
-    const content = self.strings.items[start..][0..run.len];
+    try self.addRun(start, @intCast(run.len), style, 0, 0);
+}
+
+/// A run of text with styles written into it: `{color=red|like this}`.
+///
+/// A separate call rather than something `text` does for itself, which is
+/// where this parts company with Ply. Ply turns markup on for the whole
+/// program with a build feature, so every string it draws is parsed and every
+/// brace in every label has to be escaped. Asking for it a run at a time
+/// costs one word and means `text` is never surprising.
+///
+/// The tags are taken out here, so everything after this - measuring,
+/// wrapping, the boxes, the commands - works on the text the reader will
+/// actually see. See `markup` for what a tag can say, and for what happens to
+/// one that is malformed.
+///
+/// ```zig
+/// ui.markup("Press {color=red|Escape} to leave", .{ .font_size = 14 });
+/// ```
+pub fn markup(self: *Ui, raw: []const u8, style: text_mod.TextStyle) void {
+    self.markupChecked(raw, style) catch |err| self.remember(err);
+}
+
+fn markupChecked(self: *Ui, raw: []const u8, style: text_mod.TextStyle) Error!void {
+    const start: u32 = @intCast(self.strings.items.len);
+    const spans_start: u32 = @intCast(self.spans.items.len);
+    const parsed = try markup_mod.parse(&self.strings, &self.spans, self.gpa, raw);
+    try self.addRun(
+        start,
+        @intCast(parsed.text.len),
+        style,
+        spans_start,
+        @intCast(parsed.spans.len),
+    );
+}
+
+/// Make an element out of text that is already in `strings`, and measure it.
+///
+/// The half `text` and `markup` share. By the time this runs the difference
+/// between them is gone: there is a stretch of `strings` to be measured, and
+/// maybe some spans saying how to colour it.
+fn addRun(
+    self: *Ui,
+    start: u32,
+    len: u32,
+    style: text_mod.TextStyle,
+    spans_start: u32,
+    spans_len: u32,
+) Error!void {
+    const index: u32 = @intCast(self.elements.items.len);
+    const content = self.strings.items[start..][0..len];
 
     // Without a measurer there is nothing to measure with, and a zero-sized
     // element is a visible mistake rather than a silent one.
@@ -722,9 +782,11 @@ fn textChecked(self: *Ui, run: []const u8, style: text_mod.TextStyle) Error!void
 
     try self.runs.append(self.gpa, .{
         .start = start,
-        .len = @intCast(run.len),
+        .len = len,
         .style = style,
         .element = index,
+        .spans_start = spans_start,
+        .spans_len = spans_len,
     });
 
     // A text element is somebody's child, and never the root: text at the top
@@ -1439,21 +1501,88 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
         // as one block.
         const x = box.x + geometry.leadingSpaceX(box.width - line.width, run.style.alignment);
         const y = box.y + line_height * @as(f32, @floatFromInt(i));
+        const content = self.strings.items[run.start..][0..run.len];
 
-        try self.output.append(self.gpa, .{
-            .bounding_box = .init(x, y, line.width, line_height),
-            .id = element.id,
-            .z_index = element.z_index,
-            .config = .{ .text = .{
-                .text = self.strings.items[run.start..][0..run.len][line.start..][0..line.len],
-                .color = run.style.color,
-                .font_size = run.style.font_size,
-                .letter_spacing = run.style.letter_spacing,
-                .line_height = @intFromFloat(@round(line_height)),
-                .font = run.style.font,
-            } },
-        });
+        if (run.spans_len == 0) {
+            try self.emitPiece(
+                element,
+                run.style,
+                content[line.start..][0..line.len],
+                .init(x, y, line.width, line_height),
+                run.style.color,
+            );
+            continue;
+        }
+
+        // One command per stretch of the line that is drawn the same way.
+        //
+        // The pen walks along adding each piece's own width rather than
+        // measuring the prefix again, which is what Ply does too - and it
+        // means a pair of letters either side of a tag boundary is not
+        // kerned against each other. There is nowhere for that kerning to
+        // live: they are two draws.
+        var pen = x;
+        for (self.spans.items[run.spans_start..][0..run.spans_len]) |span| {
+            const from = @max(span.start, line.start);
+            const to = @min(span.end, line.start + line.len);
+            if (from >= to) continue;
+
+            const piece = content[from..to];
+            const width = measurer.measure(piece, run.style).width;
+            defer pen += width;
+            if (span.hidden) continue;
+
+            if (span.shadow) |shadow| {
+                // The offset is in ems, so a shadow set once looks the same
+                // at every size.
+                const em: f32 = @floatFromInt(run.style.font_size);
+                try self.emitPiece(
+                    element,
+                    run.style,
+                    piece,
+                    .init(pen + shadow.offset.x * em, y + shadow.offset.y * em, width, line_height),
+                    .{
+                        .r = shadow.color.r,
+                        .g = shadow.color.g,
+                        .b = shadow.color.b,
+                        .a = std.math.clamp(shadow.color.a * span.opacity, 0, 1),
+                    },
+                );
+            }
+
+            try self.emitPiece(
+                element,
+                run.style,
+                piece,
+                .init(pen, y, width, line_height),
+                span.colorOver(run.style.color),
+            );
+        }
     }
+}
+
+fn emitPiece(
+    self: *Ui,
+    element: Element,
+    style: text_mod.TextStyle,
+    piece: []const u8,
+    box: BoundingBox,
+    ink: Color,
+) Error!void {
+    if (piece.len == 0 or ink.invisible()) return;
+    try self.output.append(self.gpa, .{
+        .bounding_box = box,
+        .id = element.id,
+        .z_index = element.z_index,
+        .config = .{ .text = .{
+            .text = piece,
+            .color = ink,
+            .font_size = style.font_size,
+            .letter_spacing = style.letter_spacing,
+            .line_height = @intFromFloat(@round(box.height)),
+            .font = style.font,
+        } },
+    });
 }
 
 // -------------------------------------------------------------------------
@@ -5524,4 +5653,229 @@ test "shift-clicking extends the selection from where the cursor was" {
     ui.setShift(false);
 
     try testing.expectEqualStrings("hello", ui.editOf("name").?.selected());
+}
+
+// -------------------------------------------------------------------------
+// Markup
+// -------------------------------------------------------------------------
+
+// Measured with `mono`, so a character is eight pixels wide and a line is
+// sixteen tall at a font size of sixteen. The point of every test here is
+// that the tags are gone by the time any of that arithmetic happens: the
+// layout measures what the reader sees.
+
+/// Every text command a frame emitted, whole.
+fn drawnPieces(drawn: []const commands.RenderCommand, out: *[16]commands.RenderCommand) []const commands.RenderCommand {
+    var count: usize = 0;
+    for (drawn) |command| {
+        if (command.config != .text) continue;
+        if (count == out.len) break;
+        out[count] = command;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+test "a markup run is as wide as the text, not as wide as the tags" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 200));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fit, .height = .fit });
+        defer ui.close();
+        ui.markup("{color=red|abc}", sixteen);
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Three characters at eight pixels. The raw string is fifteen, and an
+    // element that measured it would be five times too wide - which is what
+    // Ply's layout does unless the measurer knows about markup.
+    try testing.expectEqual(@as(f32, 24), ui.boxOf("row").?.width);
+}
+
+test "each stretch of a line is drawn in its own colour" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 200));
+    openRoot(&ui);
+    ui.markup("ab{color=red|cd}ef", sixteen);
+    ui.close();
+    const drawn = try ui.end();
+
+    var out: [16]commands.RenderCommand = undefined;
+    const pieces = drawnPieces(drawn, &out);
+    try testing.expectEqual(@as(usize, 3), pieces.len);
+
+    try testing.expectEqualStrings("ab", pieces[0].config.text.text);
+    try testing.expectEqual(@as(f32, 0), pieces[0].bounding_box.x);
+    try testing.expectEqual(paint, pieces[0].config.text.color);
+
+    // The pen walks along, so the red piece starts where the first one ended.
+    try testing.expectEqualStrings("cd", pieces[1].config.text.text);
+    try testing.expectEqual(@as(f32, 16), pieces[1].bounding_box.x);
+    try testing.expectEqual(markup_mod.parseColor("red"), pieces[1].config.text.color);
+
+    try testing.expectEqualStrings("ef", pieces[2].config.text.text);
+    try testing.expectEqual(@as(f32, 32), pieces[2].bounding_box.x);
+    try testing.expectEqual(paint, pieces[2].config.text.color);
+}
+
+test "plain text still comes out as one command a line" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 200));
+    openRoot(&ui);
+    ui.text("no tags here", sixteen);
+    ui.close();
+    const drawn = try ui.end();
+
+    var out: [16]commands.RenderCommand = undefined;
+    try testing.expectEqual(@as(usize, 1), drawnPieces(drawn, &out).len);
+}
+
+test "a span that crosses a line break is drawn on both lines" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 200));
+    openRoot(&ui);
+    {
+        // Eighty pixels holds ten characters.
+        ui.open(.{ .id = "column", .width = .fixed(80), .height = .fit, .direction = .top_to_bottom });
+        defer ui.close();
+        ui.markup("one {color=red|two three} four", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    var out: [16]commands.RenderCommand = undefined;
+    const pieces = drawnPieces(drawn, &out);
+
+    // The wrap happens between words of the *text*, so "two" and "three" end
+    // up on different lines - and the one span becomes a piece on each.
+    var red: usize = 0;
+    var rows: [8]f32 = undefined;
+    var found: usize = 0;
+    for (pieces) |piece| {
+        if (std.meta.eql(piece.config.text.color, markup_mod.parseColor("red"))) {
+            red += 1;
+            if (found < rows.len) {
+                rows[found] = piece.bounding_box.y;
+                found += 1;
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), red);
+    try testing.expect(rows[0] != rows[1]);
+}
+
+test "hidden text keeps its room and is not drawn" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 200));
+    openRoot(&ui);
+    ui.markup("ab{hide|cd}ef", sixteen);
+    ui.close();
+    const drawn = try ui.end();
+
+    var out: [16]commands.RenderCommand = undefined;
+    const pieces = drawnPieces(drawn, &out);
+
+    // Two commands, not three - and the last one is still four characters in,
+    // because the hidden pair took up its room.
+    try testing.expectEqual(@as(usize, 2), pieces.len);
+    try testing.expectEqualStrings("ef", pieces[1].config.text.text);
+    try testing.expectEqual(@as(f32, 32), pieces[1].bounding_box.x);
+}
+
+test "a shadow is drawn under its text, offset in ems" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 200));
+    openRoot(&ui);
+    ui.markup("{shadow_color=blue|x}", sixteen);
+    ui.close();
+    const drawn = try ui.end();
+
+    var out: [16]commands.RenderCommand = undefined;
+    const pieces = drawnPieces(drawn, &out);
+    try testing.expectEqual(@as(usize, 2), pieces.len);
+
+    // Ply's default offset is a third of an em back and down, so at sixteen
+    // pixels it is 4.8 - which is the whole reason it is in ems and not in
+    // pixels.
+    try testing.expectEqual(markup_mod.parseColor("blue"), pieces[0].config.text.color);
+    try testing.expectApproxEqAbs(@as(f32, -4.8), pieces[0].bounding_box.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 4.8), pieces[0].bounding_box.y, 0.001);
+
+    // And the text itself is on top, where it would have been anyway.
+    try testing.expectEqual(paint, pieces[1].config.text.color);
+    try testing.expectEqual(@as(f32, 0), pieces[1].bounding_box.x);
+}
+
+test "opacity multiplies the alpha of whatever colour is in force" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 200));
+    openRoot(&ui);
+    ui.markup("{opacity=0.5|{opacity=0.5|x}}", sixteen);
+    ui.close();
+    const drawn = try ui.end();
+
+    var out: [16]commands.RenderCommand = undefined;
+    const pieces = drawnPieces(drawn, &out);
+    try testing.expectEqual(@as(f32, 0.25), pieces[0].config.text.color.a);
+}
+
+test "markup wraps on the text it shows, not on the string it was given" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Long tags around short words. A wrapper working on the raw string would
+    // break this into a column; working on the text, it is one line.
+    ui.begin(.init(800, 200));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "column", .width = .fixed(80), .height = .fit, .direction = .top_to_bottom });
+        defer ui.close();
+        ui.markup("{color=lightblue|a} {color=lightblue|b}", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    var out: [16]commands.RenderCommand = undefined;
+    const pieces = drawnPieces(drawn, &out);
+    for (pieces) |piece| try testing.expectEqual(@as(f32, 0), piece.bounding_box.y);
+}
+
+test "the text a caller handed over is copied, tags and all" {
+    // The same trap `text` and the placeholder fell into: the parse writes
+    // into the frame's own buffer, so the raw string may be a stack buffer
+    // that is gone a line later.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var scratch: [64]u8 = undefined;
+    ui.begin(.init(800, 200));
+    openRoot(&ui);
+    {
+        const raw = try std.fmt.bufPrint(&scratch, "n = {d} and {{color=red|{d}}}", .{ 1, 2 });
+        ui.markup(raw, sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+    @memset(&scratch, 0xAA);
+
+    var out: [16]commands.RenderCommand = undefined;
+    const pieces = drawnPieces(drawn, &out);
+    try testing.expectEqualStrings("n = 1 and ", pieces[0].config.text.text);
+    try testing.expectEqualStrings("2", pieces[1].config.text.text);
 }
