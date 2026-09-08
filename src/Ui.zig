@@ -49,6 +49,7 @@ const Allocator = std.mem.Allocator;
 const color = @import("color.zig");
 const commands = @import("commands.zig");
 const geometry = @import("geometry.zig");
+const input = @import("input.zig");
 const layout = @import("layout.zig");
 const text_mod = @import("text.zig");
 
@@ -120,6 +121,16 @@ const Element = struct {
     /// What it does with content larger than itself. See `layout.Clip`.
     clip: layout.Clip = .none,
 
+    /// Where in `elements` its parent is. The root is its own parent, which
+    /// is what stops the walk up the tree rather than a sentinel nobody
+    /// remembers to check.
+    parent: u32 = 0,
+    /// Whether the pointer stops here. See `layout.Declaration.capture`.
+    capture: bool = false,
+    /// Whether a press here leaves the focus where it is. See
+    /// `layout.Declaration.preserve_focus`.
+    preserve_focus: bool = false,
+
     /// The size it currently believes it is. Filled by the fit pass, then
     /// adjusted by the grow and shrink passes.
     dimensions: Dimensions = .zero,
@@ -146,6 +157,21 @@ const Open = struct {
     /// after that point is one of its children - which is how `close` finds
     /// them in constant time instead of searching.
     pending_at: u32,
+};
+
+/// One element, as something the pointer can land on.
+const Hit = struct {
+    id: u32,
+    box: BoundingBox,
+    /// Everything the clipping ancestors between here and the root leave
+    /// visible. A point outside it is outside this element however much its
+    /// own box says otherwise - which is what stops a scrolled-away row
+    /// answering a click.
+    visible: BoundingBox,
+    /// Index into `hits` of the parent's entry, or itself for the root.
+    parent: u32,
+    capture: bool,
+    preserve_focus: bool,
 };
 
 /// Where one scroll container is, and how much there is to scroll through.
@@ -203,11 +229,14 @@ pub const Scroll = struct {
 
 /// A run of text, and where its lines ended up.
 const TextRun = struct {
-    /// Borrowed from the caller, and valid until the next `begin`. A UI
-    /// declares its text from strings it already has - a field, a literal, a
-    /// buffer it formatted - and copying every one of them every frame would
-    /// be the largest allocation in the library by far.
-    content: []const u8,
+    /// Where the copy of the text is in `strings`.
+    ///
+    /// An offset rather than a slice, because appending the *next* run may
+    /// move the buffer - and a slice taken before that would then point at
+    /// freed memory, which is the whole class of bug this copy exists to
+    /// prevent.
+    start: u32,
+    len: u32,
     style: text_mod.TextStyle,
     element: u32,
     lines_start: u32 = 0,
@@ -253,6 +282,24 @@ open_stack: std.ArrayList(Open),
 /// This frame's output.
 output: std.ArrayList(RenderCommand),
 
+/// Every element that can be pointed at, as the frame just finished left it.
+///
+/// Kept between frames because that is when the question is asked: `hovered`
+/// is called while the tree is being declared, and where an element ends up is
+/// not known until the tree is finished. See `input`.
+hits: std.ArrayList(Hit),
+
+/// Where the pointer is and what its button is doing.
+pointer: input.Pointer = .{},
+/// The elements under the pointer, outermost first. Ply's `pointer_over_ids`.
+over: std.ArrayList(u32),
+/// The elements that were under it when the button went down, and still are
+/// as far as this is concerned - Ply keeps the whole chain until the button
+/// comes up, so dragging off a button and back does not lose the press.
+held: std.ArrayList(u32),
+/// Which element has the keyboard, or zero for none.
+focus: u32 = 0,
+
 /// What each scroll container was scrolled to, kept between frames.
 ///
 /// The one piece of state in this library that outlives a frame. A layout is
@@ -265,6 +312,20 @@ scrolls: std.AutoHashMapUnmanaged(u32, Scroll),
 runs: std.ArrayList(TextRun),
 /// Every run's lines, flattened, after wrapping.
 lines: std.ArrayList(Line),
+
+/// The text declared this frame, copied.
+///
+/// **Copied, not borrowed**, and that is worth the paragraph. A caller writes
+/// `ui.text(label, ...)` where `label` was formatted into a stack buffer a
+/// line ago, and the layout does not read it until `end` - by which time the
+/// buffer is gone and what gets drawn is whatever is on the stack now. It is
+/// not a hypothetical: the first example written against a borrowing version
+/// of this API had exactly that bug, and it showed as a list of empty boxes.
+///
+/// Ply copies too, into a fresh `String` per element per frame. This is one
+/// buffer, cleared and refilled - so it is the same safety for an allocation
+/// that stops happening once the interface has settled.
+strings: std.ArrayList(u8),
 
 /// How to find out how wide a piece of text is.
 ///
@@ -306,9 +367,13 @@ pub fn init(gpa: Allocator) Ui {
         .pending = .empty,
         .open_stack = .empty,
         .output = .empty,
+        .hits = .empty,
+        .over = .empty,
+        .held = .empty,
         .scrolls = .empty,
         .runs = .empty,
         .lines = .empty,
+        .strings = .empty,
         .queue = .empty,
         .resizable = .empty,
         .walk = .empty,
@@ -321,9 +386,13 @@ pub fn deinit(self: *Ui) void {
     self.pending.deinit(self.gpa);
     self.open_stack.deinit(self.gpa);
     self.output.deinit(self.gpa);
+    self.hits.deinit(self.gpa);
+    self.over.deinit(self.gpa);
+    self.held.deinit(self.gpa);
     self.scrolls.deinit(self.gpa);
     self.runs.deinit(self.gpa);
     self.lines.deinit(self.gpa);
+    self.strings.deinit(self.gpa);
     self.queue.deinit(self.gpa);
     self.resizable.deinit(self.gpa);
     self.walk.deinit(self.gpa);
@@ -346,6 +415,7 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
     self.output.clearRetainingCapacity();
     self.runs.clearRetainingCapacity();
     self.lines.clearRetainingCapacity();
+    self.strings.clearRetainingCapacity();
 
     // Nothing has been declared yet, so nothing is live. Whatever is still
     // not live when the frame ends was not on the page and is forgotten.
@@ -360,6 +430,13 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
 /// the stored position as the element is configured - and the reason is that
 /// positioning happens long afterwards, by which time the declaration is
 /// gone. The caller writes `.clip = .scrollY` and never touches the offset.
+/// Which element is currently open, or zero when none is - which happens
+/// only for the root, whose parent is itself.
+fn innermost(self: *Ui) u32 {
+    if (self.open_stack.items.len == 0) return 0;
+    return self.open_stack.items[self.open_stack.items.len - 1].element;
+}
+
 fn remembered(self: *Ui, declaration: layout.Declaration) layout.Clip {
     var clip = declaration.clip;
     if (!clip.scrolls()) return clip;
@@ -428,6 +505,9 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
         .z_index = declaration.z_index,
         .slot_fit = declaration.slotFit(),
         .clip = self.remembered(declaration),
+        .parent = self.innermost(),
+        .capture = declaration.capture,
+        .preserve_focus = declaration.preserve_focus,
     });
 
     // The new element is a child of whatever is open, unless it is the root.
@@ -442,8 +522,10 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
 /// A run of text. Ply's `ui.text(text, |t| ...)`.
 ///
 /// Not an `open` and a `close`: a text element has no children and its size
-/// comes from measuring rather than from summing, so it is added whole. The
-/// string is borrowed and must outlive the frame - see `TextRun.content`.
+/// comes from measuring rather than from summing, so it is added whole.
+///
+/// **The string is copied**, so a caller may hand over a stack buffer it
+/// formatted a line ago and forget about it. See `strings`.
 ///
 /// ```zig
 /// ui.text("Hello, Fluxion!", .{ .font_size = 32, .color = .hex(0xFFFFFF) });
@@ -457,8 +539,14 @@ pub fn text(self: *Ui, content: []const u8, style: text_mod.TextStyle) void {
     self.textChecked(content, style) catch |err| self.remember(err);
 }
 
-fn textChecked(self: *Ui, content: []const u8, style: text_mod.TextStyle) Error!void {
+fn textChecked(self: *Ui, run: []const u8, style: text_mod.TextStyle) Error!void {
     const index: u32 = @intCast(self.elements.items.len);
+
+    // Copied first, and everything below measures the copy - so a caller
+    // whose buffer is about to go out of scope is already safe.
+    const start: u32 = @intCast(self.strings.items.len);
+    try self.strings.appendSlice(self.gpa, run);
+    const content = self.strings.items[start..][0..run.len];
 
     // Without a measurer there is nothing to measure with, and a zero-sized
     // element is a visible mistake rather than a silent one.
@@ -480,13 +568,15 @@ fn textChecked(self: *Ui, content: []const u8, style: text_mod.TextStyle) Error!
         .border = null,
         .z_index = 0,
         .slot_fit = null,
+        .parent = self.innermost(),
         .run = @intCast(self.runs.items.len),
         .dimensions = measured,
         .min_dimensions = smallest,
     });
 
     try self.runs.append(self.gpa, .{
-        .content = content,
+        .start = start,
+        .len = @intCast(run.len),
         .style = style,
         .element = index,
     });
@@ -641,6 +731,7 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
 
     try self.positionAndEmit();
     try self.measureScroll();
+    try self.recordHits();
     return self.output.items;
 }
 
@@ -999,7 +1090,8 @@ fn wrapText(self: *Ui) Error!void {
         run.lines_start = @intCast(self.lines.items.len);
         run.lines_len = 0;
 
-        var words: text_mod.Words = .init(run.content, run.style, measurer);
+        const content = self.strings.items[run.start..][0..run.len];
+        var words: text_mod.Words = .init(content, run.style, measurer);
         var start: ?u32 = null;
         var stop: u32 = 0;
         var line_width: f32 = 0;
@@ -1143,7 +1235,7 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
             .id = element.id,
             .z_index = element.z_index,
             .config = .{ .text = .{
-                .text = run.content[line.start..][0..line.len],
+                .text = self.strings.items[run.start..][0..run.len][line.start..][0..line.len],
                 .color = run.style.color,
                 .font_size = run.style.font_size,
                 .letter_spacing = run.style.letter_spacing,
@@ -1381,6 +1473,227 @@ fn measureScroll(self: *Ui) Error!void {
         }
     }
     for (stale[0..count]) |key| _ = self.scrolls.remove(key);
+}
+
+// -------------------------------------------------------------------------
+// Pointing at things
+// -------------------------------------------------------------------------
+
+/// Write down where everything ended up, so the next frame can be asked what
+/// is under the pointer.
+///
+/// Parents come before children in `elements`, so one forward pass can build
+/// each element's visible rectangle from its parent's - no stack, and no
+/// second walk of the tree.
+fn recordHits(self: *Ui) Error!void {
+    self.hits.clearRetainingCapacity();
+    try self.hits.ensureTotalCapacity(self.gpa, self.elements.items.len);
+
+    for (self.elements.items, 0..) |element, i| {
+        const parent = element.parent;
+        // Everything an element's clipping ancestors leave showing. The root
+        // is bounded by the surface, which is also its own box.
+        const visible: BoundingBox = if (i == 0)
+            element.box
+        else block: {
+            const outer = self.hits.items[parent];
+            const from_parent = if (self.elements.items[parent].clip.clips())
+                outer.visible.intersect(self.elements.items[parent].box)
+            else
+                outer.visible;
+            break :block from_parent;
+        };
+
+        self.hits.appendAssumeCapacity(.{
+            .id = element.id,
+            .box = element.box,
+            .visible = visible,
+            .parent = parent,
+            .capture = element.capture,
+            .preserve_focus = element.preserve_focus,
+        });
+    }
+}
+
+/// Say where the pointer is and whether its button is down.
+///
+/// **Call it before `begin`**, once a frame. It advances the button through
+/// `input.PointerState` - so "just pressed" fires exactly once however many
+/// times it is asked - and works out what is under the pointer from where
+/// things were when the last frame finished.
+///
+/// Ply calls this `set_pointer_state` and calls it at the same point.
+pub fn setPointer(self: *Ui, x: f32, y: f32, down: bool) void {
+    self.pointer.position = .{ .x = x, .y = y };
+    self.pointer.state = self.pointer.state.advance(down);
+
+    self.over.clearRetainingCapacity();
+    self.chainUnder(self.pointer.position) catch {};
+
+    if (self.pointer.justPressed()) {
+        self.held.clearRetainingCapacity();
+        self.held.appendSlice(self.gpa, self.over.items) catch {};
+        self.takeFocus();
+    } else if (self.pointer.isUp()) {
+        // The chain is kept for the frame the button comes up in, so
+        // `justReleased` has something to answer about, and dropped after.
+        if (self.pointer.state == .idle) self.held.clearRetainingCapacity();
+    }
+}
+
+/// Fill `over` with the elements under a point, outermost first.
+///
+/// Backwards through the hit list, because that is paint order: the last
+/// thing drawn is the thing on top, so the last box containing the point is
+/// the one being pointed at. Then up the tree from there, which gives the
+/// ancestors - and stops at anything that captures.
+fn chainUnder(self: *Ui, point: geometry.Vec2) Error!void {
+    if (self.hits.items.len == 0) return;
+
+    var topmost: ?u32 = null;
+    var i = self.hits.items.len;
+    while (i > 0) {
+        i -= 1;
+        const hit = self.hits.items[i];
+        if (hit.box.contains(point) and hit.visible.contains(point)) {
+            topmost = @intCast(i);
+            break;
+        }
+    }
+
+    const found = topmost orelse return;
+
+    // Up to the root, or to whatever takes the pointer for itself. A button
+    // inside a draggable panel captures, so dragging the button does not also
+    // drag the panel.
+    var chain: [max_depth]u32 = undefined;
+    var depth: usize = 0;
+    var at = found;
+    while (depth < chain.len) {
+        chain[depth] = at;
+        depth += 1;
+        if (self.hits.items[at].capture) break;
+        const parent = self.hits.items[at].parent;
+        if (parent == at) break;
+        at = parent;
+    }
+
+    // Outermost first, which is the order Ply hands them over in.
+    var back = depth;
+    while (back > 0) {
+        back -= 1;
+        try self.over.append(self.gpa, self.hits.items[chain[back]].id);
+    }
+}
+
+/// Move the keyboard to whatever was just pressed.
+///
+/// The innermost element under the pointer takes it, unless it asked not to.
+/// Ply's `preserve_focus` is for a toolbar button that should not take the
+/// caret out of the text field beside it - pressing it does something, and
+/// the field stays focused.
+fn takeFocus(self: *Ui) void {
+    if (self.over.items.len == 0) {
+        self.focus = 0;
+        return;
+    }
+
+    const innermost_id = self.over.items[self.over.items.len - 1];
+    for (self.hits.items) |hit| {
+        if (hit.id == innermost_id and hit.preserve_focus) return;
+    }
+    self.focus = innermost_id;
+}
+
+fn isOver(self: *Ui, id: u32) bool {
+    for (self.over.items) |over| {
+        if (over == id) return true;
+    }
+    return false;
+}
+
+fn isHeld(self: *Ui, id: u32) bool {
+    for (self.held.items) |held| {
+        if (held == id) return true;
+    }
+    return false;
+}
+
+// -- asked of the element currently open --
+
+/// Whether the pointer is over the element being declared. Ply's
+/// `ui.hovered()`.
+pub fn hovered(self: *Ui) bool {
+    return self.isOver(self.openId());
+}
+
+/// Whether the button went down on this element and has not come up. Ply's
+/// `ui.pressed()`.
+pub fn pressed(self: *Ui) bool {
+    return self.pointer.isDown() and self.isHeld(self.openId());
+}
+
+/// Whether the button went down on this element this frame. Ply's
+/// `ui.just_pressed()`.
+pub fn justPressed(self: *Ui) bool {
+    return self.pointer.justPressed() and self.isHeld(self.openId());
+}
+
+/// Whether the button came up on this element this frame. Ply's
+/// `ui.just_released()`.
+///
+/// The one to hang a button on: it fires once, and only if the press started
+/// here - so dragging in from somewhere else and letting go does nothing.
+pub fn justReleased(self: *Ui) bool {
+    return self.pointer.justReleased() and self.isHeld(self.openId()) and self.hovered();
+}
+
+/// Whether this element has the keyboard. Ply's `ui.focused()`.
+pub fn focused(self: *Ui) bool {
+    return self.focus != 0 and self.focus == self.openId();
+}
+
+fn openId(self: *Ui) u32 {
+    if (self.open_stack.items.len == 0) return 0;
+    return self.elements.items[self.innermost()].id;
+}
+
+// -- asked by name, from anywhere --
+
+/// Whether the pointer is over this element. Ply's `pointer_over(id)`.
+pub fn isPointerOver(self: *Ui, name: []const u8) bool {
+    return self.isOver(identify(name, 0));
+}
+
+/// Ply's `is_pressed(id)`.
+pub fn isElementPressed(self: *Ui, name: []const u8) bool {
+    return self.pointer.isDown() and self.isHeld(identify(name, 0));
+}
+
+/// Ply's `is_just_released(id)`.
+pub fn isElementReleased(self: *Ui, name: []const u8) bool {
+    const id = identify(name, 0);
+    return self.pointer.justReleased() and self.isHeld(id) and self.isOver(id);
+}
+
+/// The elements under the pointer, outermost first. Ply's
+/// `pointer_over_ids()`.
+pub fn pointerOver(self: *Ui) []const u32 {
+    return self.over.items;
+}
+
+/// Give the keyboard to an element, by name.
+pub fn setFocus(self: *Ui, name: []const u8) void {
+    self.focus = identify(name, 0);
+}
+
+pub fn clearFocus(self: *Ui) void {
+    self.focus = 0;
+}
+
+/// Whether this element has the keyboard.
+pub fn isFocused(self: *Ui, name: []const u8) bool {
+    return self.focus != 0 and self.focus == identify(name, 0);
 }
 
 // -------------------------------------------------------------------------
@@ -2850,4 +3163,526 @@ test "progress runs from zero to one across the content" {
     ui.scrollTo("list", 0, 200);
     try declare(&ui);
     try testing.expectEqual(@as(f32, 1), ui.scrollOf("list").?.progress().y);
+}
+
+// -------------------------------------------------------------------------
+// Pointing at things
+// -------------------------------------------------------------------------
+//
+// Every one of these runs two frames, and that is not an accident: the first
+// lays the tree out, the second asks about it. `hovered` is called while the
+// tree is being declared, so it can only answer from where things were last
+// time - see `input`. A test that ran one frame would find nothing hovered
+// and would be testing nothing.
+
+/// Two panels side by side, with a button in the second.
+fn panels(u: *Ui) !void {
+    u.begin(.init(400, 200));
+    {
+        u.open(.{ .width = .grow, .height = .grow });
+        defer u.close();
+
+        u.empty(.{ .id = "left", .width = .fixed(200), .height = .grow, .background_color = paint });
+
+        u.open(.{ .id = "right", .width = .grow, .height = .grow, .background_color = paint });
+        defer u.close();
+        u.empty(.{ .id = "button", .width = .fixed(80), .height = .fixed(30), .background_color = paint });
+    }
+    _ = try u.end();
+}
+
+test "the pointer finds the element under it, and its ancestors with it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try panels(&ui);
+
+    // Over the button, which sits at the top left of the right-hand panel.
+    ui.setPointer(210, 10, false);
+    try panels(&ui);
+
+    try testing.expect(ui.isPointerOver("button"));
+    // And the panel behind it, because a chain is ancestors *and* the thing
+    // itself - a hover style on a card should not switch off because the
+    // pointer is over a label inside it.
+    try testing.expect(ui.isPointerOver("right"));
+    try testing.expect(!ui.isPointerOver("left"));
+
+    // Outermost first.
+    const chain = ui.pointerOver();
+    try testing.expectEqual(identify("button", 0), chain[chain.len - 1]);
+}
+
+test "the pointer somewhere else finds nothing of ours" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try panels(&ui);
+    ui.setPointer(10, 10, false);
+    try panels(&ui);
+
+    try testing.expect(ui.isPointerOver("left"));
+    try testing.expect(!ui.isPointerOver("right"));
+    try testing.expect(!ui.isPointerOver("button"));
+}
+
+test "hovered can be asked inline, while the element is open" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui, seen: *bool) !void {
+            u.begin(.init(400, 200));
+            {
+                u.open(.{ .width = .grow, .height = .grow });
+                defer u.close();
+
+                u.open(.{ .id = "target", .width = .fixed(100), .height = .fixed(50) });
+                defer u.close();
+                // The whole point of the API: asked here, about this.
+                seen.* = u.hovered();
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    var hovered_now = false;
+    try frame(&ui, &hovered_now);
+    ui.setPointer(50, 25, false);
+    try frame(&ui, &hovered_now);
+    try testing.expect(hovered_now);
+
+    ui.setPointer(300, 100, false);
+    try frame(&ui, &hovered_now);
+    try testing.expect(!hovered_now);
+}
+
+test "the topmost element wins where two overlap" {
+    // A real overlap, which takes some arranging without floating elements:
+    // the first panel does not clip, so its three-hundred-pixel child runs
+    // out over the panel beside it. The one declared later is painted later
+    // and is therefore on top.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 200));
+            {
+                u.open(.{ .width = .grow, .height = .grow });
+                defer u.close();
+
+                u.open(.{ .width = .fixed(100), .height = .fixed(100) });
+                {
+                    defer u.close();
+                    // Overflows its parent by two hundred pixels.
+                    u.empty(.{ .id = "under", .width = .fixed(300), .height = .fixed(100) });
+                }
+                u.empty(.{ .id = "over", .width = .fixed(200), .height = .fixed(100) });
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+
+    // At x = 150 both boxes are present: `under` runs from 0 to 300, and
+    // `over` from 100 to 300.
+    ui.setPointer(150, 50, false);
+    try frame(&ui);
+
+    try testing.expect(ui.isPointerOver("over"));
+    try testing.expect(!ui.isPointerOver("under"));
+
+    // And where only the first one reaches, it is found.
+    ui.setPointer(50, 50, false);
+    try frame(&ui);
+    try testing.expect(ui.isPointerOver("under"));
+}
+
+test "a press fires once, holds while down, and releases once" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try panels(&ui);
+    ui.setPointer(210, 10, false);
+    try panels(&ui);
+
+    // Down.
+    ui.setPointer(210, 10, true);
+    try panels(&ui);
+    try testing.expect(ui.pointer.justPressed());
+    try testing.expect(ui.isElementPressed("button"));
+
+    // Still down: pressed stays, just-pressed does not.
+    ui.setPointer(210, 10, true);
+    try panels(&ui);
+    try testing.expect(!ui.pointer.justPressed());
+    try testing.expect(ui.isElementPressed("button"));
+
+    // Up: released once.
+    ui.setPointer(210, 10, false);
+    try panels(&ui);
+    try testing.expect(ui.isElementReleased("button"));
+    try testing.expect(!ui.isElementPressed("button"));
+
+    // And not again.
+    ui.setPointer(210, 10, false);
+    try panels(&ui);
+    try testing.expect(!ui.isElementReleased("button"));
+}
+
+test "a press that started elsewhere does not release here" {
+    // Dragging in from outside and letting go must not fire a button. This is
+    // the difference between `justReleased` and "the pointer is up over me".
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try panels(&ui);
+
+    // Press on the left panel.
+    ui.setPointer(10, 10, false);
+    try panels(&ui);
+    ui.setPointer(10, 10, true);
+    try panels(&ui);
+    try testing.expect(ui.isElementPressed("left"));
+
+    // Drag over the button and let go.
+    ui.setPointer(210, 10, true);
+    try panels(&ui);
+    ui.setPointer(210, 10, false);
+    try panels(&ui);
+
+    try testing.expect(!ui.isElementReleased("button"));
+}
+
+test "dragging off a button and back keeps it pressed" {
+    // Ply keeps the chain the pointer went down on until the button comes up,
+    // so a press survives a wobble. Matched here rather than improved on.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try panels(&ui);
+    ui.setPointer(210, 10, false);
+    try panels(&ui);
+    ui.setPointer(210, 10, true);
+    try panels(&ui);
+
+    // Off it, still held.
+    ui.setPointer(10, 150, true);
+    try panels(&ui);
+    try testing.expect(ui.isElementPressed("button"));
+    // But not hovered, so a release out here would not fire it.
+    try testing.expect(!ui.isPointerOver("button"));
+}
+
+test "an element that captures keeps the pointer from its ancestors" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 200));
+            {
+                u.open(.{ .id = "panel", .width = .grow, .height = .grow, .background_color = paint });
+                defer u.close();
+                u.empty(.{
+                    .id = "grabby",
+                    .width = .fixed(80),
+                    .height = .fixed(30),
+                    .capture = true,
+                    .background_color = paint,
+                });
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+    ui.setPointer(10, 10, false);
+    try frame(&ui);
+
+    // The button is pointed at and the panel under it is not - which is what
+    // stops dragging a knob from also dragging the window it is on.
+    try testing.expect(ui.isPointerOver("grabby"));
+    try testing.expect(!ui.isPointerOver("panel"));
+    try testing.expectEqual(1, ui.pointerOver().len);
+}
+
+test "a clipped-away element is not under the pointer, wherever its box is" {
+    // The box says the row is at y = 400; the scissor says only the first
+    // hundred pixels are showing. A hit test that looked at the box alone
+    // would let a scrolled-away row answer a click.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 400));
+            {
+                u.open(.{ .width = .grow, .height = .grow });
+                defer u.close();
+
+                u.open(.{
+                    .id = "window",
+                    .width = .fixed(200),
+                    .height = .fixed(100),
+                    .direction = .top_to_bottom,
+                    .clip = .both,
+                });
+                defer u.close();
+
+                u.empty(.{ .id = "showing", .width = .grow, .height = .fixed(50), .background_color = paint });
+                u.empty(.{ .id = "hidden", .width = .grow, .height = .fixed(50), .background_color = paint });
+                u.empty(.{ .id = "gone", .width = .grow, .height = .fixed(50), .background_color = paint });
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+
+    // Inside the window, over the first row.
+    ui.setPointer(50, 20, false);
+    try frame(&ui);
+    try testing.expect(ui.isPointerOver("showing"));
+
+    // The third row's box is at y = 100..150, which is outside the
+    // hundred-pixel window. Pointing where it would be finds nothing.
+    ui.setPointer(50, 120, false);
+    try frame(&ui);
+    try testing.expect(!ui.isPointerOver("gone"));
+    try testing.expect(!ui.isPointerOver("window"));
+}
+
+test "scrolling changes what is under the pointer" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 400));
+            {
+                u.open(.{ .width = .grow, .height = .grow });
+                defer u.close();
+
+                u.open(.{
+                    .id = "list",
+                    .width = .fixed(200),
+                    .height = .fixed(100),
+                    .direction = .top_to_bottom,
+                    .clip = .scrollY,
+                });
+                defer u.close();
+
+                u.empty(.{ .id = "one", .width = .grow, .height = .fixed(50), .background_color = paint });
+                u.empty(.{ .id = "two", .width = .grow, .height = .fixed(50), .background_color = paint });
+                u.empty(.{ .id = "three", .width = .grow, .height = .fixed(50), .background_color = paint });
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+    ui.setPointer(50, 20, false);
+    try frame(&ui);
+    try testing.expect(ui.isPointerOver("one"));
+
+    // Scroll down by one row: the same place on screen is now the second.
+    ui.scrollTo("list", 0, 50);
+    try frame(&ui);
+    ui.setPointer(50, 20, false);
+    try frame(&ui);
+
+    try testing.expect(ui.isPointerOver("two"));
+    try testing.expect(!ui.isPointerOver("one"));
+}
+
+test "pressing gives an element the keyboard" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try panels(&ui);
+    ui.setPointer(210, 10, false);
+    try panels(&ui);
+
+    try testing.expect(!ui.isFocused("button"));
+
+    ui.setPointer(210, 10, true);
+    try panels(&ui);
+    try testing.expect(ui.isFocused("button"));
+
+    // Pressing somewhere else moves it.
+    ui.setPointer(10, 150, false);
+    try panels(&ui);
+    ui.setPointer(10, 150, true);
+    try panels(&ui);
+    try testing.expect(!ui.isFocused("button"));
+    try testing.expect(ui.isFocused("left"));
+}
+
+test "preserve_focus leaves the keyboard where it was" {
+    // A toolbar button pressed while a text field has the caret: the button
+    // does its work and the field keeps the caret.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 200));
+            {
+                u.open(.{ .width = .grow, .height = .grow });
+                defer u.close();
+                u.empty(.{ .id = "field", .width = .fixed(200), .height = .grow, .background_color = paint });
+                u.empty(.{
+                    .id = "bold",
+                    .width = .fixed(40),
+                    .height = .fixed(40),
+                    .preserve_focus = true,
+                    .background_color = paint,
+                });
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+    ui.setPointer(10, 10, false);
+    try frame(&ui);
+    ui.setPointer(10, 10, true);
+    try frame(&ui);
+    try testing.expect(ui.isFocused("field"));
+
+    // Press the toolbar button.
+    ui.setPointer(210, 10, false);
+    try frame(&ui);
+    ui.setPointer(210, 10, true);
+    try frame(&ui);
+
+    try testing.expect(ui.isElementPressed("bold"));
+    try testing.expect(ui.isFocused("field"));
+}
+
+test "pressing nothing clears the focus" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try panels(&ui);
+    ui.setPointer(210, 10, true);
+    try panels(&ui);
+    try testing.expect(ui.isFocused("button"));
+
+    // Off the surface entirely.
+    ui.setPointer(-50, -50, false);
+    try panels(&ui);
+    ui.setPointer(-50, -50, true);
+    try panels(&ui);
+    try testing.expect(!ui.isFocused("button"));
+}
+
+test "focus can be set and cleared by hand" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try panels(&ui);
+    ui.setFocus("button");
+    try testing.expect(ui.isFocused("button"));
+
+    ui.clearFocus();
+    try testing.expect(!ui.isFocused("button"));
+    try testing.expect(!ui.isFocused("left"));
+}
+
+test "the first frame has nothing under the pointer, and says so" {
+    // Nothing has been laid out yet, so there is nothing to be over. Asking
+    // must answer no rather than reading an empty list off the end.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.setPointer(50, 50, true);
+    try testing.expectEqual(0, ui.pointerOver().len);
+    try testing.expect(!ui.isPointerOver("anything"));
+    try testing.expect(!ui.isElementPressed("anything"));
+}
+
+test "the inline queries and the ones by name agree" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var inline_hovered = false;
+    var inline_pressed = false;
+
+    const frame = struct {
+        fn run(u: *Ui, h: *bool, p: *bool) !void {
+            u.begin(.init(400, 200));
+            {
+                u.open(.{ .width = .grow, .height = .grow });
+                defer u.close();
+                u.open(.{ .id = "target", .width = .fixed(100), .height = .fixed(50) });
+                defer u.close();
+                h.* = u.hovered();
+                p.* = u.pressed();
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui, &inline_hovered, &inline_pressed);
+    ui.setPointer(50, 25, true);
+    try frame(&ui, &inline_hovered, &inline_pressed);
+
+    try testing.expectEqual(ui.isPointerOver("target"), inline_hovered);
+    try testing.expectEqual(ui.isElementPressed("target"), inline_pressed);
+    try testing.expect(inline_hovered);
+    try testing.expect(inline_pressed);
+}
+
+test "text is copied, so a buffer that goes out of scope is still drawn" {
+    // The bug this exists to stop, and it is not hypothetical: a list whose
+    // labels are formatted into a stack buffer inside the loop drew a column
+    // of empty boxes, because by the time `end` measured them the buffer had
+    // been reused. Ply copies; so does this.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 200));
+    {
+        ui.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+        defer ui.close();
+
+        for (0..3) |i| {
+            // Exactly the shape that failed: a buffer whose lifetime ends
+            // with this iteration.
+            var scratch: [16]u8 = undefined;
+            const label = std.fmt.bufPrint(&scratch, "Item {d}", .{i}) catch "?";
+            ui.text(label, .{ .font_size = 16, .color = paint });
+            // Scribble over it, which is what the next iteration would do.
+            @memset(&scratch, 0xAA);
+        }
+    }
+    const drawn = try ui.end();
+
+    try testing.expectEqual(3, drawn.len);
+    try testing.expectEqualStrings("Item 0", drawn[0].config.text.text);
+    try testing.expectEqualStrings("Item 1", drawn[1].config.text.text);
+    try testing.expectEqualStrings("Item 2", drawn[2].config.text.text);
+}
+
+test "the copies are thrown away and the buffer reused each frame" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    for (0..3) |_| {
+        ui.begin(.init(400, 200));
+        {
+            ui.open(.{ .width = .grow, .height = .grow });
+            defer ui.close();
+            ui.text("Hello", .{ .font_size = 16, .color = paint });
+        }
+        _ = try ui.end();
+
+        // Five bytes a frame, not fifteen by the third: the buffer is
+        // cleared and refilled, so a settled interface stops allocating.
+        try testing.expectEqual(5, ui.strings.items.len);
+    }
 }

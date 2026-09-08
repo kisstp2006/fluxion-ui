@@ -243,6 +243,15 @@ pub const Declaration = struct {
     /// What happens to content larger than this element. See `Clip`.
     clip: Clip = .none,
 
+    /// Whether the pointer stops here rather than reaching what is behind.
+    /// Ply's `.capture()`, and what a button inside a draggable panel wants:
+    /// dragging the button must not also drag the panel.
+    capture: bool = false,
+    /// Whether pressing here leaves the keyboard where it is. Ply's
+    /// `.preserve_focus()`, for a toolbar control that should not take the
+    /// caret out of the field beside it.
+    preserve_focus: bool = false,
+
     /// Drawn above lower numbers, below higher ones. Elements at the same
     /// z-index are drawn in the order they were declared.
     z_index: i16 = 0,

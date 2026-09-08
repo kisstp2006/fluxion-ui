@@ -40,6 +40,7 @@ const std = @import("std");
 pub const color = @import("color.zig");
 pub const commands = @import("commands.zig");
 pub const geometry = @import("geometry.zig");
+pub const input = @import("input.zig");
 pub const layout = @import("layout.zig");
 pub const text = @import("text.zig");
 
@@ -63,6 +64,9 @@ pub const SlotFit = layout.SlotFit;
 pub const AlignX = geometry.AlignX;
 pub const AlignY = geometry.AlignY;
 
+pub const Pointer = input.Pointer;
+pub const PointerState = input.PointerState;
+
 pub const TextStyle = text.TextStyle;
 pub const Measurer = text.Measurer;
 pub const WrapMode = text.WrapMode;
@@ -74,6 +78,7 @@ test {
     _ = color;
     _ = commands;
     _ = geometry;
+    _ = input;
     _ = layout;
     _ = text;
     _ = Ui;

@@ -114,6 +114,15 @@ the differences are the ones Zig forces, and there are three of them.
 | `.overflow(\|o\| o.scroll_y())` | `.clip = .scrollY` |
 | `.overflow(\|o\| o.clip_x())` | `.clip = .x` |
 | `ui.scroll_offset()` | `ui.scrollOf("list").?.position` |
+| `ui.hovered()` | `ui.hovered()` |
+| `ui.pressed()`, `ui.just_pressed()` | `ui.pressed()`, `ui.justPressed()` |
+| `ui.just_released()` | `ui.justReleased()` |
+| `ui.focused()` | `ui.focused()` |
+| `pointer_over(id)` | `ui.isPointerOver("save")` |
+| `is_pressed(id)` | `ui.isElementPressed("save")` |
+| `bounding_box(id)` | `ui.boxOf("save")` |
+| `.capture()` | `.capture = true` |
+| `.preserve_focus()` | `.preserve_focus = true` |
 | `.contain(16.0/9.0)` | `.contain = 16.0 / 9.0` |
 | `.cover(16.0/9.0)` | `.cover = 16.0 / 9.0` |
 | `.id("save")` | `.id = "save"` |
@@ -225,6 +234,11 @@ font, or with the monospace measurer, and the layout is identical in all
 three. The adapter for a real font is fifteen lines, and
 `examples/prose.zig` is all fifteen of them.
 
+**The string is copied**, so a label formatted into a stack buffer a line ago
+is safe to hand over. Ply copies too, into a fresh string per element per
+frame; this is one buffer, cleared and refilled, so a settled interface stops
+allocating for it.
+
 **Text is what makes the shrink pass mean anything.** Every other kind of
 element has a minimum equal to its content and so cannot give way. A paragraph
 can: it is as wide as it would be unbroken and as narrow as its longest word,
@@ -238,6 +252,46 @@ passes run in the order they do -
 
 Getting steps two and three the wrong way round makes a wrapped paragraph
 overflow the card drawn round it, which is a bug that only shows on long text.
+
+## Pointing at things
+
+```zig
+ui.setPointer(mouse_x, mouse_y, mouse_down);   // once, before `begin`
+
+ui.open(.{ .id = "save", ... });
+defer ui.close();
+if (ui.hovered()) { ... }
+if (ui.justReleased()) { save(); }
+```
+
+**The answers are one frame old**, and they have to be. `hovered` is asked
+while the tree is being declared, and where an element ends up is not known
+until the tree is finished - so it answers from where the element was last
+frame. Every immediate-mode interface works this way. It is invisible at sixty
+frames a second except in one case: an element that has just appeared, or has
+just moved a long way, is not hovered until the frame after.
+
+Four states rather than a boolean, because "went down this frame" and "is
+down" are different questions and a button needs both:
+
+| | |
+| --- | --- |
+| `hovered()` | the pointer is over it |
+| `pressed()` | the button went down on it and has not come up |
+| `justPressed()` | it went down this frame |
+| `justReleased()` | it came up this frame, on the element it went down on |
+
+`justReleased` is the one to hang a button on: dragging in from somewhere else
+and letting go does nothing, which is what every other interface does too.
+
+**A clipped-away element is not under the pointer**, whatever its box says.
+The hit test intersects every clipping ancestor, so a row scrolled out of a
+list does not answer a click at the place it would have been.
+
+`.capture = true` stops the pointer reaching what is behind - a knob inside a
+draggable panel wants it, so dragging the knob does not also drag the panel.
+`.preserve_focus = true` leaves the keyboard where it is, for a toolbar button
+that should not take the caret out of the field beside it.
 
 ## Clipping and scrolling
 
@@ -362,13 +416,13 @@ Ported and tested:
 - The element tree, and a stable number per element for state to hang off
 - Rectangles, corner radii, borders, and the command list they come out as
 - Clipping and scrolling, with the position remembered between frames
+- Hit testing, hover, press and focus, with capture and clip-aware picking
 - An optional renderer over Fluxion RHI: one instanced draw, an SDF for the shapes, a glyph atlas for the text
 
 Not yet, in the order it is worth doing:
 
 | | Why it is not here |
 | --- | --- |
-| **Hit testing, hover, focus** | Every element's final box is recorded - see `Ui.boxOf` - which is the half of it that had to come first. |
 | **Floating elements, wrapping, shaders, images** | Ply has all of these. They sit above the core rather than inside it. |
 | **Accessibility, networking, audio, storage** | Deliberately out of scope. Ply's are bound to its own subsystems, and this library builds on the fluxion ones. |
 

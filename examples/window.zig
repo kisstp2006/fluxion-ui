@@ -38,6 +38,7 @@ const theme = struct {
     const sidebar: ui.Color = .hex(0x191C21);
     const card: ui.Color = .hex(0x232830);
     const line: ui.Color = .hex(0x2E343D);
+    const hover: ui.Color = .hex(0x2E343D);
     const ink: ui.Color = .hex(0xE8E8EA);
     const accent: ui.Color = .oklch(0.7, 0.14, 250);
 };
@@ -119,13 +120,28 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                 var label: [24]u8 = undefined;
                 const text = std.fmt.bufPrint(&label, "Item {d}", .{i + 1}) catch "Item";
 
+                var name: [24]u8 = undefined;
+                const id = std.fmt.bufPrint(&name, "item{d}", .{i}) catch "item";
+
+                // Asked before the element is opened, because the answer is
+                // about where it was last frame - which is what an
+                // immediate-mode interface always has to work from.
+                const lit = u.isPointerOver(id);
+                const down = u.isElementPressed(id);
+
                 u.open(.{
+                    .id = id,
                     .width = .grow,
                     .height = .fixed(28),
                     .padding = .xy(10, 0),
                     .align_y = .center,
                     .corner_radius = .all(6),
-                    .background_color = theme.card,
+                    .background_color = if (down)
+                        theme.accent
+                    else if (lit)
+                        theme.hover
+                    else
+                        theme.card,
                 });
                 defer u.close();
                 u.text(text, .{ .font_size = 13, .color = theme.ink });
@@ -211,6 +227,10 @@ const Window = struct {
     inner: *Inner,
     /// How far the wheel has turned since this was last asked.
     wheel: f32 = 0,
+    /// Where the cursor is, and whether the left button is down.
+    pointer_x: f32 = 0,
+    pointer_y: f32 = 0,
+    down: bool = false,
 
     const Inner = struct {
         ctx: platform.Context,
@@ -278,6 +298,13 @@ const Window = struct {
             // One notch is one line of a list, near enough. Turning a wheel
             // event into pixels is the program's business, not the layout's.
             .scroll => |w| self.wheel -= @as(f32, @floatCast(w.y)) * 40,
+            .cursor => |m| {
+                self.pointer_x = @floatCast(m.x);
+                self.pointer_y = @floatCast(m.y);
+            },
+            .mouse_button => |b| if (b.button == .left) {
+                self.down = b.action == .press;
+            },
             else => {},
         };
         return !self.inner.win.shouldClose();
@@ -286,6 +313,14 @@ const Window = struct {
     fn takeWheel(self: *Window) f32 {
         defer self.wheel = 0;
         return self.wheel;
+    }
+
+    fn cursor(self: Window) struct { x: f32, y: f32 } {
+        return .{ .x = self.pointer_x, .y = self.pointer_y };
+    }
+
+    fn buttonDown(self: Window) bool {
+        return self.down;
     }
 
     /// What the OpenGL backend needs from whoever made the context, which is
@@ -366,6 +401,12 @@ pub fn main(init: std.process.Init) !void {
         // would ask which container is under it; this one has only the one.
         const wheel = window.takeWheel();
         if (wheel != 0) layout.scrollBy("list", 0, wheel);
+
+        // Before `begin`, once a frame. It advances the button through its
+        // four states and works out what is under the cursor from where
+        // things were when the last frame finished.
+        const cursor = window.cursor();
+        layout.setPointer(cursor.x, cursor.y, window.buttonDown());
 
         layout.begin(size);
         shell(&layout, size);
