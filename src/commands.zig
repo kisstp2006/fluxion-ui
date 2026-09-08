@@ -36,6 +36,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const geometry = @import("geometry.zig");
+const markup = @import("markup.zig");
 const layout = @import("layout.zig");
 
 const BoundingBox = geometry.BoundingBox;
@@ -82,6 +83,22 @@ pub const Text = struct {
     /// Which font, as an index into whatever table the caller registered.
     /// Zero is "the default one".
     font: u16 = 0,
+
+    /// What moves, tints or hides the glyphs of this run, and how many
+    /// characters into the whole run its first glyph is.
+    ///
+    /// Borrowed for the frame, like `text`. Empty for almost everything, and
+    /// a renderer that wants no part of animated text can ignore it and be
+    /// right about every interface that does not use one.
+    ///
+    /// It reaches the renderer rather than being resolved before it, because
+    /// where a letter of a wave sits depends on which letter it is - and the
+    /// renderer is the only thing here that has ever seen a letter.
+    effects: []const markup.Effect = &.{},
+    /// How far into the run this piece starts, in characters. A wave has to
+    /// travel along a whole sentence even when its middle is a different
+    /// colour and so a different command.
+    first: u32 = 0,
 };
 
 /// A rectangle of a texture.

@@ -429,8 +429,33 @@ tag - so `use { x } here` is prose, not a parse error. A `}` with nothing open
 is a `}`. A tag left open runs to the end. Ply errors on all three; showing the
 reader the text in the wrong colour beats showing them nothing.
 
-Ply's animated styles are not here - see the table above - and a tag naming one
-is ignored rather than refused, so the text still reads.
+### The ones that move
+
+```zig
+ui.markup("{wave_a=0.22_s=6|This waves} and {gradient|this runs through colours}", style);
+renderer.setTime(seconds);   // once a frame, on the renderer
+```
+
+All nine of Ply's, at Ply's defaults and with its argument names: `wave` and
+`jitter` move a glyph, `pulse` and `swing` resize and tilt one, `transform`
+does all three and does not move, `gradient` colours them, and `type`, `fade`
+and `scale` bring them in or take them away over time.
+
+**They reach the renderer rather than being resolved before it.** Where a
+letter of a wave sits depends on which letter it is and what time it is, and
+the renderer is the only thing here that has ever seen a letter - the layout
+works in runs. So the parameters travel on the text command and the per-glyph
+arithmetic happens where the glyphs are, on top of the same transform
+[rotation](#rotation) put on the instance.
+
+The pen does not move with them: a wave changes where a letter is *drawn* and
+not where the next one starts, or the word would stretch and squash as it
+went. That is Ply's behaviour and it is the only one that reads.
+
+`type`, `fade` and `scale` need a start time, which the renderer keeps by the
+`id` in the tag - so two runs written `{type_in_id=intro|...}` begin together.
+Ply panics when one of these is written without `in` or `out`; this reads a
+missing one as `in`, which is what somebody who forgot meant.
 
 ### Editing it
 
@@ -810,6 +835,7 @@ than from memory.
 | **Rotation** | of an element and its children or of its own box alone, with a pivot and flips, nesting, and a hit test that follows |
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
+| **Animated text** | all nine of Ply's: `wave`, `pulse`, `swing`, `jitter`, `transform`, `gradient`, `type`, `fade` and `scale` |
 | **Clipping and scrolling** | per axis, with the position remembered between frames and clamped when the content shrinks |
 | **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
 | **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, and clip-aware picking |
@@ -828,7 +854,6 @@ the order it is worth doing in.
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
 | **TinyVG** | Ply can hand a vector image straight to `.image(...)` and rasterise it. Here a picture is a texture, and turning TinyVG into one is somebody else's pass. |
 | **Shaders and effects** | `.effect(...)` and `.shader(...)`: a fragment shader per element, with Ply's own build step behind it. This renderer is one pipeline and one draw call by design, and a shader per element is a pipeline per element - so this is not a missing feature so much as a different renderer. A program that wants it can consume the command list itself. |
-| **Animated text styles** | `wave`, `jitter`, `pulse`, `swing`, `type`, `fade`, `scale`, `transform`, `gradient`. Every one moves or resizes single glyphs, and a command here describes a run rather than a glyph - so these come with rotation and effects, not before them. |
 | **Drag scrolling** | Dragging the content itself, with momentum, a decay curve and a smoothing filter. This scrolls by wheel, by `scrollBy`, and by the scrollbar. Ply's `no_drag_scroll` exists to turn the thing off that is not here. |
 | **Smooth scrolling** | Ply animates towards a target position over a duration. Here a scroll position is a number, and it changes when something changes it. |
 | **`between_children` borders** | A line drawn between one child and the next, without an element per separator. |

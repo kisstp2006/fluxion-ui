@@ -70,6 +70,137 @@ pub const Shadow = struct {
     offset: geometry.Vec2 = .{ .x = -0.3, .y = 0.3 },
 };
 
+/// The four numbers every oscillating effect takes, under Ply's names.
+///
+/// The wave they all share is `cos(2pi * (f*t + i/w + p))`, where `i` is how
+/// many characters into the run this one is - so `w` is a wavelength measured
+/// in characters and is what makes a wave travel along a word rather than
+/// every letter moving together.
+pub const Cycle = struct {
+    /// How many characters make one wavelength. Ply's `w`.
+    width: f32 = 3,
+    /// Cycles a second. Ply's `f`, or `s / w` when `s` is given instead -
+    /// `s` being how many characters a second the wave travels.
+    frequency: f32 = 0.5,
+    /// How far it goes, in whatever the effect measures in. Ply's `a`.
+    amplitude: f32 = 0.3,
+    /// Where in the cycle to start. Ply's `p`.
+    phase: f32 = 0,
+
+    /// Where in the wave one character of one frame is.
+    pub fn at(self: Cycle, seconds: f64, index: f32) f32 {
+        const width = if (self.width == 0) 1 else self.width;
+        const turns = self.frequency * @as(f32, @floatCast(seconds)) + index / width + self.phase;
+        return @cos(2 * std.math.pi * turns);
+    }
+};
+
+/// One thing that moves, colours or hides a glyph. Ply's animated styles.
+///
+/// **Per glyph and per frame**, which is why these are carried rather than
+/// resolved: where a letter of a wave sits depends on which letter it is and
+/// what time it is, and neither is known when the tag is parsed.
+pub const Effect = union(enum) {
+    /// A displacement along a direction. Ply's `wave`.
+    wave: Wave,
+    /// A size that breathes. Ply's `pulse`, whose amplitude is a fraction.
+    pulse: Cycle,
+    /// A tilt that rocks. Ply's `swing`, whose amplitude is in degrees.
+    swing: Cycle,
+    /// A different small offset every twentieth of a second. Ply's `jitter`.
+    jitter: Jitter,
+    /// A fixed move, size and tilt. Ply's `transform`.
+    transform: Static,
+    /// A colour that runs along the text. Ply's `gradient`.
+    gradient: Gradient,
+    /// Letters arriving or leaving over time. Ply's `type`, `fade` and
+    /// `scale`, which differ only in what they do to the glyph.
+    reveal: Reveal,
+
+    pub const Wave = struct {
+        cycle: Cycle = .{},
+        /// Which way it displaces, in degrees. Zero is straight down, which
+        /// is Ply's.
+        direction: f32 = 0,
+    };
+
+    pub const Jitter = struct {
+        /// How far, in ems, on each axis.
+        radius: geometry.Vec2 = .{ .x = 0.1, .y = 0.1 },
+        /// The whole shake turned by this many degrees.
+        rotation: f32 = 0,
+    };
+
+    pub const Static = struct {
+        /// In ems, so it holds at any size.
+        translate: geometry.Vec2 = .{ .x = 0, .y = 0 },
+        scale: geometry.Vec2 = .{ .x = 1, .y = 1 },
+        /// In degrees, as Ply writes it.
+        rotate: f32 = 0,
+    };
+
+    pub const Gradient = struct {
+        /// How many characters a second the colours travel.
+        speed: f32 = 1,
+        stops: [max_stops]Stop = default_stops,
+        count: u8 = default_stop_count,
+
+        pub const max_stops = 12;
+
+        pub const Stop = struct { at: f32 = 0, color: Color = .white };
+
+        /// The colour this many characters along.
+        pub fn sample(self: Gradient, position: f32) Color {
+            if (self.count == 0) return .white;
+            const stops = self.stops[0..self.count];
+            const cycle = stops[stops.len - 1].at;
+            if (cycle <= 0) return stops[0].color;
+
+            const along = @mod(@mod(position, cycle) + cycle, cycle);
+            for (stops[0 .. stops.len - 1], stops[1..]) |left, right| {
+                if (along < left.at or along > right.at) continue;
+                const span = right.at - left.at;
+                const t = if (span > 0) (along - left.at) / span else 0;
+                return left.color.lerp(right.color, t);
+            }
+            return stops[stops.len - 1].color;
+        }
+    };
+
+    pub const Reveal = struct {
+        kind: Kind = .type,
+        /// Whether the letters are leaving rather than arriving. Ply's `out`
+        /// against its `in`.
+        out: bool = false,
+        speed: f32 = 8,
+        /// How many characters wide the edge of the reveal is. Ply's `trail`,
+        /// and not used by `type`, which has no edge.
+        trail: f32 = 3,
+        /// Seconds to wait before starting.
+        delay: f32 = 0,
+        /// Which clock this shares. Ply's `id`, hashed - two runs with the
+        /// same one start together.
+        clock: u32 = 0,
+
+        pub const Kind = enum { type, fade, scale };
+    };
+};
+
+/// Ply's rainbow, which is what a `gradient` with no stops of its own gets.
+const default_stops = blk: {
+    var stops: [Effect.Gradient.max_stops]Effect.Gradient.Stop = @splat(.{});
+    const colours = [_]u24{
+        0xFF0000, 0xFF9A00, 0xD0DE21, 0x4FDC4A, 0x3FDAD8,
+        0x2FC9E2, 0x1C7FEE, 0x5F15F2, 0xBA0CF8, 0xFB07D9,
+        0xFF0000,
+    };
+    for (colours, 0..) |colour, i| {
+        stops[i] = .{ .at = @floatFromInt(i), .color = .hex(colour) };
+    }
+    break :blk stops;
+};
+const default_stop_count: u8 = 11;
+
 /// One stretch of the stripped text, and how it is drawn.
 ///
 /// Offsets are bytes from the start of *this* run's text, not from the start
@@ -85,6 +216,13 @@ pub const Span = struct {
     /// Still takes up its room, and is not drawn. Ply's `hide`.
     hidden: bool = false,
     shadow: ?Shadow = null,
+    /// Where this span's effects are in the list they were parsed into.
+    ///
+    /// A range rather than a slice for the same reason a run of text is an
+    /// offset: appending the next span's effects may move the list, and a
+    /// slice taken before that would point at nothing.
+    effects_start: u32 = 0,
+    effects_len: u32 = 0,
 
     /// The colour to draw with, given the element's own.
     pub fn colorOver(self: Span, base: Color) Color {
@@ -96,7 +234,8 @@ pub const Span = struct {
     /// Whether this span says anything at all. A run with no tags in it comes
     /// out as one of these, and the emitter can take the plain path.
     pub fn plain(self: Span) bool {
-        return self.color == null and self.opacity == 1 and !self.hidden and self.shadow == null;
+        return self.color == null and self.opacity == 1 and !self.hidden and
+            self.shadow == null and self.effects_len == 0;
     }
 };
 
@@ -119,6 +258,9 @@ pub const Parsed = struct {
     spans: []const Span,
     /// One per byte of `text`, when a map was asked for.
     marks: []const Mark,
+    /// Every effect any of the spans asked for, flattened. A span names its
+    /// own by range. See `Span.effects_start`.
+    effects: []const Effect,
 };
 
 /// Ply's palette, at Ply's numbers, which are macroquad's.
@@ -171,7 +313,7 @@ pub fn parseColor(text: []const u8) Color {
         var parts = std.mem.splitScalar(u8, text[1 .. text.len - 1], ',');
         while (parts.next()) |part| {
             if (found == channels.len) break;
-            channels[found] = number(std.mem.trim(u8, part, " \t"));
+            channels[found] = parseNumber(std.mem.trim(u8, part, " \t"));
             found += 1;
         }
         if (found < 3) return .white;
@@ -187,8 +329,104 @@ pub fn parseColor(text: []const u8) Color {
 }
 
 /// Ply's `parse_float`: whatever it reads, or zero.
-fn number(text: []const u8) f32 {
+fn parseNumber(text: []const u8) f32 {
     return std.fmt.parseFloat(f32, text) catch 0;
+}
+
+/// The cycle four of Ply's effects share, out of a tag's arguments.
+///
+/// `s` is the alternative to `f`: how many characters a second the wave
+/// travels, which divided by the wavelength is the frequency. Ply offers both
+/// because one is easier to picture for a wave and the other for a pulse.
+fn cycleOf(arguments: Arguments, width: f32, frequency: f32, amplitude: f32) Cycle {
+    const w = arguments.number("w", width);
+    return .{
+        .width = w,
+        .frequency = if (arguments.has("s"))
+            arguments.number("s", 0) / (if (w == 0) 1 else w)
+        else
+            arguments.number("f", frequency),
+        .amplitude = arguments.number("a", amplitude),
+        .phase = arguments.number("p", 0),
+    };
+}
+
+/// A hash of a name, so two runs sharing an `id` share a clock.
+fn clockOf(arguments: Arguments) u32 {
+    const name = arguments.get("id") orelse "";
+    var hash: u32 = 2166136261;
+    for (name) |byte| {
+        hash ^= byte;
+        hash *%= 16777619;
+    }
+    return hash;
+}
+
+/// The effect a tag asks for, or null if it asks for none of them.
+///
+/// Ply panics when `type`, `fade` or `scale` is written without `in` or
+/// `out`. This reads a missing one as `in`, which is what somebody who forgot
+/// meant, and is the same choice as everywhere else here: the text keeps
+/// working.
+fn effectOf(body: []const u8) ?Effect {
+    const arguments: Arguments = .{ .body = body };
+    const command = arguments.command();
+
+    if (std.mem.eql(u8, command, "wave")) return .{ .wave = .{
+        .cycle = cycleOf(arguments, 3, 0.5, 0.3),
+        .direction = arguments.number("r", 0),
+    } };
+    if (std.mem.eql(u8, command, "pulse")) return .{ .pulse = cycleOf(arguments, 2, 0.6, 0.15) };
+    if (std.mem.eql(u8, command, "swing")) return .{ .swing = cycleOf(arguments, 3, 0.5, 8) };
+
+    if (std.mem.eql(u8, command, "jitter")) return .{ .jitter = .{
+        .radius = arguments.pair("radii", .{ .x = 0.1, .y = 0.1 }),
+        .rotation = arguments.number("rotation", 0),
+    } };
+
+    if (std.mem.eql(u8, command, "transform")) return .{ .transform = .{
+        .translate = arguments.pair("translate", .{ .x = 0, .y = 0 }),
+        .scale = arguments.pair("scale", .{ .x = 1, .y = 1 }),
+        .rotate = arguments.number("rotate", 0),
+    } };
+
+    if (std.mem.eql(u8, command, "gradient")) {
+        var gradient: Effect.Gradient = .{ .speed = arguments.number("speed", 1) };
+        if (arguments.get("stops")) |list| {
+            var count: u8 = 0;
+            var pairs = std.mem.splitScalar(u8, list, ',');
+            while (pairs.next()) |entry| {
+                if (count == Effect.Gradient.max_stops) break;
+                const colon = std.mem.indexOfScalar(u8, entry, ':') orelse continue;
+                gradient.stops[count] = .{
+                    .at = parseNumber(entry[0..colon]),
+                    .color = parseColor(entry[colon + 1 ..]),
+                };
+                count += 1;
+            }
+            if (count > 0) gradient.count = count;
+        }
+        return .{ .gradient = gradient };
+    }
+
+    const kind: Effect.Reveal.Kind =
+        if (std.mem.eql(u8, command, "type"))
+            .type
+        else if (std.mem.eql(u8, command, "fade"))
+            .fade
+        else if (std.mem.eql(u8, command, "scale"))
+            .scale
+        else
+            return null;
+
+    return .{ .reveal = .{
+        .kind = kind,
+        .out = arguments.has("out"),
+        .speed = arguments.number("speed", if (kind == .type) 8 else 3),
+        .trail = arguments.number("trail", 3),
+        .delay = arguments.number("delay", 0),
+        .clock = clockOf(arguments),
+    } };
 }
 
 /// The arguments of one tag, in the order they were written.
@@ -205,14 +443,46 @@ const Arguments = struct {
         return if (std.mem.indexOfScalar(u8, first, '=')) |at| first[0..at] else first;
     }
 
+    /// One argument by name, or null.
+    ///
+    /// A part with no `=` is a flag: its name is the whole part and its value
+    /// is empty, which is how `{fade_out|...}` says which way round it goes.
+    /// Ply gets the same from splitting on `=` and taking what it finds.
+    ///
+    /// The first part is the command, and a value attached to it - the `red`
+    /// in `color=red` - answers to the empty name rather than to `color`.
     fn get(self: Arguments, name: []const u8) ?[]const u8 {
         var index: usize = 0;
         while (self.part(index)) |piece| : (index += 1) {
-            const at = std.mem.indexOfScalar(u8, piece, '=') orelse continue;
-            const key = if (index == 0) "" else piece[0..at];
-            if (std.mem.eql(u8, key, name)) return piece[at + 1 ..];
+            const at = std.mem.indexOfScalar(u8, piece, '=');
+            if (index == 0) {
+                const value = at orelse continue;
+                if (name.len == 0) return piece[value + 1 ..];
+                continue;
+            }
+            const key = if (at) |value| piece[0..value] else piece;
+            if (!std.mem.eql(u8, key, name)) continue;
+            return if (at) |value| piece[value + 1 ..] else "";
         }
         return null;
+    }
+
+    /// A number argument, or the default when it is not there.
+    fn number(self: Arguments, name: []const u8, default: f32) f32 {
+        return parseNumber(self.get(name) orelse return default);
+    }
+
+    /// A pair of numbers written `x,y`, where a single one means both.
+    fn pair(self: Arguments, name: []const u8, default: geometry.Vec2) geometry.Vec2 {
+        const text = self.get(name) orelse return default;
+        var parts = std.mem.splitScalar(u8, text, ',');
+        const x = parseNumber(parts.next() orelse return default);
+        const y = if (parts.next()) |second| parseNumber(second) else x;
+        return .{ .x = x, .y = y };
+    }
+
+    fn has(self: Arguments, name: []const u8) bool {
+        return self.get(name) != null;
     }
 
     fn part(self: Arguments, wanted: usize) ?[]const u8 {
@@ -225,12 +495,21 @@ const Arguments = struct {
     }
 };
 
+/// How many effects can be in force at once - one per open tag, and past
+/// that the innermost ones are the ones that count.
+pub const max_effects = 8;
+
 /// What is in force at one point in the text: the style stack, folded.
 const Fold = struct {
     color: ?Color = null,
     opacity: f32 = 1,
     hidden: bool = false,
     shadow: ?Shadow = null,
+    /// The effects of every tag open here, outermost first. Carried by value
+    /// so that closing a tag is a copy back rather than any bookkeeping -
+    /// which is the whole reason the fold is a value and not a stack.
+    effects: [max_effects]Effect = undefined,
+    effect_count: u8 = 0,
 
     /// The same, with one tag's command applied on top.
     ///
@@ -245,16 +524,21 @@ const Fold = struct {
         if (std.mem.eql(u8, command, "color")) {
             if (arguments.get("")) |value| out.color = parseColor(value);
         } else if (std.mem.eql(u8, command, "opacity")) {
-            if (arguments.get("")) |value| out.opacity *= number(value);
+            if (arguments.get("")) |value| out.opacity *= parseNumber(value);
         } else if (std.mem.eql(u8, command, "hide")) {
             out.hidden = true;
+        } else if (effectOf(body)) |effect| {
+            if (out.effect_count < max_effects) {
+                out.effects[out.effect_count] = effect;
+                out.effect_count += 1;
+            }
         } else if (std.mem.eql(u8, command, "shadow")) {
             var shadow: Shadow = .{};
             if (arguments.get("color")) |value| shadow.color = parseColor(value);
             if (arguments.get("offset")) |value| {
                 var parts = std.mem.splitScalar(u8, value, ',');
-                if (parts.next()) |x| shadow.offset.x = number(x);
-                if (parts.next()) |y| shadow.offset.y = number(y);
+                if (parts.next()) |x| shadow.offset.x = parseNumber(x);
+                if (parts.next()) |y| shadow.offset.y = parseNumber(y);
             }
             out.shadow = shadow;
         }
@@ -264,7 +548,7 @@ const Fold = struct {
         return out;
     }
 
-    fn span(self: Fold, start: usize, end: usize) Span {
+    fn span(self: Fold, start: usize, end: usize, effects_start: u32) Span {
         return .{
             .start = @intCast(start),
             .end = @intCast(end),
@@ -272,6 +556,8 @@ const Fold = struct {
             .opacity = self.opacity,
             .hidden = self.hidden,
             .shadow = self.shadow,
+            .effects_start = effects_start,
+            .effects_len = self.effect_count,
         };
     }
 };
@@ -290,12 +576,14 @@ pub fn parse(
     out_text: *std.ArrayList(u8),
     out_spans: *std.ArrayList(Span),
     out_marks: ?*std.ArrayList(Mark),
+    out_effects: ?*std.ArrayList(Effect),
     gpa: std.mem.Allocator,
     raw: []const u8,
 ) std.mem.Allocator.Error!Parsed {
     const text_from = out_text.items.len;
     const spans_from = out_spans.items.len;
     const marks_from = if (out_marks) |marks| marks.items.len else 0;
+    const effects_from = if (out_effects) |effects| effects.items.len else 0;
 
     // Every byte of text goes through here, so the map cannot fall out of
     // step with the text it is a map of.
@@ -369,7 +657,11 @@ pub fn parse(
                 } else {
                     const here = out_text.items.len - text_from;
                     if (here > span_start) {
-                        try out_spans.append(gpa, current.span(span_start, here));
+                        try out_spans.append(gpa, current.span(
+                            span_start,
+                            here,
+                            try lay(out_effects, gpa, current),
+                        ));
                     }
                     stack[depth] = current;
                     depth += 1;
@@ -388,7 +680,11 @@ pub fn parse(
                 } else {
                     const here = out_text.items.len - text_from;
                     if (here > span_start) {
-                        try out_spans.append(gpa, current.span(span_start, here));
+                        try out_spans.append(gpa, current.span(
+                            span_start,
+                            here,
+                            try lay(out_effects, gpa, current),
+                        ));
                     }
                     depth -= 1;
                     current = stack[depth];
@@ -420,14 +716,36 @@ pub fn parse(
 
     const total = out_text.items.len - text_from;
     if (total > span_start or out_spans.items.len == spans_from) {
-        try out_spans.append(gpa, current.span(span_start, total));
+        try out_spans.append(gpa, current.span(
+            span_start,
+            total,
+            try lay(out_effects, gpa, current),
+        ));
     }
 
     return .{
         .text = out_text.items[text_from..],
         .spans = out_spans.items[spans_from..],
         .marks = if (out_marks) |marks| marks.items[marks_from..] else &.{},
+        .effects = if (out_effects) |effects| effects.items[effects_from..] else &.{},
     };
+}
+
+/// Put a fold's effects down in the list, and say where they went.
+///
+/// Copied per span rather than shared between the spans of one tag, because a
+/// span is a range into a flat list and sharing would mean the ranges could
+/// not simply be appended. The number of effects in a document is small and
+/// the number of spans is not much larger.
+fn lay(
+    out_effects: ?*std.ArrayList(Effect),
+    gpa: std.mem.Allocator,
+    fold: Fold,
+) std.mem.Allocator.Error!u32 {
+    const effects = out_effects orelse return 0;
+    const at: u32 = @intCast(effects.items.len);
+    try effects.appendSlice(gpa, fold.effects[0..fold.effect_count]);
+    return at;
 }
 
 /// Drop the tags that have nothing left inside them.
@@ -515,7 +833,7 @@ const Fixture = struct {
     spans: std.ArrayList(Span) = .empty,
 
     fn run(self: *Fixture, gpa: std.mem.Allocator, raw: []const u8) !Parsed {
-        return parse(&self.text, &self.spans, null, gpa, raw);
+        return parse(&self.text, &self.spans, null, null, gpa, raw);
     }
 
     fn deinit(self: *Fixture, gpa: std.mem.Allocator) void {
@@ -674,12 +992,11 @@ test "a tag that never closed its header is text" {
 }
 
 test "an unknown command is ignored and its text still reads" {
-    // Ply's animated styles arrive here until they are ported, and so do
-    // typos. Neither should take the text away.
+    // A typo in a tag name should not take the text away with it.
     var fixture: Fixture = .{};
     defer fixture.deinit(testing.allocator);
 
-    const parsed = try fixture.run(testing.allocator, "{wave_amp=3_freq=2|moving} still");
+    const parsed = try fixture.run(testing.allocator, "{wobble_amp=3|moving} still");
     try testing.expectEqualStrings("moving still", parsed.text);
     try testing.expect(parsed.spans[0].plain());
 }
@@ -738,7 +1055,7 @@ test "the map says where each visible byte came from" {
 
     //           0123456789...
     const raw = "a{color=red|bc}d";
-    const parsed = try parse(&text, &spans, &marks, testing.allocator, raw);
+    const parsed = try parse(&text, &spans, &marks, null, testing.allocator, raw);
     try testing.expectEqualStrings("abcd", parsed.text);
     try testing.expectEqual(parsed.text.len, parsed.marks.len);
 
@@ -761,7 +1078,7 @@ test "an escaped brace is one visible byte from two raw ones" {
     var marks: std.ArrayList(Mark) = .empty;
     defer marks.deinit(testing.allocator);
 
-    const parsed = try parse(&text, &spans, &marks, testing.allocator, "a\\{b");
+    const parsed = try parse(&text, &spans, &marks, null, testing.allocator, "a\\{b");
     try testing.expectEqualStrings("a{b", parsed.text);
 
     // The mark for the brace is two bytes wide, so deleting the character
@@ -793,4 +1110,164 @@ test "an emptied tag is taken away, innermost first" {
         "use { x } here",
         try compact(&out, testing.allocator, "use { x } here"),
     );
+}
+
+/// Parse into fresh lists including the effects, which the plain fixture
+/// above does not collect.
+fn effectsOf(gpa: std.mem.Allocator, raw: []const u8, out: *std.ArrayList(Effect)) ![]const Effect {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(gpa);
+
+    const parsed = try parse(&text, &spans, null, out, gpa, raw);
+    return parsed.effects;
+}
+
+test "an animated tag comes out as an effect with Ply's defaults" {
+    var out: std.ArrayList(Effect) = .empty;
+    defer out.deinit(testing.allocator);
+
+    const effects = try effectsOf(testing.allocator, "{wave|x}", &out);
+    try testing.expectEqual(@as(usize, 1), effects.len);
+
+    const wave = effects[0].wave;
+    try testing.expectEqual(@as(f32, 3), wave.cycle.width);
+    try testing.expectEqual(@as(f32, 0.5), wave.cycle.frequency);
+    try testing.expectEqual(@as(f32, 0.3), wave.cycle.amplitude);
+    try testing.expectEqual(@as(f32, 0), wave.direction);
+}
+
+test "the arguments are read, and `s` is a speed rather than a frequency" {
+    var out: std.ArrayList(Effect) = .empty;
+    defer out.deinit(testing.allocator);
+
+    const spelt = try effectsOf(testing.allocator, "{wave_a=1.5_w=4_p=0.25_r=90|x}", &out);
+    try testing.expectEqual(@as(f32, 1.5), spelt[0].wave.cycle.amplitude);
+    try testing.expectEqual(@as(f32, 4), spelt[0].wave.cycle.width);
+    try testing.expectEqual(@as(f32, 0.25), spelt[0].wave.cycle.phase);
+    try testing.expectEqual(@as(f32, 90), spelt[0].wave.direction);
+
+    // Ply's alternative: `s` characters a second over `w` characters a
+    // wavelength is the frequency.
+    out.clearRetainingCapacity();
+    const sped = try effectsOf(testing.allocator, "{wave_s=8_w=4|x}", &out);
+    try testing.expectEqual(@as(f32, 2), sped[0].wave.cycle.frequency);
+}
+
+test "every one of Ply's animated styles is recognised" {
+    var out: std.ArrayList(Effect) = .empty;
+    defer out.deinit(testing.allocator);
+
+    for ([_][]const u8{
+        "{wave|x}",    "{pulse|x}",     "{swing|x}",
+        "{jitter|x}",  "{transform|x}", "{gradient|x}",
+        "{type_in|x}", "{fade_in|x}",   "{scale_out|x}",
+    }) |raw| {
+        out.clearRetainingCapacity();
+        const effects = try effectsOf(testing.allocator, raw, &out);
+        try testing.expectEqual(@as(usize, 1), effects.len);
+    }
+}
+
+test "a reveal reads its direction, and a missing one means arriving" {
+    var out: std.ArrayList(Effect) = .empty;
+    defer out.deinit(testing.allocator);
+
+    const arriving = try effectsOf(testing.allocator, "{type_in|x}", &out);
+    try testing.expect(!arriving[0].reveal.out);
+    try testing.expectEqual(@as(f32, 8), arriving[0].reveal.speed);
+
+    out.clearRetainingCapacity();
+    const leaving = try effectsOf(testing.allocator, "{fade_out_speed=2|x}", &out);
+    try testing.expect(leaving[0].reveal.out);
+    try testing.expectEqual(@as(f32, 2), leaving[0].reveal.speed);
+
+    // Ply panics when neither is given. This reads it as arriving, which is
+    // what somebody who forgot meant.
+    out.clearRetainingCapacity();
+    const forgotten = try effectsOf(testing.allocator, "{type|x}", &out);
+    try testing.expect(!forgotten[0].reveal.out);
+}
+
+test "two runs sharing an id share a clock, and two without still do" {
+    var out: std.ArrayList(Effect) = .empty;
+    defer out.deinit(testing.allocator);
+
+    const same = try effectsOf(testing.allocator, "{type_in_id=a|x}{type_in_id=a|y}", &out);
+    try testing.expectEqual(same[0].reveal.clock, same[1].reveal.clock);
+
+    out.clearRetainingCapacity();
+    const different = try effectsOf(testing.allocator, "{type_in_id=a|x}{type_in_id=b|y}", &out);
+    try testing.expect(different[0].reveal.clock != different[1].reveal.clock);
+}
+
+test "nested effects both reach the span they cover" {
+    var out: std.ArrayList(Effect) = .empty;
+    defer out.deinit(testing.allocator);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(testing.allocator);
+
+    const parsed = try parse(&text, &spans, null, &out, testing.allocator, "{wave|{swing|both}}");
+    try testing.expectEqualStrings("both", parsed.text);
+
+    // One span, two effects on it, outermost first.
+    try testing.expectEqual(@as(usize, 1), parsed.spans.len);
+    try testing.expectEqual(@as(u32, 2), parsed.spans[0].effects_len);
+    const mine = out.items[parsed.spans[0].effects_start..][0..2];
+    try testing.expectEqual(std.meta.Tag(Effect).wave, std.meta.activeTag(mine[0]));
+    try testing.expectEqual(std.meta.Tag(Effect).swing, std.meta.activeTag(mine[1]));
+}
+
+test "an effect makes a span anything but plain" {
+    var out: std.ArrayList(Effect) = .empty;
+    defer out.deinit(testing.allocator);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(testing.allocator);
+
+    const parsed = try parse(&text, &spans, null, &out, testing.allocator, "{wave|x}");
+    try testing.expect(!parsed.spans[0].plain());
+}
+
+test "the wave is a cosine of the time and the character" {
+    const cycle: Cycle = .{ .width = 4, .frequency = 0, .amplitude = 1, .phase = 0 };
+
+    // At a frequency of zero the wave stands still and is a picture of the
+    // word: a whole wavelength every four characters.
+    try testing.expectApproxEqAbs(@as(f32, 1), cycle.at(0, 0), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), cycle.at(0, 1), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -1), cycle.at(0, 2), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1), cycle.at(0, 4), 0.001);
+
+    // And a frequency of one takes a second to come round.
+    const moving: Cycle = .{ .width = 4, .frequency = 1, .amplitude = 1 };
+    try testing.expectApproxEqAbs(moving.at(0, 0), moving.at(1, 0), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -1), moving.at(0.5, 0), 0.001);
+}
+
+test "a gradient runs through its stops and comes back round" {
+    const gradient: Effect.Gradient = .{
+        .speed = 1,
+        .stops = blk: {
+            var stops: [Effect.Gradient.max_stops]Effect.Gradient.Stop = @splat(.{});
+            stops[0] = .{ .at = 0, .color = .black };
+            stops[1] = .{ .at = 2, .color = .white };
+            break :blk stops;
+        },
+        .count = 2,
+    };
+
+    try testing.expectEqual(Color.black, gradient.sample(0));
+    try testing.expectApproxEqAbs(@as(f32, 0.5), gradient.sample(1).r, 0.001);
+    // Two characters along is the last stop, and three is one past it - which
+    // wraps back to the start.
+    try testing.expectApproxEqAbs(@as(f32, 0.5), gradient.sample(3).r, 0.001);
+    // And a position before the start wraps too rather than clamping.
+    try testing.expectApproxEqAbs(@as(f32, 0.5), gradient.sample(-1).r, 0.001);
 }

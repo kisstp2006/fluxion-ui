@@ -265,6 +265,16 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                 .{ .font_size = 13, .color = theme.ink },
             );
 
+            // The same tags, animated. These move per glyph and per frame, so
+            // the parameters travel on the command and the renderer - which is
+            // the only thing here that has ever seen a letter - does the work.
+            u.markup(
+                "{wave_a=0.22_s=6|This waves}, {gradient_speed=3|this runs " ++
+                    "through colours}, {pulse_a=0.12|this breathes}, and " ++
+                    "{jitter_radii=0.05,0.05|this will not sit still}.",
+                .{ .font_size = 13, .color = theme.ink },
+            );
+
             // A wrapping row: the tags carry on underneath rather than
             // being squeezed or running off the edge. The row is as tall as
             // the lines it took, so the panel below it moves down.
@@ -737,6 +747,7 @@ pub fn main(init: std.process.Init) !void {
 
     var clipboard: [256]u8 = undefined;
     var clipped_len: usize = 0;
+    var elapsed: f64 = 0;
 
     var drawn: u32 = 0;
     while (window.pump()) {
@@ -779,9 +790,11 @@ pub fn main(init: std.process.Init) !void {
         };
 
         // A sixtieth of a second, near enough: this example does not measure
-        // its own frames, and what the clock is for is the cursor blink and
-        // telling a double click from two clicks.
+        // its own frames, and what the clock is for is the cursor blink,
+        // telling a double click from two clicks, and the animated markup.
         layout.tick(1.0 / 60.0);
+        elapsed += 1.0 / 60.0;
+        renderer.setTime(elapsed);
 
         layout.begin(size);
         shell(&layout, size);

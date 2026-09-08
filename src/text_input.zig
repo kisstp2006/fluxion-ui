@@ -619,8 +619,9 @@ pub const TextEdit = struct {
     /// Where each byte of `visible` came from in `text`, which is what turns
     /// an edit the reader made into an edit of the string.
     marks: std.ArrayList(markup.Mark) = .empty,
-    /// How `visible` is coloured, for the drawing.
+    /// How `visible` is coloured, for the drawing, and what moves it.
     spans: std.ArrayList(markup.Span) = .empty,
+    effects_list: std.ArrayList(markup.Effect) = .empty,
 
     /// What the last declaration said.
     ///
@@ -678,6 +679,7 @@ pub const TextEdit = struct {
         self.visible.deinit(gpa);
         self.marks.deinit(gpa);
         self.spans.deinit(gpa);
+        self.effects_list.deinit(gpa);
         for (self.undo_stack.items) |*entry| entry.deinit(gpa);
         self.undo_stack.deinit(gpa);
         for (self.redo_stack.items) |*entry| entry.deinit(gpa);
@@ -722,7 +724,8 @@ pub const TextEdit = struct {
         self.visible.clearRetainingCapacity();
         self.marks.clearRetainingCapacity();
         self.spans.clearRetainingCapacity();
-        _ = try markup.parse(&self.visible, &self.spans, &self.marks, gpa, self.text.items);
+        self.effects_list.clearRetainingCapacity();
+        _ = try markup.parse(&self.visible, &self.spans, &self.marks, &self.effects_list, gpa, self.text.items);
     }
 
     /// Where in the raw string an insertion at this visible offset belongs.

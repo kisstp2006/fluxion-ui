@@ -119,6 +119,17 @@ pub const Renderer = struct {
     /// What an image command's number means. Borrowed, and must outlive the
     /// frame it is drawn in. See `setTextures`.
     textures: []const rhi.types.Texture = &.{},
+
+    /// What the animated text styles are animated against. See `setTime`.
+    time: f64 = 0,
+    /// When each named reveal started, by the hash of its name.
+    ///
+    /// A `type` or `fade` runs from the first frame it is seen on, so it has
+    /// to be remembered somewhere - and two runs sharing an `id` share a
+    /// start, which is what the name is for. Never swept: the names are
+    /// written in the program's own strings, so there is a fixed number of
+    /// them however long it runs.
+    clocks: std.AutoHashMapUnmanaged(u32, f64) = .empty,
     sampler: rhi.types.Sampler,
 
     shader: rhi.types.Shader,
@@ -245,6 +256,15 @@ pub const Renderer = struct {
         self.textures = textures;
     }
 
+    /// Say what time it is, in seconds.
+    ///
+    /// Only the animated markup styles read it, and a program that uses none
+    /// of them need never call this. Any clock will do as long as it goes
+    /// forwards: seconds since the program started is the usual one.
+    pub fn setTime(self: *Renderer, seconds: f64) void {
+        self.time = seconds;
+    }
+
     pub fn deinit(self: *Renderer) void {
         self.device.destroyBuffer(self.frame_buffer);
         self.device.destroyBuffer(self.instance_buffer);
@@ -252,6 +272,7 @@ pub const Renderer = struct {
         self.device.destroyPipeline(self.pipeline);
         self.device.destroyShader(self.shader);
         self.device.destroySampler(self.sampler);
+        self.clocks.deinit(self.gpa);
         self.device.destroyTexture(self.atlas_texture);
         self.atlas.deinit();
         self.instances.deinit(self.gpa);
@@ -451,6 +472,114 @@ pub const Renderer = struct {
         };
     }
 
+    /// What the effects do to one glyph.
+    const Moved = struct {
+        /// Added to where the glyph would have been, in pixels.
+        offset: ui.geometry.Vec2 = .{ .x = 0, .y = 0 },
+        scale: ui.geometry.Vec2 = .{ .x = 1, .y = 1 },
+        /// In radians, about the middle of the glyph.
+        rotate: f32 = 0,
+        /// Multiplied into the alpha.
+        opacity: f32 = 1,
+        color: ?ui.Color = null,
+        hidden: bool = false,
+    };
+
+    /// Work out what one glyph of one frame looks like.
+    ///
+    /// Ply's arithmetic, effect by effect, with its defaults. `index` is how
+    /// many characters into the whole run this glyph is, which is what makes
+    /// a wave travel along a word instead of every letter moving together.
+    fn moveGlyph(
+        self: *Renderer,
+        effects: []const ui.markup.Effect,
+        index: f32,
+        em: f32,
+    ) Moved {
+        var moved: Moved = .{};
+
+        for (effects) |effect| switch (effect) {
+            .wave => |wave| {
+                // A displacement along a direction, which is straight down
+                // until `r` says otherwise.
+                const distance = wave.cycle.at(self.time, index) * wave.cycle.amplitude * em;
+                const along = wave.direction * std.math.pi / 180.0;
+                moved.offset.x += -distance * @sin(along);
+                moved.offset.y += distance * @cos(along);
+            },
+            .pulse => |cycle| {
+                const size = 1 + cycle.at(self.time, index) * cycle.amplitude;
+                moved.scale.x *= size;
+                moved.scale.y *= size;
+            },
+            .swing => |cycle| {
+                // Ply's amplitude here is in degrees, and its wave is a sine
+                // rather than a cosine - a swing starts upright.
+                const width = if (cycle.width == 0) 1 else cycle.width;
+                const turns = cycle.frequency * @as(f32, @floatCast(self.time)) +
+                    index / width + cycle.phase;
+                moved.rotate += @sin(2 * std.math.pi * turns) *
+                    cycle.amplitude * std.math.pi / 180.0;
+            },
+            .jitter => |jitter| {
+                // Twenty steps a second, so it shakes rather than shimmers,
+                // and the same nonsense-from-a-sine Ply uses for the numbers.
+                const seed = @floor(@as(f32, @floatCast(self.time)) * 20) + index * 13.37;
+                const x = fract(@sin(seed) * 43758.5453);
+                const y = fract(@cos(seed + 7.1) * 23421.632);
+                const shake_x = (x - 0.5) * 2 * jitter.radius.x * em;
+                const shake_y = (y - 0.5) * 2 * jitter.radius.y * em;
+                const along = jitter.rotation * std.math.pi / 180.0;
+                moved.offset.x += shake_x * @cos(along) - shake_y * @sin(along);
+                moved.offset.y += shake_x * @sin(along) + shake_y * @cos(along);
+            },
+            .transform => |fixed| {
+                moved.offset.x += fixed.translate.x * em;
+                moved.offset.y += fixed.translate.y * em;
+                moved.scale.x *= fixed.scale.x;
+                moved.scale.y *= fixed.scale.y;
+                moved.rotate += fixed.rotate * std.math.pi / 180.0;
+            },
+            .gradient => |gradient| {
+                moved.color = gradient.sample(index - @as(f32, @floatCast(self.time)) * gradient.speed);
+            },
+            .reveal => |reveal| {
+                const started = self.clocks.get(reveal.clock) orelse blk: {
+                    self.clocks.put(self.gpa, reveal.clock, self.time) catch {};
+                    break :blk self.time;
+                };
+                const elapsed = @max(0, @as(f32, @floatCast(self.time - started)) - reveal.delay);
+                const reached = elapsed * reveal.speed;
+
+                switch (reveal.kind) {
+                    // No edge: a letter is either there or it is not.
+                    .type => {
+                        const arrived = index < reached;
+                        if (arrived == reveal.out) moved.hidden = true;
+                    },
+                    .fade, .scale => {
+                        const trail = if (reveal.trail == 0) 1 else reveal.trail;
+                        const progress = std.math.clamp((reached - index) / trail, 0, 1);
+                        const amount = if (reveal.out) 1 - progress else progress;
+                        if (reveal.kind == .fade) {
+                            moved.opacity *= amount;
+                        } else {
+                            moved.scale.x *= amount;
+                            moved.scale.y *= amount;
+                        }
+                    },
+                }
+            },
+        };
+
+        return moved;
+    }
+
+    /// The part after the point, which is what Ply's `fract` is.
+    fn fract(value: f32) f32 {
+        return value - @floor(value);
+    }
+
     /// One instance per glyph of a line.
     fn addText(self: *Renderer, command: ui.RenderCommand, run: ui.commands.Text) Error!void {
         const turn = turnOf(command.transform);
@@ -462,6 +591,9 @@ pub const Renderer = struct {
         var pen = command.bounding_box.x;
         var previous: ?u16 = null;
 
+        const em: f32 = @floatFromInt(size);
+        var at: u32 = run.first;
+
         var letters = (std.unicode.Utf8View.init(run.text) catch return).iterator();
         while (letters.nextCodepoint()) |codepoint| {
             const index = self.face.glyphFor(codepoint);
@@ -469,16 +601,28 @@ pub const Renderer = struct {
                 pen += @as(f32, @floatFromInt(self.face.kern(left, index) catch 0)) * scale;
             }
             previous = index;
+            defer at += 1;
 
             const entry = try self.atlas.glyph(self.face, index, size);
-            if (!entry.isBlank()) {
+            if (entry.isBlank()) {
+                pen += entry.advance;
+                continue;
+            }
+            defer pen += entry.advance;
+
+            // The pen does not care what the effects do: a wave moves where a
+            // letter is drawn and not where the next one starts, or the word
+            // would stretch and squash as it went.
+            const box: [4]f32 = .{
+                pen + @as(f32, @floatFromInt(entry.left)),
+                baseline - @as(f32, @floatFromInt(entry.top)),
+                @floatFromInt(entry.width),
+                @floatFromInt(entry.height),
+            };
+
+            if (run.effects.len == 0) {
                 try self.instances.append(self.gpa, .{
-                    .rect = .{
-                        pen + @as(f32, @floatFromInt(entry.left)),
-                        baseline - @as(f32, @floatFromInt(entry.top)),
-                        @floatFromInt(entry.width),
-                        @floatFromInt(entry.height),
-                    },
+                    .rect = box,
                     .color = run.color.array(),
                     .radii = @splat(0),
                     .uv = .{ entry.u0, entry.v0, entry.u1, entry.v1 },
@@ -487,8 +631,50 @@ pub const Renderer = struct {
                     .textured = Instance.Kind.glyph,
                     .origin = turn.origin,
                 });
+                continue;
             }
-            pen += entry.advance;
+
+            const moved = self.moveGlyph(run.effects, @floatFromInt(at), em);
+            if (moved.hidden) continue;
+
+            var colour = moved.color orelse run.color;
+            colour.a = std.math.clamp(colour.a * moved.opacity, 0, 1);
+            if (colour.invisible()) continue;
+
+            // A glyph turns and grows about its own middle and is then
+            // moved, and whatever the element was turned by goes on top -
+            // which is how a waving word inside a tilted badge stays in the
+            // badge. This one is not a rigid motion, because a pulse scales
+            // it; nothing ever asks for it back, which is the only thing
+            // rigidity buys.
+            const middle_x = box[0] + box[2] / 2;
+            const middle_y = box[1] + box[3] / 2;
+            const cos = @cos(moved.rotate);
+            const sin = @sin(moved.rotate);
+            const m00 = cos * moved.scale.x;
+            const m10 = sin * moved.scale.x;
+            const m01 = -sin * moved.scale.y;
+            const m11 = cos * moved.scale.y;
+            const glyph: ui.geometry.Transform = .{
+                .x_axis = .{ .x = m00, .y = m10 },
+                .y_axis = .{ .x = m01, .y = m11 },
+                .origin = .{
+                    .x = middle_x + moved.offset.x - (m00 * middle_x + m01 * middle_y),
+                    .y = middle_y + moved.offset.y - (m10 * middle_x + m11 * middle_y),
+                },
+            };
+            const both = turnOf(glyph.then(command.transform));
+
+            try self.instances.append(self.gpa, .{
+                .rect = box,
+                .color = colour.array(),
+                .radii = @splat(0),
+                .uv = .{ entry.u0, entry.v0, entry.u1, entry.v1 },
+                .motion = both.motion,
+                .border = 0,
+                .textured = Instance.Kind.glyph,
+                .origin = both.origin,
+            });
         }
     }
 
@@ -1395,4 +1581,127 @@ test "a picture between two labels breaks the batch and the labels rejoin" {
     // Atlas, sheet, atlas: three bindings and so three draws. A shape would
     // have joined whichever of them it landed in.
     try testing.expectEqual(@as(usize, 3), fixture.renderer.batches.items.len);
+}
+
+test "a wave moves a glyph and leaves the pen where it was" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    // A wave straight down, standing still, at its crest on the first letter.
+    const effects = [_]ui.markup.Effect{.{ .wave = .{
+        .cycle = .{ .width = 100, .frequency = 0, .amplitude = 0.5 },
+    } }};
+
+    fixture.renderer.setTime(0);
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 200, 20), .config = .{ .text = .{
+            .text = "ab",
+            .color = .white,
+            .font_size = 16,
+            .effects = &effects,
+        } } },
+    }, .init(200, 200));
+
+    try testing.expect(fixture.renderer.instances.items.len >= 2);
+    // Copied, because the next build refills the same list - comparing two
+    // slices of it would be comparing a thing with itself.
+    const with = fixture.renderer.instances.items[0];
+
+    // The same run with no effects, to compare against.
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 200, 20), .config = .{ .text = .{
+            .text = "ab",
+            .color = .white,
+            .font_size = 16,
+        } } },
+    }, .init(200, 200));
+    const without = fixture.renderer.instances.items[0];
+
+    // The box is untouched - a wave moves where a letter is drawn, not where
+    // the next one starts, or the word would stretch as it went.
+    try testing.expectEqual(without.rect, with.rect);
+    // What changed is where the motion puts it: eight pixels down, which is
+    // half an em at sixteen.
+    try testing.expectApproxEqAbs(@as(f32, 8), with.origin[1] - without.origin[1], 0.01);
+}
+
+test "a typewriter hides the letters it has not reached" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const effects = [_]ui.markup.Effect{.{ .reveal = .{
+        .kind = .type,
+        .speed = 2,
+        .clock = 1234,
+    } }};
+
+    const frame = struct {
+        fn run(f: *Fixture, e: []const ui.markup.Effect) !usize {
+            try f.renderer.build(&.{
+                .{ .bounding_box = .init(0, 0, 200, 20), .config = .{ .text = .{
+                    .text = "abcdef",
+                    .color = .white,
+                    .font_size = 16,
+                    .effects = e,
+                } } },
+            }, .init(200, 200));
+            return f.renderer.instances.items.len;
+        }
+    }.run;
+
+    // The clock starts on the frame the effect is first seen, so nothing has
+    // arrived yet.
+    fixture.renderer.setTime(10);
+    try testing.expectEqual(@as(usize, 0), try frame(fixture, &effects));
+
+    // A second later, two letters at two a second.
+    fixture.renderer.setTime(11);
+    try testing.expectEqual(@as(usize, 2), try frame(fixture, &effects));
+
+    // And eventually all of them.
+    fixture.renderer.setTime(20);
+    try testing.expectEqual(@as(usize, 6), try frame(fixture, &effects));
+}
+
+test "a gradient colours the letters differently from each other" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const effects = [_]ui.markup.Effect{.{ .gradient = .{ .speed = 0 } }};
+
+    fixture.renderer.setTime(0);
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 200, 20), .config = .{ .text = .{
+            .text = "abcd",
+            .color = .white,
+            .font_size = 16,
+            .effects = &effects,
+        } } },
+    }, .init(200, 200));
+
+    const instances = fixture.renderer.instances.items;
+    try testing.expect(instances.len >= 2);
+    // Ply's rainbow puts a stop at every character, so no two next to each
+    // other are the same.
+    try testing.expect(!std.meta.eql(instances[0].color, instances[1].color));
+}
+
+test "a run with no effects takes the path it always did" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    fixture.renderer.setTime(3.5);
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 200, 20), .config = .{ .text = .{
+            .text = "plain",
+            .color = .white,
+            .font_size = 16,
+        } } },
+    }, .init(200, 200));
+
+    // Whatever the clock says, an unanimated glyph is not turned.
+    for (fixture.renderer.instances.items) |instance| {
+        try testing.expectEqual([4]f32{ 1, 0, 0, 1 }, instance.motion);
+        try testing.expectEqual([2]f32{ 0, 0 }, instance.origin);
+    }
 }

@@ -525,6 +525,10 @@ lines: std.ArrayList(Line),
 
 /// Every markup run's spans, flattened. See `markup_mod.Span`.
 spans: std.ArrayList(markup_mod.Span),
+/// And every span's effects. A span names its own by range, and a text
+/// command carries the slice - the renderer is where a wave becomes a
+/// displacement, because the renderer is where the glyphs are.
+effects: std.ArrayList(markup_mod.Effect),
 
 /// The text declared this frame, copied.
 ///
@@ -593,6 +597,7 @@ pub fn init(gpa: Allocator) Ui {
         .runs = .empty,
         .lines = .empty,
         .spans = .empty,
+        .effects = .empty,
         .strings = .empty,
         .queue = .empty,
         .resizable = .empty,
@@ -621,6 +626,7 @@ pub fn deinit(self: *Ui) void {
     self.runs.deinit(self.gpa);
     self.lines.deinit(self.gpa);
     self.spans.deinit(self.gpa);
+    self.effects.deinit(self.gpa);
     self.strings.deinit(self.gpa);
     self.queue.deinit(self.gpa);
     self.resizable.deinit(self.gpa);
@@ -646,6 +652,7 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
     self.runs.clearRetainingCapacity();
     self.lines.clearRetainingCapacity();
     self.spans.clearRetainingCapacity();
+    self.effects.clearRetainingCapacity();
     self.strings.clearRetainingCapacity();
 
     // Nothing has been declared yet, so nothing is live. Whatever is still
@@ -831,7 +838,7 @@ pub fn markup(self: *Ui, raw: []const u8, style: text_mod.TextStyle) void {
 fn markupChecked(self: *Ui, raw: []const u8, style: text_mod.TextStyle) Error!void {
     const start: u32 = @intCast(self.strings.items.len);
     const spans_start: u32 = @intCast(self.spans.items.len);
-    const parsed = try markup_mod.parse(&self.strings, &self.spans, null, self.gpa, raw);
+    const parsed = try markup_mod.parse(&self.strings, &self.spans, null, &self.effects, self.gpa, raw);
     try self.addRun(
         start,
         @intCast(parsed.text.len),
@@ -1737,6 +1744,8 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
                 content[line.start..][0..line.len],
                 .init(x, y, line.width, line_height),
                 run.style.color,
+                &.{},
+                0,
             );
             continue;
         }
@@ -1786,6 +1795,11 @@ fn emitSpanned(
         if (first >= last) continue;
 
         const piece = content[first..last];
+        const effects = self.effects.items[span.effects_start..][0..span.effects_len];
+        // How many characters of the whole run come before this piece, so a
+        // wave travels along a sentence rather than restarting at every
+        // change of colour.
+        const along: u32 = @intCast(text_input.characters(content[0..first]));
         const width = measurer.measure(piece, style).width;
         defer pen += width;
         if (span.hidden) continue;
@@ -1805,6 +1819,8 @@ fn emitSpanned(
                     .b = shadow.color.b,
                     .a = std.math.clamp(shadow.color.a * span.opacity, 0, 1),
                 },
+                effects,
+                along,
             );
         }
 
@@ -1814,6 +1830,8 @@ fn emitSpanned(
             piece,
             .init(pen, y, width, line_height),
             span.colorOver(style.color),
+            effects,
+            along,
         );
     }
 }
@@ -1825,6 +1843,8 @@ fn emitPiece(
     piece: []const u8,
     box: BoundingBox,
     ink: Color,
+    effects: []const markup_mod.Effect,
+    first: u32,
 ) Error!void {
     if (piece.len == 0 or ink.invisible()) return;
     try self.output.append(self.gpa, .{
@@ -1839,6 +1859,8 @@ fn emitPiece(
             .letter_spacing = style.letter_spacing,
             .line_height = @intFromFloat(@round(box.height)),
             .font = style.font,
+            .effects = effects,
+            .first = first,
         } },
     });
 }
@@ -2298,6 +2320,8 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
                     run,
                     .init(origin_x, line_y, width, step),
                     style.color,
+                    &.{},
+                    0,
                 );
             } else {
                 try self.emitSpanned(
