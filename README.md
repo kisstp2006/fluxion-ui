@@ -235,6 +235,51 @@ passes run in the order they do -
 Getting steps two and three the wrong way round makes a wrapped paragraph
 overflow the card drawn round it, which is a bug that only shows on long text.
 
+## The renderer
+
+Optional, and a separate module. The library's own output is a command list;
+this is one ready-made consumer of it, for programs that do not want to write
+their own:
+
+```zig
+const render = @import("fluxion_ui_rhi");
+
+var renderer: render.Renderer = try .init(gpa, &device, &face);
+defer renderer.deinit();
+
+try renderer.draw(.{ .surface = surface }, size, try ui.end(), .hex(0x14161A));
+try device.present(surface);
+```
+
+**One instanced draw for the whole frame.** Every rectangle, every border and
+every glyph is the same unit quad under a different set of per-instance
+numbers, and the fragment shader decides what it is looking at - because the
+three things a UI draws are the same thing:
+
+| | What it is |
+| --- | --- |
+| A rectangle | A rounded box, filled. |
+| A border | A rounded box with a smaller one cut out of it. |
+| A glyph | A rectangle whose alpha comes from the atlas. |
+
+So there is one pipeline, one shader, one texture and one buffer, and the only
+thing that breaks a batch is a scissor rectangle - which an interface changes
+a handful of times a frame, not a thousand. A window full of controls is one
+draw call, and a thousand more boxes is still one.
+
+The shape comes from a signed distance field: `roundedBox` is negative inside
+and positive outside and the value is the distance in pixels, so `0.5 - d`
+clamped to zero and one is a one-pixel antialiased edge that needs no
+multisampling and no extra geometry. A border is the same field twice, with
+the inner one subtracted.
+
+Glyphs live in one `r8_unorm` atlas, packed on shelves and keyed by glyph *and*
+size together - the same letter at 12 pixels and at 13 is two different
+pictures, and there is no scaling one into the other that does not look wrong.
+
+Both dependencies are lazy. A program that only lays out, or that brings its
+own renderer, fetches neither.
+
 ## Colour
 
 Four floats from zero to one, which is what a GPU takes. Ply keeps the same
@@ -265,12 +310,12 @@ Ported and tested:
 - Direction, padding, gaps, and alignment on both axes
 - The element tree, and a stable number per element for state to hang off
 - Rectangles, corner radii, borders, and the command list they come out as
+- An optional renderer over Fluxion RHI: one instanced draw, an SDF for the shapes, a glyph atlas for the text
 
 Not yet, in the order it is worth doing:
 
 | | Why it is not here |
 | --- | --- |
-| **The RHI backend** | The seam is settled and the layout is checked; a rounded rectangle wants an SDF fragment shader and a window, which is its own piece of work. |
 | **Scroll and clipping** | `scissor_start` / `scissor_end` are in the command list already. The clip container that emits them is not. |
 | **Hit testing, hover, focus** | Every element's final box is recorded - see `Ui.boxOf` - which is the half of it that had to come first. |
 | **Floating elements, wrapping, shaders, images** | Ply has all of these. They sit above the core rather than inside it. |
@@ -284,8 +329,9 @@ paragraph, down to its longest word - see [Text](#text).
 ## Examples
 
 ```bash
-zig build example         # an application shell, printed as draw commands
-zig build example-prose   # a paragraph measured with a real font and drawn
+zig build example          # an application shell, printed as draw commands
+zig build example-prose    # a paragraph measured with a real font and drawn
+zig build example-window   # the whole stack on a real GPU, in a window
 ```
 
 ```
@@ -312,7 +358,18 @@ zig build example     # the shell, printed
 zig build docs        # API docs into zig-out/docs
 ```
 
-The tests are layouts with known right answers, checked against the boxes that
+The tests come in three layers. The layout ones are layouts with known right
+answers, checked against the boxes that came out, measured with a monospace
+measurer so a wrapping bug is a number wrong by a whole character. The
+renderer ones run against Fluxion RHI's `none` backend, which validates every
+call and draws none of them, so the instances and the scissor batches are
+checked on a machine with no GPU. And two of them open a hidden window, render
+a frame into a texture and read the pixels back - because a shader that does
+not compile, an attribute at the wrong offset and a viewport the wrong way up
+all pass everything else and produce a blank window. On a machine with no
+display they skip.
+
+The layout tests are layouts with known right answers, checked against the boxes that
 came out - which is the only way to test a layout engine, because an
 intermediate size is not worth asserting on when the next pass is allowed to
 change it. The example carries its own: that the panes tile the window with no

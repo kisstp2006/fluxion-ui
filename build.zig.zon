@@ -22,6 +22,21 @@
             .path = "../fluxion-font",
             .lazy = true,
         },
+
+        // What the optional `fluxion_ui_rhi` module draws with. Lazy for the
+        // same reason: the library's own output is a command list, and a
+        // program with its own renderer never fetches this.
+        .fluxion_rhi = .{
+            .path = "../fluxion-rhi",
+            .lazy = true,
+        },
+
+        // The window one example opens. Lazy, and the library imports it
+        // nowhere: a layout engine has no business opening windows.
+        .fluxion_platform = .{
+            .path = "../fluxion-platform",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

@@ -99,7 +99,13 @@ pub const Measurer = struct {
     /// checked without a font file all want exactly this. `advance` is the
     /// width of one character at a font size of one, so a size of 16 with an
     /// advance of 0.5 gives eight-pixel characters.
-    pub fn monospace(advance: f32, line_spacing: f32) Measurer {
+    /// `comptime`, and it has to be. The two functions below name `advance`
+    /// and `line_spacing` from inside, and Zig has no closures - an inner
+    /// function may only reach a value the compiler already knows. Taking
+    /// them at run time compiles wherever the call happens to be in a
+    /// comptime context and fails everywhere else, which is a worse API than
+    /// one that says so in its signature.
+    pub fn monospace(comptime advance: f32, comptime line_spacing: f32) Measurer {
         const Mono = struct {
             fn measure(_: ?*const anyopaque, run: []const u8, style: TextStyle) Size {
                 // Counted in codepoints, not bytes: an accented letter is one
