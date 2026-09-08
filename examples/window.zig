@@ -171,6 +171,34 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
             u.text("One draw call", .{ .font_size = 22, .color = theme.ink });
             u.text(body, .{ .font_size = 13, .color = theme.ink });
 
+            // Two text inputs. The first is one line and scrolls sideways
+            // when what is typed runs past it; the second wraps and scrolls
+            // up and down, and has a bar to show how far.
+            u.open(.{ .width = .grow, .height = .fit, .gap = 10 });
+            {
+                defer u.close();
+                for ([_][2][]const u8{
+                    .{ "name", "Your name" },
+                    .{ "email", "you@example.com" },
+                }) |pair| {
+                    u.textInput(.{
+                        .id = pair[0],
+                        .width = .grow,
+                        .padding = .xy(10, 7),
+                        .corner_radius = .all(6),
+                        .background_color = theme.card,
+                        .border = .all(if (u.isFocused(pair[0])) theme.accent else theme.line, 1),
+                    }, .{
+                        .placeholder = pair[1],
+                        .font_size = 13,
+                        .text_color = theme.ink,
+                        .placeholder_color = .hex(0x6E7681),
+                        .cursor_color = theme.accent,
+                        .drag_select = true,
+                    });
+                }
+            }
+
             u.open(.{
                 .id = "panel",
                 .width = .grow,
@@ -178,15 +206,57 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                 .padding = .all(14),
                 .corner_radius = .all(10),
                 .background_color = theme.card,
-                .border = .all(theme.line, 1),
+                .border = .all(if (u.isFocused("notes")) theme.accent else theme.line, 1),
             });
             defer u.close();
-            u.text("Rounded corners and this border are the same shader.", .{
-                .font_size = 12,
-                .color = theme.ink,
+            u.textInput(.{
+                .id = "notes",
+                .width = .grow,
+                .height = .grow,
+            }, .{
+                .placeholder = "Notes. Enter starts a new line, and this one wraps.",
+                .multiline = true,
+                .font_size = 13,
+                .text_color = theme.ink,
+                .placeholder_color = .hex(0x6E7681),
+                .cursor_color = theme.accent,
+                .drag_select = true,
+                .scrollbar = .{ .thumb_color = .hexa(0x6E7681B0), .hide_after_frames = 120 },
             });
         }
     }
+}
+
+/// What a key means to a text input, or null if it means nothing.
+///
+/// The whole of the keyboard binding, and it lives here rather than in the
+/// library on purpose: Ctrl against Cmd, which key is undo, what a numeric
+/// keypad Enter counts as and what the reader's layout actually produces are
+/// all decisions a program makes and a layout library cannot.
+fn editing(k: platform.event.KeyEvent) ?ui.text_input.Action {
+    const shift = k.mods.shift;
+    const ctrl = k.mods.control;
+
+    return switch (k.key) {
+        .left => .moveTo(if (ctrl) .word_left else .left, shift),
+        .right => .moveTo(if (ctrl) .word_right else .right, shift),
+        .up => .moveTo(.up, shift),
+        .down => .moveTo(.down, shift),
+        // Home and End are the line in a multiline input and the whole text
+        // in a single-line one, and the library decides which - so the same
+        // binding is right for both. Ctrl reaches past the line either way.
+        .home => .moveTo(if (ctrl) .text_start else .start, shift),
+        .end => .moveTo(if (ctrl) .text_end else .end, shift),
+        .backspace => if (ctrl) .backspace_word else .backspace,
+        .delete => if (ctrl) .delete_word else .delete,
+        .enter, .kp_enter => .submit,
+        .a => if (ctrl) .select_all else null,
+        .c => if (ctrl) .copy else null,
+        .x => if (ctrl) .cut else null,
+        .z => if (ctrl) (if (shift) .redo else .undo) else null,
+        .y => if (ctrl) .redo else null,
+        else => null,
+    };
 }
 
 // -------------------------------------------------------------------------
@@ -240,6 +310,23 @@ const Window = struct {
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     down: bool = false,
+
+    /// What the keyboard has done since the last frame, and what was held
+    /// down while it did it.
+    typed: [32]Typed = undefined,
+    typed_len: usize = 0,
+    mods: platform.Mods = .{},
+
+    /// One thing the keyboard did, in the order it did it.
+    ///
+    /// Keys and characters have to stay in order: typing "ab", pressing
+    /// backspace and typing "c" is three keys and three characters
+    /// interleaved, and draining one list and then the other would give
+    /// "ac" - or "b", depending which way round it was drained.
+    const Typed = union(enum) {
+        key: platform.event.KeyEvent,
+        character: u21,
+    };
 
     const Inner = struct {
         ctx: platform.Context,
@@ -307,8 +394,19 @@ const Window = struct {
         self.inner.ctx.pump() catch return false;
         while (self.inner.ctx.poll()) |event| switch (event) {
             .close => self.inner.win.setShouldClose(true),
-            .key => |k| if (k.key == .escape and k.action == .press) {
-                self.inner.win.setShouldClose(true);
+            .key => |k| {
+                self.mods = k.mods;
+                if (k.key == .escape and k.action == .press) {
+                    self.inner.win.setShouldClose(true);
+                } else if (k.action.down() and self.typed_len < self.typed.len) {
+                    self.typed[self.typed_len] = .{ .key = k };
+                    self.typed_len += 1;
+                }
+            },
+            .char => |c| if (self.typed_len < self.typed.len) {
+                self.mods = c.mods;
+                self.typed[self.typed_len] = .{ .character = c.codepoint };
+                self.typed_len += 1;
             },
             // One notch is one line of a list, near enough. Turning a wheel
             // event into pixels is the program's business, not the layout's.
@@ -328,6 +426,17 @@ const Window = struct {
     fn takeWheel(self: *Window) f32 {
         defer self.wheel = 0;
         return self.wheel;
+    }
+
+    /// What the keyboard did since the last frame, in order. Emptied by the
+    /// reading, like the wheel.
+    fn takeTyped(self: *Window) []const Typed {
+        defer self.typed_len = 0;
+        return self.typed[0..self.typed_len];
+    }
+
+    fn shiftHeld(self: Window) bool {
+        return self.mods.shift;
     }
 
     fn cursor(self: Window) struct { x: f32, y: f32 } {
@@ -431,6 +540,9 @@ pub fn main(init: std.process.Init) !void {
     defer layout.deinit();
     layout.setMeasurer(measured.measurer());
 
+    var clipboard: [256]u8 = undefined;
+    var clipped_len: usize = 0;
+
     var drawn: u32 = 0;
     while (window.pump()) {
         const size = window.size();
@@ -445,7 +557,36 @@ pub fn main(init: std.process.Init) !void {
         // four states and works out what is under the cursor from where
         // things were when the last frame finished.
         const cursor = window.cursor();
+        layout.setShift(window.shiftHeld());
         layout.setPointer(cursor.x, cursor.y, window.buttonDown());
+
+        // The keyboard, in the order it arrived. Which key means which action
+        // is the program's business - this library never sees a key, only
+        // what the program decided it meant.
+        for (window.takeTyped()) |event| switch (event) {
+            .character => |code| {
+                var utf8: [4]u8 = undefined;
+                const length = std.unicode.utf8Encode(code, &utf8) catch continue;
+                layout.typeText(utf8[0..length]);
+            },
+            .key => |k| if (editing(k)) |action| {
+                if (layout.textAction(action)) |taken| {
+                    // No platform clipboard here, so Ctrl+V pastes whatever
+                    // Ctrl+C or Ctrl+X last took - enough to show the round
+                    // trip, and the whole of what a library with no platform
+                    // layer can offer on its own.
+                    clipped_len = @min(taken.len, clipboard.len);
+                    @memcpy(clipboard[0..clipped_len], taken[0..clipped_len]);
+                }
+            } else if (k.key == .v and k.mods.control) {
+                _ = layout.textAction(.{ .paste = clipboard[0..clipped_len] });
+            },
+        };
+
+        // A sixtieth of a second, near enough: this example does not measure
+        // its own frames, and what the clock is for is the cursor blink and
+        // telling a double click from two clicks.
+        layout.tick(1.0 / 60.0);
 
         layout.begin(size);
         shell(&layout, size);

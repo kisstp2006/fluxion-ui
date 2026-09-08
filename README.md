@@ -123,6 +123,11 @@ the differences are the ones Zig forces, and there are three of them.
 | `is_pressed(id)` | `ui.isElementPressed("save")` |
 | `bounding_box(id)` | `ui.boxOf("save")` |
 | `.capture()` | `.capture = true` |
+| `.text_input(\|t\| t.placeholder("Name"))` | `ui.textInput(.{ ... }, .{ .placeholder = "Name" })` |
+| `ui.get_text_value(id)` | `ui.textValueOf("name")` |
+| `ui.set_text_value(id, v)` | `ui.setTextValue("name", v)` |
+| `.on_changed(\|t\| ...)` | `if (ui.textChanged("name")) ...` |
+| `.on_submit(\|t\| ...)` | `if (ui.textSubmitted("name")) ...` |
 | `.preserve_focus()` | `.preserve_focus = true` |
 | `.contain(16.0/9.0)` | `.contain = 16.0 / 9.0` |
 | `.cover(16.0/9.0)` | `.cover = 16.0 / 9.0` |
@@ -381,6 +386,77 @@ when anything moves - in frames rather than seconds, because a layout library
 is never told the frame rate. Ply's curve exactly: it holds for the whole
 count, then fades over a quarter as many frames again.
 
+## Text input
+
+```zig
+ui.textInput(
+    .{ .id = "name", .width = .grow, .height = .fixed(32), .padding = .xy(10, 7) },
+    .{ .placeholder = "Your name", .drag_select = true },
+);
+
+const typed = ui.textValueOf("name").?;
+if (ui.textSubmitted("name")) send(typed);
+```
+
+Two arguments, like `text`: the box is a declaration like any other, and the
+config is only what makes it editable. Give it a **width** - a `.fit` width is
+the padding and nothing else, because a box that resized itself as the reader
+typed would be unusable. A `.fit` height is one line, which Ply does not do and
+which stops an input nobody gave a height from being an invisible box the
+reader can focus and type into and never see.
+
+What it holds outlives the frame, like a scroll position, and is forgotten when
+the element stops being declared.
+
+### The keyboard is the program's
+
+This library has no platform layer and never will, so it never sees a key. What
+it takes is what a key *meant*:
+
+```zig
+ui.tick(dt);                                   // the cursor blinks on this
+ui.setShift(shift_held);                       // for shift-clicking
+ui.setPointer(x, y, button_down);
+
+_ = ui.textAction(.moveTo(.left, shift));      // Left, or Shift+Left
+_ = ui.textAction(.backspace_word);            // Ctrl+Backspace
+ui.typeText("á");                              // a character event
+if (ui.textAction(.copy)) |taken| clipboard.set(taken);
+_ = ui.textAction(.{ .paste = clipboard.get() });
+```
+
+Ctrl against Cmd, key repeat, dead keys and the layout the reader actually has
+are all decisions a program makes and a layout library cannot. What is ported
+is everything after that decision, which is where the behaviour lives.
+`examples/window.zig` has the whole binding, and it is thirty lines.
+
+**Home and End are decided here, not by the caller.** `.start` and `.end` mean
+the line in a multiline input and the whole text in a single-line one, so one
+binding is right for both; `.text_start` and `.text_end` are Ctrl+Home and
+Ctrl+End. Copy and cut hand the selected text back rather than reaching for a
+clipboard, because there is no clipboard to reach for.
+
+### What it does, and where it differs
+
+Ply's plain editing model, ported whole: character, word and line movement with
+shift extending the selection; the four deletions, and Ctrl+Delete taking the
+space after the word as well as the word; insertion with a length limit counted
+in characters; undo and redo, where typing a word is one undo and a paste is
+its own; click to place the cursor, double click to select a word, drag to
+select; the blink, on Ply's 1.06 second clock; and both scroll offsets, which
+keep the cursor in view as it moves.
+
+Two deliberate differences:
+
+- **Positions are byte offsets**, not Ply's character counts. Ply calls
+  `text.chars().count()` in almost every method, which walks the string; a byte
+  offset is what a Zig slice already wants. Nothing a reader sees changes - the
+  cursor still steps one character at a time through "árvíztűrő", and
+  `max_length` is still characters.
+- **Up and down keep the column they started from.** Ply's plain path
+  recomputes it at every step, so passing through a short line forgets it. Ply
+  has the field for this and its comment, and only its styled path uses it.
+
 ## The renderer
 
 Optional, and a separate module. The library's own output is a command list;
@@ -479,6 +555,8 @@ Ported and tested:
 - Rectangles, corner radii, borders, and the command list they come out as
 - Clipping and scrolling, with the position remembered between frames
 - Hit testing, hover, press and focus, with capture and clip-aware picking
+- Scrollbars, with a draggable thumb and an optional fade
+- Text input: selection, undo, word movement, click and drag, password, multiline
 - An optional renderer over Fluxion RHI: one instanced draw, an SDF for the shapes, a glyph atlas for the text
 
 Not yet, in the order it is worth doing:
@@ -486,6 +564,8 @@ Not yet, in the order it is worth doing:
 | | Why it is not here |
 | --- | --- |
 | **Floating elements, wrapping, shaders, images** | Ply has all of these. They sit above the core rather than inside it. |
+| **Rich text markup** | Ply's `{red\|like this}`, and half of its `text_input.rs`. A milestone of its own; the plain editing model does not need it. |
+| **Input methods** | Composing Japanese or Chinese needs preedit events this library never sees. `text_input.Action` has room for them. |
 | **Accessibility, networking, audio, storage** | Deliberately out of scope. Ply's are bound to its own subsystems, and this library builds on the fluxion ones. |
 
 A container too small for its fixed children still overflows rather than

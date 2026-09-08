@@ -52,6 +52,7 @@ const geometry = @import("geometry.zig");
 const input = @import("input.zig");
 const layout = @import("layout.zig");
 const text_mod = @import("text.zig");
+const text_input = @import("text_input.zig");
 
 const BoundingBox = geometry.BoundingBox;
 const Color = color.Color;
@@ -118,6 +119,26 @@ const Element = struct {
     /// Which run of text this element draws, if it is one. Index into `runs`.
     run: ?u32 = null,
 
+    /// What it takes to be a text input, or null for an ordinary element.
+    field: ?text_input.Config = null,
+    /// What this input **draws**, in `strings`: the text, or the placeholder,
+    /// or a row of bullets. Built when the element is declared and read when
+    /// it is drawn.
+    ///
+    /// Built then rather than at drawing time, and an offset rather than a
+    /// slice, for two reasons that are really the same one. The config's own
+    /// `placeholder` points at whatever the caller had, which may be a stack
+    /// buffer that is gone by the time the frame is drawn. And a text command
+    /// holds a slice, so every one of them has to still be looking at its own
+    /// text when the frame is handed over - a scratch buffer refilled per
+    /// field leaves every command but the last pointing at the wrong string,
+    /// which is a bug this library has now had twice.
+    ///
+    /// `strings` is only appended to while elements are being declared, never
+    /// while they are being drawn, so a slice taken during drawing stays put.
+    shown_start: u32 = 0,
+    shown_len: u32 = 0,
+
     /// What it does with content larger than itself. See `layout.Clip`.
     clip: layout.Clip = .none,
 
@@ -172,6 +193,10 @@ const Hit = struct {
     parent: u32,
     capture: bool,
     preserve_focus: bool,
+    /// Whether this is a text input, which a press has more to do about.
+    field: bool,
+    /// Whether dragging in it selects text.
+    drag_select: bool,
 };
 
 /// Where one scroll container is, and how much there is to scroll through.
@@ -243,8 +268,12 @@ pub const Scroll = struct {
 /// where the thumb is depends on a layout that has not run yet when the
 /// pointer is set.
 const Bar = struct {
-    /// The scroll container this belongs to.
+    /// The scroll container - or text input - this belongs to.
     element: u32,
+    /// Whether the element is a text input rather than a scroll container.
+    /// The two keep their scroll positions in different places, and a drag
+    /// has to write to the right one.
+    field: bool,
     vertical: bool,
     thumb: BoundingBox,
     /// How far the content can move, and how far the thumb can, which is the
@@ -253,9 +282,21 @@ const Bar = struct {
     thumb_travel: f32,
 };
 
+/// A press on a text input, waiting for the layout to say where it landed.
+const PendingClick = struct {
+    element: u32,
+    at: geometry.Vec2,
+    /// Whether to extend the selection rather than replace it. Shift, or a
+    /// drag in progress, which amount to the same thing here.
+    select: bool,
+    /// Whether this was the second click in a row, which selects a word.
+    word: bool,
+};
+
 /// A scrollbar thumb with the pointer held down on it.
 const ThumbDrag = struct {
     element: u32,
+    field: bool,
     vertical: bool,
     /// Where the pointer was when the drag started, along the dragged axis,
     /// and where the content was. Both fixed for the length of the drag, so
@@ -338,6 +379,38 @@ held: std.ArrayList(u32),
 /// Which element has the keyboard, or zero for none.
 focus: u32 = 0,
 
+/// What each text input holds, kept between frames.
+///
+/// Beside the scroll positions and for the same reason: what the reader has
+/// typed is theirs, and redeclaring the page must not take it back.
+edits: std.AutoHashMapUnmanaged(u32, text_input.TextEdit),
+
+/// A click on a text input that has not yet been turned into a cursor.
+///
+/// Ply's `pending_text_click`, and the reason it has to wait is that a click
+/// arrives in pixels and a cursor lives in the string. What lies between them
+/// is a measurement that only happens while the frame is being drawn, so the
+/// click is written down here and answered in `emitField`.
+pending_click: ?PendingClick = null,
+/// The field a drag is selecting in, while the button is down.
+selecting: ?u32 = null,
+/// Whether shift is held. See `setShift`.
+shift: bool = false,
+/// Seconds since this `Ui` was made, advanced by `tick`. What the cursor
+/// blinks on and what tells one click from a double click.
+now: f64 = 0,
+
+/// What the last `copy` or `cut` produced.
+///
+/// Kept because a cut deletes the text it is handing over, so the slice a
+/// caller is given cannot point into the field it came from. Good until the
+/// next copy or cut.
+clipboard: std.ArrayList(u8),
+
+/// Refilled for each field as it is drawn.
+field_lines: std.ArrayList(text_input.VisualLine),
+field_boundaries: std.ArrayList(f32),
+
 /// The scrollbars drawn this frame, for the next frame to be pointed at.
 bars: std.ArrayList(Bar),
 /// The thumb the pointer went down on, until it comes up again.
@@ -411,6 +484,10 @@ pub fn init(gpa: Allocator) Ui {
         .open_stack = .empty,
         .output = .empty,
         .hits = .empty,
+        .edits = .empty,
+        .clipboard = .empty,
+        .field_lines = .empty,
+        .field_boundaries = .empty,
         .bars = .empty,
         .over = .empty,
         .held = .empty,
@@ -431,6 +508,12 @@ pub fn deinit(self: *Ui) void {
     self.open_stack.deinit(self.gpa);
     self.output.deinit(self.gpa);
     self.hits.deinit(self.gpa);
+    var typed = self.edits.valueIterator();
+    while (typed.next()) |edit| edit.deinit(self.gpa);
+    self.edits.deinit(self.gpa);
+    self.clipboard.deinit(self.gpa);
+    self.field_lines.deinit(self.gpa);
+    self.field_boundaries.deinit(self.gpa);
     self.bars.deinit(self.gpa);
     self.over.deinit(self.gpa);
     self.held.deinit(self.gpa);
@@ -475,6 +558,12 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
         scroll.live = false;
         if (scroll.active) scroll.idle = 0 else scroll.idle +|= 1;
         scroll.active = false;
+    }
+
+    var typed = self.edits.valueIterator();
+    while (typed.next()) |edit| {
+        edit.live = false;
+        edit.beginFrame();
     }
 }
 
@@ -658,6 +747,69 @@ pub fn empty(self: *Ui, declaration: layout.Declaration) void {
     self.close();
 }
 
+/// Declare a text input. Ply's `.text_input(|t| ...)` on an element.
+///
+/// Two arguments, like `text`, and for the same reason: the box is a
+/// declaration like any other - a width, a height, padding, a background, a
+/// border - and the config is only what makes it editable.
+///
+/// ```zig
+/// ui.textInput(
+///     .{ .id = "name", .width = .grow, .height = .fixed(32), .padding = .xy(8, 6) },
+///     .{ .placeholder = "Your name" },
+/// );
+/// ```
+///
+/// **Give it a width.** A `.fit` width comes out as the padding and nothing
+/// else, because a box that resized itself as the reader typed would be
+/// unusable. A `.fit` height is one line, which Ply does not do and which
+/// stops an input nobody gave a height from being an invisible box the reader
+/// can focus and type into and never see.
+///
+/// The text is reached by name afterwards: `textValueOf("name")`.
+pub fn textInput(self: *Ui, declaration: layout.Declaration, config: text_input.Config) void {
+    self.textInputChecked(declaration, config) catch |err| self.remember(err);
+}
+
+fn textInputChecked(self: *Ui, declaration: layout.Declaration, config: text_input.Config) Error!void {
+    try self.openChecked(declaration);
+    const index = self.innermost();
+
+    const entry = try self.edits.getOrPut(self.gpa, self.elements.items[index].id);
+    if (!entry.found_existing) entry.value_ptr.* = .empty;
+    entry.value_ptr.live = true;
+    entry.value_ptr.multiline = config.multiline;
+    entry.value_ptr.max_length = config.max_length;
+
+    // What this input will draw, worked out now while the caller's
+    // placeholder is still theirs to lend. See `Element.shown_start`.
+    const start: u32 = @intCast(self.strings.items.len);
+    const shown = try text_input.display(
+        &self.strings,
+        self.gpa,
+        entry.value_ptr.text.items,
+        config.placeholder,
+        config.password,
+    );
+
+    self.elements.items[index].field = config;
+    self.elements.items[index].shown_start = start;
+    self.elements.items[index].shown_len = @intCast(shown.len);
+
+    try self.closeChecked();
+
+    if (declaration.height.kind == .fit) {
+        if (self.measurer) |measurer| {
+            const wanted = measurer.lineHeight(config.style()) +
+                self.elements.items[index].config.padding.onAxis(false);
+            self.elements.items[index].dimensions.height =
+                @max(self.elements.items[index].dimensions.height, wanted);
+            self.elements.items[index].min_dimensions.height =
+                @max(self.elements.items[index].min_dimensions.height, wanted);
+        }
+    }
+}
+
 /// Close the innermost open element, and give it the size its children need.
 ///
 /// This is phase one, and it happens here rather than in `end` because it
@@ -789,6 +941,7 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
     try self.positionAndEmit();
     try self.measureScroll();
     try self.recordHits();
+    try self.sweepFields();
     return self.output.items;
 }
 
@@ -1323,6 +1476,7 @@ fn positionAndEmit(self: *Ui) Error!void {
     self.elements.items[0].box = .at(0, 0, self.elements.items[0].dimensions);
     try self.emitBackground(0, self.elements.items[0].box);
     try self.emitText(0, self.elements.items[0].box);
+    try self.emitField(0, self.elements.items[0].box);
     if (self.elements.items[0].clip.clips()) {
         try self.emitScissor(.scissor_start, self.elements.items[0].box);
     }
@@ -1381,6 +1535,7 @@ fn positionAndEmit(self: *Ui) Error!void {
         self.elements.items[child_index].box = .at(x, y, child.dimensions);
         try self.emitBackground(child_index, self.elements.items[child_index].box);
         try self.emitText(child_index, self.elements.items[child_index].box);
+        try self.emitField(child_index, self.elements.items[child_index].box);
 
         // The background goes down first and is not clipped by the element's
         // own rectangle; everything inside it is.
@@ -1473,6 +1628,198 @@ fn emitBorder(self: *Ui, index: u32, box: BoundingBox) Error!void {
             .corner_radius = element.corner_radius.clampTo(box.width, box.height),
         } },
     });
+}
+
+/// Draw a text input: the selection, the text, and the cursor.
+///
+/// Also where a click on it is finally answered, because everything a click
+/// needs to know - which line, which character, how far the text has been
+/// scrolled - is measured here and nowhere else. Ply resolves its
+/// `pending_text_click` at the same point in its own frame.
+fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
+    const element = self.elements.items[index];
+    const config = element.field orelse return;
+    const measurer = self.measurer orelse return;
+    const edit = self.edits.getPtr(element.id) orelse return;
+    if (box.empty()) return;
+
+    const padding = element.config.padding;
+    const inner: BoundingBox = .init(
+        box.x + @as(f32, @floatFromInt(padding.left)),
+        box.y + @as(f32, @floatFromInt(padding.top)),
+        @max(0, box.width - padding.onAxis(true)),
+        @max(0, box.height - padding.onAxis(false)),
+    );
+
+    // What is drawn is not always what is stored: the placeholder when there
+    // is nothing, bullets when it is a password. Built when this element was
+    // declared, so every command emitted below keeps looking at its own text.
+    const blank = edit.text.items.len == 0;
+    const shown = self.strings.items[element.shown_start..][0..element.shown_len];
+    const style = if (blank) config.placeholderStyle() else config.style();
+    const step = measurer.lineHeight(config.style());
+
+    self.field_lines.clearRetainingCapacity();
+    const lines = try text_input.wrapLines(
+        &self.field_lines,
+        self.gpa,
+        shown,
+        inner.width,
+        config.multiline,
+        style,
+        measurer,
+    );
+
+    // A press that landed on this field is turned into a cursor position
+    // here, where the measurements are.
+    if (self.pending_click) |click| {
+        if (click.element == element.id) {
+            self.pending_click = null;
+
+            const down = click.at.y - inner.y + edit.scroll.y;
+            var row: usize = if (step > 0)
+                @intFromFloat(@max(0, @floor(down / step)))
+            else
+                0;
+            if (row >= lines.len) row = lines.len - 1;
+            const line = lines[row];
+
+            self.field_boundaries.clearRetainingCapacity();
+            const xs = try text_input.boundaries(
+                &self.field_boundaries,
+                self.gpa,
+                shown[line.start..line.end],
+                style,
+                measurer,
+            );
+            const column = text_input.nearestBoundary(click.at.x - inner.x + edit.scroll.x, xs);
+
+            // The column is a character index into what is *drawn*, and the
+            // cursor is a byte offset into what is *stored*. For a password
+            // those are three bytes apart per character, which is why the
+            // crossing is counted in characters.
+            const offset = if (blank) 0 else text_input.offsetOfCharacter(
+                edit.text.items,
+                text_input.characters(shown[0..line.start]) + column,
+            );
+
+            if (click.word) edit.selectWordAt(offset) else edit.clickTo(offset, click.select);
+        }
+    }
+
+    // Where the cursor is, in the drawn text.
+    const cursor_display = if (blank) 0 else text_input.offsetOfCharacter(
+        shown,
+        text_input.characters(edit.text.items[0..edit.cursor]),
+    );
+    const spot = text_input.locate(lines, cursor_display);
+    const cursor_line = lines[spot.line];
+    const cursor_x = measurer.measure(shown[cursor_line.start..spot.at], style).width;
+
+    const has_keyboard = self.focus != 0 and self.focus == element.id;
+    if (has_keyboard) {
+        edit.revealX(cursor_x, inner.width);
+        if (config.multiline) {
+            edit.revealY(spot.line, step, inner.height);
+        } else {
+            edit.scroll.y = 0;
+        }
+    }
+
+    // The text moves inside the box, so it has to be cut off at its edge -
+    // otherwise a name longer than the field is drawn straight across
+    // whatever is beside it.
+    try self.emitScissor(.scissor_start, box);
+
+    const origin_x = inner.x - edit.scroll.x;
+    const origin_y = inner.y - edit.scroll.y;
+
+    // The selection, under the text, once per line it covers.
+    const highlight: ?text_input.Range = if (blank) null else if (edit.selection()) |range| .{
+        .start = text_input.offsetOfCharacter(shown, text_input.characters(edit.text.items[0..range.start])),
+        .end = text_input.offsetOfCharacter(shown, text_input.characters(edit.text.items[0..range.end])),
+    } else null;
+
+    var widest: f32 = 0;
+    for (lines, 0..) |line, row| {
+        const run = shown[line.start..line.end];
+        const line_y = origin_y + step * @as(f32, @floatFromInt(row));
+
+        if (highlight) |range| {
+            const from = @max(line.start, range.start);
+            const to = @min(line.end, range.end);
+            if (from < to) {
+                const left = measurer.measure(shown[line.start..from], style).width;
+                const right = measurer.measure(shown[line.start..to], style).width;
+                try self.output.append(self.gpa, .{
+                    .bounding_box = .init(origin_x + left, line_y, right - left, step),
+                    .id = element.id,
+                    .z_index = element.z_index,
+                    .config = .{ .rectangle = .{
+                        .color = config.selection_color,
+                        .corner_radius = .sharp,
+                    } },
+                });
+            }
+        }
+
+        if (run.len > 0) {
+            const width = measurer.measure(run, style).width;
+            widest = @max(widest, width);
+            try self.output.append(self.gpa, .{
+                .bounding_box = .init(origin_x, line_y, width, step),
+                .id = element.id,
+                .z_index = element.z_index,
+                .config = .{ .text = .{
+                    .text = run,
+                    .color = style.color,
+                    .font_size = style.font_size,
+                    .letter_spacing = style.letter_spacing,
+                    .line_height = @intFromFloat(@round(step)),
+                    .font = style.font,
+                } },
+            });
+        }
+    }
+
+    // The cursor, on top, and only while the field has the keyboard.
+    if (has_keyboard and edit.cursorVisible()) {
+        try self.output.append(self.gpa, .{
+            .bounding_box = .init(
+                origin_x + cursor_x,
+                origin_y + step * @as(f32, @floatFromInt(spot.line)),
+                2,
+                step,
+            ),
+            .id = element.id,
+            .z_index = element.z_index,
+            .config = .{ .rectangle = .{
+                .color = config.cursor_color,
+                .corner_radius = .sharp,
+            } },
+        });
+    }
+
+    try self.emitScissor(.scissor_end, box);
+
+    // And a bar down the edge if one was asked for, measured the way a scroll
+    // container's is: against the whole box, with the padding counted into
+    // the content.
+    if (config.scrollbar) |bar_config| {
+        const alpha = visibility(bar_config, edit.idle);
+        if (alpha > 0) {
+            const content_height = step * @as(f32, @floatFromInt(lines.len)) + padding.onAxis(false);
+            const content_width = widest + padding.onAxis(true);
+            if (config.multiline) {
+                if (barGeometry(box, content_height, edit.scroll.y, bar_config, true)) |bar| {
+                    try self.emitBar(element, bar_config, alpha, bar, true, true);
+                }
+            }
+            if (barGeometry(box, content_width, edit.scroll.x, bar_config, false)) |bar| {
+                try self.emitBar(element, bar_config, alpha, bar, false, true);
+            }
+        }
+    }
 }
 
 /// Where one scrollbar goes, and what a drag of it is worth.
@@ -1588,12 +1935,12 @@ fn emitScrollbars(self: *Ui, index: u32, box: BoundingBox) Error!void {
     // question, and `thumbUnder` answers it the other way round.
     if (element.clip.scroll_y) {
         if (barGeometry(box, content.height + padding.onAxis(false), element.clip.offset.y, config, true)) |bar| {
-            try self.emitBar(element, config, alpha, bar, true);
+            try self.emitBar(element, config, alpha, bar, true, false);
         }
     }
     if (element.clip.scroll_x) {
         if (barGeometry(box, content.width + padding.onAxis(true), element.clip.offset.x, config, false)) |bar| {
-            try self.emitBar(element, config, alpha, bar, false);
+            try self.emitBar(element, config, alpha, bar, false, false);
         }
     }
 }
@@ -1605,6 +1952,7 @@ fn emitBar(
     alpha: f32,
     bar: BarGeometry,
     vertical: bool,
+    field: bool,
 ) Error!void {
     const radius: geometry.CornerRadius = .all(config.corner_radius);
 
@@ -1632,6 +1980,7 @@ fn emitBar(
 
     try self.bars.append(self.gpa, .{
         .element = element.id,
+        .field = field,
         .vertical = vertical,
         .thumb = bar.thumb,
         .max_scroll = bar.max_scroll,
@@ -1740,8 +2089,32 @@ fn recordHits(self: *Ui) Error!void {
             .parent = parent,
             .capture = element.capture,
             .preserve_focus = element.preserve_focus,
+            .field = element.field != null,
+            .drag_select = if (element.field) |config| config.drag_select else false,
         });
     }
+}
+
+/// Move time along, in seconds.
+///
+/// **Call it once a frame, before `begin`.** Two things need a clock and
+/// neither can have one of its own: the cursor blinks on it, and it is what
+/// tells a second click from a double click. A program that never calls this
+/// gets a solid cursor and no double clicks, which is a good failure - not a
+/// wrong one.
+pub fn tick(self: *Ui, dt: f32) void {
+    self.now += dt;
+    var typed = self.edits.valueIterator();
+    while (typed.next()) |edit| edit.blink += dt;
+}
+
+/// Say whether shift is held.
+///
+/// The one modifier the pointer needs: shift-clicking a text input extends
+/// the selection rather than replacing it. Every other modifier reaches this
+/// library already decided, as a `text_input.Action`.
+pub fn setShift(self: *Ui, held: bool) void {
+    self.shift = held;
 }
 
 /// Say where the pointer is and whether its button is down.
@@ -1776,8 +2149,10 @@ pub fn setPointer(self: *Ui, x: f32, y: f32, down: bool) void {
         self.held.clearRetainingCapacity();
         self.held.appendSlice(self.gpa, self.over.items) catch {};
         self.takeFocus();
+        self.pressField();
     } else if (self.pointer.isUp()) {
         self.drag = null;
+        self.selecting = null;
         // The chain is kept for the frame the button comes up in, so
         // `justReleased` has something to answer about, and dropped after.
         if (self.pointer.state == .idle) self.held.clearRetainingCapacity();
@@ -1786,6 +2161,50 @@ pub fn setPointer(self: *Ui, x: f32, y: f32, down: bool) void {
     // Not on the frame the button went down: the pointer has not moved yet,
     // and Ply waits the same frame for the same reason.
     if (self.drag) |grabbed| self.dragThumb(grabbed);
+
+    // A drag inside a text input keeps asking for the cursor to be put where
+    // the pointer is, with the selection dragged along behind it.
+    if (self.selecting) |id| {
+        if (self.pointer.isDown() and !self.pointer.justPressed()) {
+            self.pending_click = .{
+                .element = id,
+                .at = self.pointer.position,
+                .select = true,
+                .word = false,
+            };
+        }
+    }
+}
+
+/// Write down a press that landed on a text input, for `emitField` to answer.
+///
+/// Nothing is decided here on purpose. Where in the string the pointer is
+/// depends on a measurement that has not happened yet - the frame this press
+/// belongs to has not been declared, let alone laid out - so all that is
+/// settled now is *which* field, and whether this is the second click.
+fn pressField(self: *Ui) void {
+    if (self.over.items.len == 0) return;
+    const target = self.over.items[self.over.items.len - 1];
+
+    for (self.hits.items) |hit| {
+        if (hit.id != target) continue;
+        if (!hit.field) return;
+
+        const edit = self.edits.getPtr(target) orelse return;
+        // Ply's rule: the same element, within four tenths of a second.
+        const twice = edit.last_click_at == target and (self.now - edit.last_click) < 0.4;
+        edit.last_click = self.now;
+        edit.last_click_at = target;
+
+        self.pending_click = .{
+            .element = target,
+            .at = self.pointer.position,
+            .select = self.shift,
+            .word = twice,
+        };
+        if (hit.drag_select) self.selecting = target;
+        return;
+    }
 }
 
 /// The bar for one axis of one container, as the last frame drew it.
@@ -1820,15 +2239,32 @@ fn thumbUnder(self: *Ui, point: geometry.Vec2) ?ThumbDrag {
             }
         }
 
-        const scroll = self.scrolls.get(bar.element) orelse continue;
+        const scrolled = self.scrolledTo(bar.element, bar.field) orelse continue;
         return .{
             .element = bar.element,
+            .field = bar.field,
             .vertical = bar.vertical,
             .origin = if (bar.vertical) point.y else point.x,
-            .scrolled = if (bar.vertical) scroll.position.y else scroll.position.x,
+            .scrolled = if (bar.vertical) scrolled.y else scrolled.x,
         };
     }
     return null;
+}
+
+/// How far a scrollable thing has been scrolled.
+///
+/// Two kinds of thing have a scrollbar and they keep the same two numbers in
+/// different places: a scroll container in `scrolls`, a text input in the
+/// state that also holds its text. Everything a bar does goes through here
+/// and its opposite below, so the rest of the scrollbar code never has to
+/// know which it is looking at.
+fn scrolledTo(self: *Ui, element: u32, field: bool) ?geometry.Vec2 {
+    if (field) {
+        const edit = self.edits.getPtr(element) orelse return null;
+        return edit.scroll;
+    }
+    const scroll = self.scrolls.get(element) orelse return null;
+    return scroll.position;
 }
 
 /// Move the content by as much as the thumb has been dragged.
@@ -1843,19 +2279,26 @@ fn thumbUnder(self: *Ui, point: geometry.Vec2) ?ThumbDrag {
 /// is dragged at the new rate. Ply recomputes them too.
 fn dragThumb(self: *Ui, grabbed: ThumbDrag) void {
     const bar = self.barOf(grabbed.element, grabbed.vertical) orelse return;
-    const scroll = self.scrolls.getPtr(grabbed.element) orelse return;
 
-    const now = if (grabbed.vertical) self.pointer.position.y else self.pointer.position.x;
+    const pointer = if (grabbed.vertical) self.pointer.position.y else self.pointer.position.x;
     const moved: f32 = if (bar.thumb_travel <= 0)
         0
     else
-        grabbed.scrolled + (now - grabbed.origin) * (bar.max_scroll / bar.thumb_travel);
+        grabbed.scrolled + (pointer - grabbed.origin) * (bar.max_scroll / bar.thumb_travel);
+    const to = std.math.clamp(moved, 0, bar.max_scroll);
 
-    const at = std.math.clamp(moved, 0, bar.max_scroll);
+    if (grabbed.field) {
+        const edit = self.edits.getPtr(grabbed.element) orelse return;
+        if (grabbed.vertical) edit.scroll.y = to else edit.scroll.x = to;
+        edit.active = true;
+        return;
+    }
+
+    const scroll = self.scrolls.getPtr(grabbed.element) orelse return;
     if (grabbed.vertical) {
-        scroll.position.y = at;
+        scroll.position.y = to;
     } else {
-        scroll.position.x = at;
+        scroll.position.x = to;
     }
     scroll.position = scroll.clamped();
     scroll.active = true;
@@ -2023,6 +2466,171 @@ pub fn clearFocus(self: *Ui) void {
 /// Whether this element has the keyboard.
 pub fn isFocused(self: *Ui, name: []const u8) bool {
     return self.focus != 0 and self.focus == identify(name, 0);
+}
+
+// -------------------------------------------------------------------------
+// Typing
+// -------------------------------------------------------------------------
+
+/// Do something to the focused text input.
+///
+/// **Call it before `begin`**, with whatever the keyboard produced. Nothing
+/// happens if no text input has the focus, which is what lets a program hand
+/// every key over without checking first.
+///
+/// What comes back is the text a `copy` or a `cut` wants put on the
+/// clipboard, and null otherwise - this library has no clipboard of its own
+/// and no way to reach the system's. The slice is good until the next copy or
+/// cut.
+///
+/// ```zig
+/// if (key == .left) _ = ui.textAction(.moveTo(.left, shift));
+/// if (key == .c and ctrl) if (ui.textAction(.copy)) |taken| clipboard.set(taken);
+/// ```
+pub fn textAction(self: *Ui, action: text_input.Action) ?[]const u8 {
+    return self.textActionChecked(action) catch |err| {
+        self.remember(err);
+        return null;
+    };
+}
+
+fn textActionChecked(self: *Ui, action: text_input.Action) Error!?[]const u8 {
+    if (self.focus == 0) return null;
+    const edit = self.edits.getPtr(self.focus) orelse return null;
+
+    // The undo entry is pushed *before* the edit, so what it holds is the
+    // state to come back to. Which actions push, and which of those group
+    // with the one before, is `text_input.EditKind`.
+    switch (action) {
+        .backspace => try edit.pushUndo(self.gpa, .backspace),
+        .delete => try edit.pushUndo(self.gpa, .delete),
+        .backspace_word, .delete_word => try edit.pushUndo(self.gpa, .delete_word),
+        .cut => try edit.pushUndo(self.gpa, .cut),
+        .paste => try edit.pushUndo(self.gpa, .paste),
+        // Only in a multiline input, where Enter is an edit rather than an
+        // answer.
+        .submit => if (edit.multiline) try edit.pushUndo(self.gpa, .insert),
+        else => {},
+    }
+
+    const before = edit.revision;
+    var taken: ?[]const u8 = null;
+
+    switch (action) {
+        .move => |motion| edit.move(motion),
+        .backspace => edit.backspace(),
+        .delete => edit.deleteForward(),
+        .backspace_word => edit.backspaceWord(),
+        .delete_word => edit.deleteWordForward(),
+        .select_all => edit.selectAll(),
+        .copy => taken = try self.remember_clipboard(edit.selected()),
+        .cut => {
+            taken = try self.remember_clipboard(edit.selected());
+            _ = edit.deleteSelection();
+            edit.resetBlink();
+        },
+        .paste => |run| try edit.insert(self.gpa, run, edit.max_length),
+        .submit => {
+            edit.submitted = true;
+            if (edit.multiline) try edit.insert(self.gpa, "\n", edit.max_length);
+        },
+        .undo => _ = try edit.undo(self.gpa),
+        .redo => _ = try edit.redo(self.gpa),
+    }
+
+    if (edit.revision != before) edit.changed = true;
+    edit.active = true;
+    return taken;
+}
+
+fn remember_clipboard(self: *Ui, run: []const u8) Error![]const u8 {
+    self.clipboard.clearRetainingCapacity();
+    try self.clipboard.appendSlice(self.gpa, run);
+    return self.clipboard.items;
+}
+
+/// Type into the focused text input. Ply's `process_text_input_char`.
+///
+/// One character or several - a program that gets a whole string out of its
+/// window layer may hand the whole string over. Consecutive calls group into
+/// one undo, so typing a word and pressing Ctrl+Z takes back the word.
+pub fn typeText(self: *Ui, run: []const u8) void {
+    self.typeTextChecked(run) catch |err| self.remember(err);
+}
+
+fn typeTextChecked(self: *Ui, run: []const u8) Error!void {
+    if (self.focus == 0) return;
+    const edit = self.edits.getPtr(self.focus) orelse return;
+
+    try edit.pushUndo(self.gpa, .insert);
+    const before = edit.revision;
+    try edit.insert(self.gpa, run, edit.max_length);
+    if (edit.revision != before) edit.changed = true;
+    edit.active = true;
+}
+
+/// What a text input holds, or null if there is no such element or it was not
+/// on the page last frame.
+pub fn textValueOf(self: *Ui, name: []const u8) ?[]const u8 {
+    const edit = self.edits.getPtr(identify(name, 0)) orelse return null;
+    return edit.value();
+}
+
+/// Put text into an input, from the program rather than the keyboard.
+///
+/// Does not push an undo: filling a form in is not an edit the reader made,
+/// and letting Ctrl+Z take it back would undo something they never did.
+pub fn setTextValue(self: *Ui, name: []const u8, run: []const u8) void {
+    const edit = self.edits.getPtr(identify(name, 0)) orelse return;
+    edit.setValue(self.gpa, run) catch |err| self.remember(err);
+    edit.active = true;
+}
+
+/// Whether the text changed this frame - a key, a paste, an undo. What an
+/// `on_changed` callback would be told, asked for instead.
+pub fn textChanged(self: *Ui, name: []const u8) bool {
+    const edit = self.edits.getPtr(identify(name, 0)) orelse return false;
+    return edit.changed_this_frame;
+}
+
+/// Whether Enter was pressed in this input this frame. Ply's `on_submit`.
+pub fn textSubmitted(self: *Ui, name: []const u8) bool {
+    const edit = self.edits.getPtr(identify(name, 0)) orelse return false;
+    return edit.submitted_this_frame;
+}
+
+/// Everything one text input remembers, for a caller that wants the cursor or
+/// the selection rather than only the text.
+pub fn editOf(self: *Ui, name: []const u8) ?*text_input.TextEdit {
+    return self.edits.getPtr(identify(name, 0));
+}
+
+/// Forget the inputs that were not declared this frame.
+///
+/// The mirror of the sweep `measureScroll` does, and it counts the idle
+/// frames a hiding scrollbar needs while it is there.
+fn sweepFields(self: *Ui) Error!void {
+    var stale: [64]u32 = undefined;
+    var count: usize = 0;
+
+    var seen = self.edits.iterator();
+    while (seen.next()) |entry| {
+        if (entry.value_ptr.active) entry.value_ptr.idle = 0 else entry.value_ptr.idle +|= 1;
+        entry.value_ptr.active = false;
+
+        if (entry.value_ptr.live) continue;
+        if (count < stale.len) {
+            stale[count] = entry.key_ptr.*;
+            count += 1;
+        }
+    }
+
+    for (stale[0..count]) |key| {
+        if (self.edits.fetchRemove(key)) |gone| {
+            var edit = gone.value;
+            edit.deinit(self.gpa);
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -4421,4 +5029,499 @@ test "the fade curve is Ply's" {
 
     // No hold at all means always shown, which is the default.
     try testing.expectEqual(@as(f32, 1), visibility(.{}, 4000));
+}
+
+// -------------------------------------------------------------------------
+// Text input
+// -------------------------------------------------------------------------
+
+// Measured with `mono`, so at a font size of sixteen a character is eight
+// pixels wide and a line is sixteen tall. Every click below is a multiple of
+// eight for that reason, and every expected cursor position is too.
+//
+// A click takes two frames, and not by accident: `setPointer` can only say
+// *which* field was pressed, because where in the string the pointer landed
+// depends on a measurement that has not happened yet. The frame after
+// resolves it. A test that ran one frame would find the cursor where it
+// started and would be testing nothing.
+
+/// A frame with one text input in it, in a two hundred pixel box.
+fn oneField(u: *Ui, config: text_input.Config) ![]const commands.RenderCommand {
+    u.begin(.init(400, 200));
+    openRoot(u);
+    u.textInput(
+        .{ .id = "name", .width = .fixed(200), .height = .fixed(20), .background_color = paint },
+        config,
+    );
+    u.close();
+    return try u.end();
+}
+
+/// The text commands a frame emitted, in order.
+fn drawnText(drawn: []const commands.RenderCommand, out: *[8][]const u8) []const []const u8 {
+    var count: usize = 0;
+    for (drawn) |command| {
+        if (command.config != .text) continue;
+        if (count == out.len) break;
+        out[count] = command.config.text.text;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+/// The one rectangle drawn in this colour, if there is one.
+fn rectangleIn(drawn: []const commands.RenderCommand, colour: Color) ?BoundingBox {
+    for (drawn) |command| {
+        if (command.config != .rectangle) continue;
+        if (std.meta.eql(command.config.rectangle.color, colour)) return command.bounding_box;
+    }
+    return null;
+}
+
+test "an empty input draws its placeholder, and a typed one draws the text" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var seen: [8][]const u8 = undefined;
+    const empty_frame = try oneField(&ui, .{ .placeholder = "Your name" });
+    try testing.expectEqualStrings("Your name", drawnText(empty_frame, &seen)[0]);
+
+    ui.setTextValue("name", "Kiss");
+    const typed = try oneField(&ui, .{ .placeholder = "Your name" });
+    try testing.expectEqualStrings("Kiss", drawnText(typed, &seen)[0]);
+}
+
+test "the placeholder is copied, so a caller may format it into a buffer" {
+    // The bug `ui.text` already had once. A placeholder is nearly always a
+    // literal, and "nearly always" is exactly how that one happened.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var scratch: [32]u8 = undefined;
+    const drawn = blk: {
+        const label = try std.fmt.bufPrint(&scratch, "Field {d}", .{7});
+        break :blk try oneField(&ui, .{ .placeholder = label });
+    };
+    @memset(&scratch, 0xAA);
+
+    var seen: [8][]const u8 = undefined;
+    try testing.expectEqualStrings("Field 7", drawnText(drawn, &seen)[0]);
+}
+
+test "two inputs in one frame each draw their own text" {
+    // The bug this is here for drew every field's text as the last field's,
+    // because they shared one scratch buffer and a text command holds a
+    // slice. It is the same trap `ui.text` fell into once, and only a frame
+    // with more than one input in it can see it.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const two = struct {
+        fn run(u: *Ui) ![]const commands.RenderCommand {
+            u.begin(.init(400, 200));
+            openRoot(u);
+            u.textInput(.{ .id = "first", .width = .fixed(100), .height = .fixed(20) }, .{});
+            u.textInput(.{ .id = "second", .width = .fixed(100), .height = .fixed(20) }, .{ .placeholder = "empty" });
+            u.textInput(.{ .id = "third", .width = .fixed(100), .height = .fixed(20) }, .{});
+            u.close();
+            return try u.end();
+        }
+    }.run;
+
+    _ = try two(&ui);
+    ui.setTextValue("first", "one");
+    ui.setTextValue("third", "a much longer third one");
+    const drawn = try two(&ui);
+
+    var seen: [8][]const u8 = undefined;
+    const lines = drawnText(drawn, &seen);
+    try testing.expectEqual(@as(usize, 3), lines.len);
+    try testing.expectEqualStrings("one", lines[0]);
+    try testing.expectEqualStrings("empty", lines[1]);
+    try testing.expectEqualStrings("a much longer third one", lines[2]);
+}
+
+test "typing goes into the focused input and nowhere else" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Nothing focused: the keys go nowhere rather than into the first field
+    // that happens to exist.
+    _ = try oneField(&ui, .{});
+    ui.typeText("hello");
+    try testing.expectEqualStrings("", ui.textValueOf("name").?);
+
+    // Click it, and they land.
+    ui.setPointer(20, 10, true);
+    _ = try oneField(&ui, .{});
+    try testing.expect(ui.isFocused("name"));
+
+    ui.typeText("hello");
+    try testing.expectEqualStrings("hello", ui.textValueOf("name").?);
+
+    // `textChanged` is about the frame, not about the instant: keys arrive
+    // between frames, so the answer is the same whether it is asked while
+    // declaring or after the commands are out.
+    try testing.expect(!ui.textChanged("name"));
+    _ = try oneField(&ui, .{});
+    try testing.expect(ui.textChanged("name"));
+    _ = try oneField(&ui, .{});
+    try testing.expect(!ui.textChanged("name"));
+}
+
+test "the cursor is drawn where the text ends, and only while focused" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const cursor: Color = .hex(0xFF0000);
+    ui.setTextValue("name", "abc");
+
+    // Not focused: no cursor at all, however solid the blink says it is.
+    const unfocused = try oneField(&ui, .{ .cursor_color = cursor });
+    try testing.expect(rectangleIn(unfocused, cursor) == null);
+
+    // Setting the value from the program leaves the cursor where it was,
+    // only clamping it - which is Ply's rule and is why this types instead.
+    try testing.expectEqual(@as(usize, 0), ui.editOf("name").?.cursor);
+
+    ui.setFocus("name");
+    ui.typeText("abc");
+    const with_keyboard = try oneField(&ui, .{ .cursor_color = cursor });
+
+    // Three characters at eight pixels, and two pixels wide.
+    const drawn_at = rectangleIn(with_keyboard, cursor).?;
+    try testing.expectEqual(@as(f32, 24), drawn_at.x);
+    try testing.expectEqual(@as(f32, 2), drawn_at.width);
+}
+
+test "a selection is washed over exactly the characters it covers" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const wash: Color = .hex(0x00FF00);
+    _ = try oneField(&ui, .{ .selection_color = wash });
+    ui.setTextValue("name", "hello world");
+
+    const edit = ui.editOf("name").?;
+    edit.anchor = 2;
+    edit.cursor = 7;
+
+    const drawn = try oneField(&ui, .{ .selection_color = wash });
+    const box = rectangleIn(drawn, wash).?;
+    try testing.expectEqual(@as(f32, 16), box.x);
+    try testing.expectEqual(@as(f32, 40), box.width);
+}
+
+test "clicking puts the cursor at the nearest character boundary" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try oneField(&ui, .{});
+    ui.setTextValue("name", "hello");
+    _ = try oneField(&ui, .{});
+
+    // Between the second and third character, nearer the third.
+    ui.setPointer(21, 10, true);
+    _ = try oneField(&ui, .{});
+    try testing.expectEqual(@as(usize, 3), ui.editOf("name").?.cursor);
+
+    // Past the end of the text, but still inside the box, lands after the
+    // last character. A second later, so that this is a click and not the
+    // second half of a double click.
+    ui.setPointer(21, 10, false);
+    ui.tick(1.0);
+    ui.setPointer(150, 10, true);
+    _ = try oneField(&ui, .{});
+    try testing.expectEqual(@as(usize, 5), ui.editOf("name").?.cursor);
+
+    // Outside it entirely is not a press on the field at all, so the cursor
+    // stays where it was put.
+    ui.setPointer(150, 10, false);
+    ui.tick(1.0);
+    ui.setPointer(390, 10, true);
+    _ = try oneField(&ui, .{});
+    try testing.expectEqual(@as(usize, 5), ui.editOf("name").?.cursor);
+}
+
+test "double clicking selects the word under the pointer" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try oneField(&ui, .{});
+    ui.setTextValue("name", "hello world");
+    _ = try oneField(&ui, .{});
+
+    // Two presses inside Ply's four tenths of a second. The clock only moves
+    // when a program says so, which is what makes this testable at all.
+    ui.setPointer(60, 10, true);
+    _ = try oneField(&ui, .{});
+    ui.setPointer(60, 10, false);
+    ui.tick(0.1);
+    ui.setPointer(60, 10, true);
+    _ = try oneField(&ui, .{});
+
+    try testing.expectEqualStrings("world", ui.editOf("name").?.selected());
+
+    // The same two presses a second apart are two clicks, not one double.
+    ui.setPointer(60, 10, false);
+    ui.tick(1.0);
+    ui.setPointer(60, 10, true);
+    _ = try oneField(&ui, .{});
+    try testing.expect(ui.editOf("name").?.selection() == null);
+}
+
+test "dragging inside an input selects, when it was asked to" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const config: text_input.Config = .{ .drag_select = true };
+    _ = try oneField(&ui, config);
+    ui.setTextValue("name", "hello world");
+    _ = try oneField(&ui, config);
+
+    ui.setPointer(0, 10, true);
+    _ = try oneField(&ui, config);
+    ui.setPointer(40, 10, true);
+    _ = try oneField(&ui, config);
+
+    try testing.expectEqualStrings("hello", ui.editOf("name").?.selected());
+}
+
+test "a password draws bullets, and a click still lands on the right character" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const config: text_input.Config = .{ .password = true };
+    _ = try oneField(&ui, config);
+    // Accented, so the bullets and the text are different lengths in bytes -
+    // three characters stored in four bytes, drawn as nine.
+    ui.setTextValue("name", "tűz");
+    const drawn = try oneField(&ui, config);
+
+    var seen: [8][]const u8 = undefined;
+    try testing.expectEqualStrings(text_input.bullet ** 3, drawnText(drawn, &seen)[0]);
+
+    // A click on the second bullet is a cursor after the second *character*,
+    // which is byte three because the "ű" is two of them.
+    ui.setPointer(16, 10, true);
+    _ = try oneField(&ui, config);
+    try testing.expectEqual(@as(usize, 3), ui.editOf("name").?.cursor);
+}
+
+test "an input longer than its box scrolls to keep the cursor in view" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.setFocus("name");
+    _ = try oneField(&ui, .{});
+    // Fifty characters at eight pixels is four hundred, in a box of two
+    // hundred. The cursor is at the end, so the text is scrolled by the
+    // difference and not one pixel more.
+    ui.setTextValue("name", "x" ** 50);
+    ui.editOf("name").?.cursor = 50;
+    _ = try oneField(&ui, .{});
+
+    try testing.expectEqual(@as(f32, 200), ui.editOf("name").?.scroll.x);
+
+    // Home brings it back to the start.
+    _ = ui.textAction(.moveTo(.start, false));
+    _ = try oneField(&ui, .{});
+    try testing.expectEqual(@as(f32, 0), ui.editOf("name").?.scroll.x);
+}
+
+test "copy hands the selection over and cut takes it away" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.setFocus("name");
+    _ = try oneField(&ui, .{});
+    ui.setTextValue("name", "hello world");
+    ui.editOf("name").?.anchor = 0;
+    ui.editOf("name").?.cursor = 5;
+
+    try testing.expectEqualStrings("hello", ui.textAction(.copy).?);
+    try testing.expectEqualStrings("hello world", ui.textValueOf("name").?);
+
+    // What a cut hands back is a copy, and it has to be: the text it points
+    // at is gone by the time the caller reads it.
+    const taken = ui.textAction(.cut).?;
+    try testing.expectEqualStrings("hello", taken);
+    try testing.expectEqualStrings(" world", ui.textValueOf("name").?);
+
+    // And it goes back where it came from.
+    _ = ui.textAction(.{ .paste = taken });
+    try testing.expectEqualStrings("hello world", ui.textValueOf("name").?);
+}
+
+test "Enter submits a single-line input and adds a line to a multiline one" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.setFocus("name");
+    _ = try oneField(&ui, .{});
+    ui.typeText("hello");
+
+    _ = ui.textAction(.submit);
+    _ = try oneField(&ui, .{});
+    try testing.expect(ui.textSubmitted("name"));
+    try testing.expectEqualStrings("hello", ui.textValueOf("name").?);
+
+    // The flag lasts exactly the frame it was asked about.
+    _ = try oneField(&ui, .{});
+    try testing.expect(!ui.textSubmitted("name"));
+
+    const multi: text_input.Config = .{ .multiline = true };
+    _ = try oneField(&ui, multi);
+    _ = ui.textAction(.submit);
+    _ = try oneField(&ui, multi);
+    try testing.expectEqualStrings("hello\n", ui.textValueOf("name").?);
+}
+
+test "a multiline input draws one command per line" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const config: text_input.Config = .{ .multiline = true };
+    _ = try oneField(&ui, config);
+    ui.setTextValue("name", "one\ntwo\nthree");
+    const drawn = try oneField(&ui, config);
+
+    var seen: [8][]const u8 = undefined;
+    const lines = drawnText(drawn, &seen);
+    try testing.expectEqual(@as(usize, 3), lines.len);
+    try testing.expectEqualStrings("two", lines[1]);
+}
+
+test "a multiline input wraps to its width, and a single-line one never does" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Two hundred pixels holds twenty-five characters at eight pixels each.
+    const words = "alpha beta gamma delta epsilon zeta";
+
+    const multi: text_input.Config = .{ .multiline = true };
+    _ = try oneField(&ui, multi);
+    ui.setTextValue("name", words);
+    const wrapped = try oneField(&ui, multi);
+
+    var seen: [8][]const u8 = undefined;
+    const lines = drawnText(wrapped, &seen);
+    try testing.expect(lines.len > 1);
+    // Broken between words, not through one.
+    for (lines) |line| try testing.expect(line[line.len - 1] != ' ');
+
+    // The same text in a single-line field is one line however long it is: it
+    // scrolls sideways instead, which is the whole difference between them.
+    const single = try oneField(&ui, .{});
+    try testing.expectEqual(@as(usize, 1), drawnText(single, &seen).len);
+}
+
+test "a text input can have a scrollbar, and it is dragged like any other" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Sixty tall, which holds under four of the six lines - and comfortably
+    // more than the twenty pixel floor under the thumb, or the thumb would
+    // fill the track and have nowhere to be dragged to.
+    const tall = struct {
+        fn run(u: *Ui) ![]const commands.RenderCommand {
+            u.begin(.init(400, 200));
+            openRoot(u);
+            u.textInput(
+                .{ .id = "notes", .width = .fixed(200), .height = .fixed(60) },
+                .{ .multiline = true, .scrollbar = .{} },
+            );
+            u.close();
+            return try u.end();
+        }
+    }.run;
+
+    _ = try tall(&ui);
+    ui.setTextValue("notes", "one\ntwo\nthree\nfour\nfive\nsix");
+    _ = try tall(&ui);
+
+    // Ninety-six pixels of lines in a sixty pixel box: there is something to
+    // scroll, so there is a bar, and it belongs to the field rather than to a
+    // scroll container that does not exist.
+    const bar = ui.barOf(identify("notes", 0), true).?;
+    try testing.expect(bar.field);
+    try testing.expectEqual(@as(f32, 36), bar.max_scroll);
+    try testing.expect(bar.thumb_travel > 0);
+
+    ui.setPointer(bar.thumb.x + 3, bar.thumb.y + 4, true);
+    try testing.expect(ui.draggingScrollbar());
+    _ = try tall(&ui);
+
+    // Five pixels of thumb are worth `max_scroll / thumb_travel` of text, and
+    // the text is what moves.
+    ui.setPointer(bar.thumb.x + 3, bar.thumb.y + 9, true);
+    const moved = ui.editOf("notes").?.scroll.y;
+    try testing.expectApproxEqAbs(5 * (bar.max_scroll / bar.thumb_travel), moved, 0.01);
+}
+
+test "what was typed survives being redeclared, and goes when the field does" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.setFocus("name");
+    _ = try oneField(&ui, .{});
+    ui.typeText("remember me");
+    _ = try oneField(&ui, .{});
+    _ = try oneField(&ui, .{});
+    try testing.expectEqualStrings("remember me", ui.textValueOf("name").?);
+
+    // A frame without it, and it is somebody else's memory - the same rule a
+    // scroll position follows.
+    ui.begin(.init(400, 200));
+    openRoot(&ui);
+    ui.close();
+    _ = try ui.end();
+    try testing.expect(ui.textValueOf("name") == null);
+}
+
+test "an input that fits its content is one line tall" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 200));
+    openRoot(&ui);
+    ui.textInput(.{ .id = "name", .width = .fixed(200), .padding = .all(4) }, .{});
+    ui.close();
+    _ = try ui.end();
+
+    // Sixteen for the line and four of padding each side. Ply never fit-sizes
+    // one at all, which leaves an invisible box the reader can type into.
+    try testing.expectEqual(@as(f32, 24), ui.boxOf("name").?.height);
+}
+
+test "the text is cut off at the edge of its box" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try oneField(&ui, .{});
+    ui.setTextValue("name", "x" ** 80);
+    const drawn = try oneField(&ui, .{});
+
+    // A name longer than the field would otherwise be drawn straight across
+    // whatever is beside it.
+    const emitted: commands.List = .{ .items = drawn };
+    try testing.expect(emitted.scissorsBalanced());
+    try testing.expectEqual(@as(usize, 1), emitted.count(.scissor_start));
+}
+
+test "shift-clicking extends the selection from where the cursor was" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try oneField(&ui, .{});
+    ui.setTextValue("name", "hello world");
+    ui.editOf("name").?.cursor = 0;
+    _ = try oneField(&ui, .{});
+
+    ui.setShift(true);
+    ui.setPointer(40, 10, true);
+    _ = try oneField(&ui, .{});
+    ui.setShift(false);
+
+    try testing.expectEqualStrings("hello", ui.editOf("name").?.selected());
 }
