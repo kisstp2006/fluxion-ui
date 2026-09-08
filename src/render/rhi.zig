@@ -57,10 +57,22 @@ pub const Instance = extern struct {
     uv: [4]f32,
     /// How thick the border is, in pixels. Zero fills the whole box.
     border: f32,
-    /// One for a glyph, zero for a shape. A flag rather than two pipelines,
-    /// because two pipelines would be two draw calls and a state change
-    /// between every label and the box behind it.
+    /// What the fragment shader is looking at: `Kind`, as a float because
+    /// that is what a vertex attribute is. A number rather than three
+    /// pipelines, because three pipelines would be three draw calls and a
+    /// state change between every label and the box behind it.
     textured: f32,
+
+    /// The three things one quad can be.
+    pub const Kind = struct {
+        /// A rectangle or a border: the rounded-box distance field, filled.
+        pub const shape: f32 = 0;
+        /// A glyph: one channel of coverage out of the atlas, in `color`.
+        pub const glyph: f32 = 1;
+        /// A picture: all four channels of a texture, tinted by `color` and
+        /// cut to the same rounded box a rectangle would be.
+        pub const image: f32 = 2;
+    };
 };
 
 /// What a frame tells the shader. Sixteen bytes, `std140`.
@@ -68,11 +80,19 @@ const Frame = extern struct {
     viewport: [4]f32,
 };
 
-/// A run of instances drawn under one scissor rectangle.
+/// A run of instances drawn under one scissor rectangle, with one texture.
 const Batch = struct {
     first: u32,
     count: u32,
     scissor: ?rhi.types.Rect,
+    /// What to bind at slot zero, or null for the glyph atlas.
+    ///
+    /// The second thing that breaks a batch, after the scissor. A shape needs
+    /// no texture and joins whichever batch it lands in; text needs the
+    /// atlas; a picture needs its own. Interfaces that draw their icons from
+    /// one sheet stay one draw call, which is the whole reason the source
+    /// rectangle exists.
+    texture: ?rhi.types.Texture = null,
 };
 
 const quad_vertices = [8]f32{ 0, 0, 1, 0, 0, 1, 1, 1 };
@@ -84,6 +104,9 @@ pub const Renderer = struct {
 
     atlas: Atlas,
     atlas_texture: rhi.types.Texture,
+    /// What an image command's number means. Borrowed, and must outlive the
+    /// frame it is drawn in. See `setTextures`.
+    textures: []const rhi.types.Texture = &.{},
     sampler: rhi.types.Sampler,
 
     shader: rhi.types.Shader,
@@ -198,6 +221,17 @@ pub const Renderer = struct {
         };
     }
 
+    /// Say what an image command's texture number means.
+    ///
+    /// A command carries a number because the layout half has never heard of
+    /// a GPU; this is where the number becomes a texture. The slice is
+    /// borrowed and has to outlive the frames drawn from it. A number with no
+    /// texture behind it draws the background and nothing else, which is a
+    /// missing picture rather than a crash.
+    pub fn setTextures(self: *Renderer, textures: []const rhi.types.Texture) void {
+        self.textures = textures;
+    }
+
     pub fn deinit(self: *Renderer) void {
         self.device.destroyBuffer(self.frame_buffer);
         self.device.destroyBuffer(self.instance_buffer);
@@ -264,6 +298,7 @@ pub const Renderer = struct {
         for (self.batches.items) |batch| {
             if (batch.count == 0) continue;
             try list.setScissor(batch.scissor);
+            try list.setTexture(0, batch.texture orelse self.atlas_texture, self.sampler);
             // A draw has no first-instance field, so a batch starts where its
             // buffer binding says it does. The offset is in bytes, and this
             // is the whole of what makes several scissor regions one buffer.
@@ -288,18 +323,21 @@ pub const Renderer = struct {
 
         var batch_start: u32 = 0;
         var scissor: ?rhi.types.Rect = null;
+        // What this batch has already committed to, or null while it is still
+        // only shapes and could go either way.
+        var bound: ?rhi.types.Texture = null;
 
         for (commands) |command| {
             switch (command.config) {
                 .scissor_start => {
-                    try self.closeBatch(&batch_start, scissor);
+                    try self.closeBatch(&batch_start, scissor, bound);
                     const box = command.bounding_box;
                     const wanted = intersect(scissor, box, size);
                     try self.clips.append(self.gpa, wanted);
                     scissor = wanted;
                 },
                 .scissor_end => {
-                    try self.closeBatch(&batch_start, scissor);
+                    try self.closeBatch(&batch_start, scissor, bound);
                     _ = self.clips.pop();
                     scissor = if (self.clips.items.len > 0)
                         self.clips.items[self.clips.items.len - 1]
@@ -312,7 +350,7 @@ pub const Renderer = struct {
                     .radii = fill.corner_radius.array(),
                     .uv = @splat(0),
                     .border = 0,
-                    .textured = 0,
+                    .textured = Instance.Kind.shape,
                 }),
                 .border => |line| try self.instances.append(self.gpa, .{
                     .rect = boxArray(command.bounding_box),
@@ -325,14 +363,57 @@ pub const Renderer = struct {
                         @max(line.width.left, line.width.right),
                         @max(line.width.top, line.width.bottom),
                     )),
-                    .textured = 0,
+                    .textured = Instance.Kind.shape,
                 }),
-                .text => |run| try self.addText(command, run),
-                .none, .image => {},
+                .text => |run| {
+                    if (bound != null and !std.meta.eql(bound.?, self.atlas_texture)) {
+                        try self.closeBatch(&batch_start, scissor, bound);
+                    }
+                    bound = self.atlas_texture;
+                    try self.addText(command, run);
+                },
+                .image => |picture| {
+                    // The fill goes down first, in its own instance, because
+                    // one quad cannot be both a colour and a picture - and
+                    // this way it is the same rectangle path as everything
+                    // else rather than a second one in the shader.
+                    if (!picture.background_color.invisible()) {
+                        try self.instances.append(self.gpa, .{
+                            .rect = boxArray(command.bounding_box),
+                            .color = picture.background_color.array(),
+                            .radii = picture.corner_radius.array(),
+                            .uv = @splat(0),
+                            .border = 0,
+                            .textured = Instance.Kind.shape,
+                        });
+                    }
+
+                    if (picture.texture >= self.textures.len) continue;
+                    const wanted = self.textures[picture.texture];
+                    if (bound != null and !std.meta.eql(bound.?, wanted)) {
+                        try self.closeBatch(&batch_start, scissor, bound);
+                    }
+                    bound = wanted;
+
+                    try self.instances.append(self.gpa, .{
+                        .rect = boxArray(command.bounding_box),
+                        .color = picture.tint.array(),
+                        .radii = picture.corner_radius.array(),
+                        .uv = .{
+                            picture.source.x,
+                            picture.source.y,
+                            picture.source.right(),
+                            picture.source.bottom(),
+                        },
+                        .border = 0,
+                        .textured = Instance.Kind.image,
+                    });
+                },
+                .none => {},
             }
         }
 
-        try self.closeBatch(&batch_start, scissor);
+        try self.closeBatch(&batch_start, scissor, bound);
     }
 
     /// One instance per glyph of a line.
@@ -366,20 +447,26 @@ pub const Renderer = struct {
                     .radii = @splat(0),
                     .uv = .{ entry.u0, entry.v0, entry.u1, entry.v1 },
                     .border = 0,
-                    .textured = 1,
+                    .textured = Instance.Kind.glyph,
                 });
             }
             pen += entry.advance;
         }
     }
 
-    fn closeBatch(self: *Renderer, first: *u32, scissor: ?rhi.types.Rect) Allocator.Error!void {
+    fn closeBatch(
+        self: *Renderer,
+        first: *u32,
+        scissor: ?rhi.types.Rect,
+        texture: ?rhi.types.Texture,
+    ) Allocator.Error!void {
         const now: u32 = @intCast(self.instances.items.len);
         if (now > first.*) {
             try self.batches.append(self.gpa, .{
                 .first = first.*,
                 .count = now - first.*,
                 .scissor = scissor,
+                .texture = texture,
             });
         }
         first.* = now;
@@ -499,13 +586,23 @@ const glsl_fragment =
     \\}
     \\
     \\void main() {
-    \\    if (v_textured > 0.5) {
+    \\    // A glyph is one channel of coverage and has no box of its own, so
+    \\    // it leaves before the distance field is computed.
+    \\    if (v_textured > 0.5 && v_textured < 1.5) {
     \\        o_color = vec4(v_color.rgb, v_color.a * texture(u_atlas, v_uv).r);
     \\        return;
     \\    }
     \\
     \\    float outer = roundedBox(v_local, v_half, v_radii);
     \\    float alpha = clamp(0.5 - outer, 0.0, 1.0);
+    \\
+    \\    // A picture is all four channels, tinted, and cut to the same
+    \\    // rounded box a rectangle would be - so a rounded avatar is round.
+    \\    if (v_textured > 1.5) {
+    \\        vec4 texel = texture(u_atlas, v_uv);
+    \\        o_color = vec4(texel.rgb * v_color.rgb, texel.a * v_color.a * alpha);
+    \\        return;
+    \\    }
     \\
     \\    if (v_border > 0.0) {
     \\        vec4 inner_radii = max(v_radii - v_border, vec4(0.0));
@@ -576,13 +673,18 @@ const hlsl_fragment =
     \\}
     \\
     \\float4 main(Input input) : SV_TARGET {
-    \\    if (input.params.y > 0.5) {
+    \\    if (input.params.y > 0.5 && input.params.y < 1.5) {
     \\        float coverage = u_atlas.Sample(u_atlas_sampler, input.uv).r;
     \\        return float4(input.color.rgb, input.color.a * coverage);
     \\    }
     \\
     \\    float outer = roundedBox(input.local, input.half_, input.radii);
     \\    float alpha = saturate(0.5 - outer);
+    \\
+    \\    if (input.params.y > 1.5) {
+    \\        float4 texel = u_atlas.Sample(u_atlas_sampler, input.uv);
+    \\        return float4(texel.rgb * input.color.rgb, texel.a * input.color.a * alpha);
+    \\    }
     \\
     \\    if (input.params.x > 0.0) {
     \\        float4 inner_radii = max(input.radii - input.params.x, 0.0);
@@ -1008,4 +1110,188 @@ test "the Direct3D shaders compile and the frame reaches the pixels" {
     // And the edge is where the padding put it.
     try testing.expect(channel(pixels, 30, 64, 0) > 200);
     try testing.expect(channel(pixels, 10, 64, 0) < 50);
+}
+
+test "the Direct3D shader draws a picture too" {
+    // The image branch of the HLSL, which was written beside the GLSL and
+    // would otherwise never have run. A `float4` sampled where a `float`
+    // was expected, a swizzle in the wrong order, a texture bound to the
+    // wrong slot: all of them draw nothing and none of them is an error.
+    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .backend = .d3d11 }) catch
+        return error.SkipZigTest;
+    defer device.deinit();
+    try testing.expectEqual(rhi.Backend.d3d11, device.backendTag());
+
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    const target = try device.createTexture(.{
+        .width = 64,
+        .height = 64,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    // Orange on the left, blue on the right, and only the left is asked for.
+    const sheet = try device.createTexture(.{
+        .width = 2,
+        .height = 1,
+        .format = .rgba8_unorm,
+        .usage = .{ .sampled = true },
+    });
+    defer device.destroyTexture(sheet);
+    try device.updateTexture(sheet, &[_]u8{
+        0xFF, 0x80, 0x00, 0xFF,
+        0x00, 0x00, 0xFF, 0xFF,
+    }, 2 * 4);
+
+    var face: font.Font = try .init(bytes);
+    var renderer: Renderer = try .init(testing.allocator, &device, &face);
+    defer renderer.deinit();
+    renderer.setTextures(&.{sheet});
+
+    const size: ui.Dimensions = .init(64, 64);
+
+    var layout: ui.Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(.monospace(0.5, 1.0));
+
+    layout.begin(size);
+    layout.empty(.{
+        .width = .grow,
+        .height = .grow,
+        .image = .{ .texture = 0, .source = .init(0, 0, 0.5, 1) },
+    });
+    const commands = try layout.end();
+
+    try renderer.draw(.{ .texture = target }, size, commands, .black);
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+
+    const middle = (32 * 64 + 32) * 4;
+    try testing.expect(pixels[middle] > 200);
+    try testing.expectApproxEqAbs(128, @as(f32, @floatFromInt(pixels[middle + 1])), 12);
+    try testing.expect(pixels[middle + 2] < 50);
+}
+
+test "a picture is one instance, tinted, with the source rectangle as its uv" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const texture = try fixture.device.createTexture(.{
+        .width = 4,
+        .height = 4,
+        .usage = .{ .sampled = true },
+    });
+    defer fixture.device.destroyTexture(texture);
+    fixture.renderer.setTextures(&.{texture});
+
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(10, 20, 30, 40), .config = .{ .image = .{
+            .texture = 0,
+            .source = .init(0.25, 0.5, 0.25, 0.5),
+            .tint = .hex(0xFF8000),
+        } } },
+    }, .init(200, 200));
+
+    const instances = fixture.renderer.instances.items;
+    try testing.expectEqual(@as(usize, 1), instances.len);
+    try testing.expectEqual(Instance.Kind.image, instances[0].textured);
+    // The uv is the source rectangle as two corners, not as a position and a
+    // size - which is what the vertex shader interpolates between.
+    try testing.expectEqual([4]f32{ 0.25, 0.5, 0.5, 1.0 }, instances[0].uv);
+    try testing.expectEqual(ui.Color.hex(0xFF8000).array(), instances[0].color);
+
+    // And the batch asks for that texture rather than the atlas.
+    try testing.expectEqual(@as(usize, 1), fixture.renderer.batches.items.len);
+    try testing.expect(fixture.renderer.batches.items[0].texture != null);
+}
+
+test "the background of an image is a rectangle under it" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const texture = try fixture.device.createTexture(.{
+        .width = 4,
+        .height = 4,
+        .usage = .{ .sampled = true },
+    });
+    defer fixture.device.destroyTexture(texture);
+    fixture.renderer.setTextures(&.{texture});
+
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 10, 10), .config = .{ .image = .{
+            .texture = 0,
+            .background_color = .hex(0x112233),
+        } } },
+    }, .init(200, 200));
+
+    const instances = fixture.renderer.instances.items;
+    try testing.expectEqual(@as(usize, 2), instances.len);
+    try testing.expectEqual(Instance.Kind.shape, instances[0].textured);
+    try testing.expectEqual(Instance.Kind.image, instances[1].textured);
+}
+
+test "a texture nobody registered draws the background and nothing else" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    // No table at all, and a command naming slot seven.
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 10, 10), .config = .{ .image = .{
+            .texture = 7,
+            .background_color = .hex(0x112233),
+        } } },
+    }, .init(200, 200));
+
+    // A missing picture rather than a crash.
+    try testing.expectEqual(@as(usize, 1), fixture.renderer.instances.items.len);
+    try testing.expectEqual(Instance.Kind.shape, fixture.renderer.instances.items[0].textured);
+}
+
+test "two pictures from one sheet stay one draw, and two sheets do not" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const one = try fixture.device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .sampled = true } });
+    defer fixture.device.destroyTexture(one);
+    const two = try fixture.device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .sampled = true } });
+    defer fixture.device.destroyTexture(two);
+    fixture.renderer.setTextures(&.{ one, two });
+
+    // Two slices of the same sheet: one batch, which is the whole reason the
+    // source rectangle is there.
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 16, 16), .config = .{ .image = .{ .texture = 0, .source = .init(0, 0, 0.5, 1) } } },
+        .{ .bounding_box = .init(16, 0, 16, 16), .config = .{ .image = .{ .texture = 0, .source = .init(0.5, 0, 0.5, 1) } } },
+    }, .init(200, 200));
+    try testing.expectEqual(@as(usize, 1), fixture.renderer.batches.items.len);
+
+    // Two different sheets: two batches, because one texture is bound at a
+    // time and there is nowhere else to put the second.
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 16, 16), .config = .{ .image = .{ .texture = 0 } } },
+        .{ .bounding_box = .init(16, 0, 16, 16), .config = .{ .image = .{ .texture = 1 } } },
+    }, .init(200, 200));
+    try testing.expectEqual(@as(usize, 2), fixture.renderer.batches.items.len);
+}
+
+test "a picture between two labels breaks the batch and the labels rejoin" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const sheet = try fixture.device.createTexture(.{ .width = 4, .height = 4, .usage = .{ .sampled = true } });
+    defer fixture.device.destroyTexture(sheet);
+    fixture.renderer.setTextures(&.{sheet});
+
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 40, 20), .config = .{ .text = .{ .text = "one", .color = .white, .font_size = 16 } } },
+        .{ .bounding_box = .init(0, 20, 16, 16), .config = .{ .image = .{ .texture = 0 } } },
+        .{ .bounding_box = .init(0, 40, 40, 20), .config = .{ .text = .{ .text = "two", .color = .white, .font_size = 16 } } },
+    }, .init(200, 200));
+
+    // Atlas, sheet, atlas: three bindings and so three draws. A shape would
+    // have joined whichever of them it landed in.
+    try testing.expectEqual(@as(usize, 3), fixture.renderer.batches.items.len);
 }

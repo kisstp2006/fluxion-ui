@@ -283,9 +283,26 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
             // Two text inputs. The first is one line and scrolls sideways
             // when what is typed runs past it; the second wraps and scrolls
             // up and down, and has a bar to show how far.
-            u.open(.{ .width = .grow, .height = .fit, .gap = 10 });
+            u.open(.{ .width = .grow, .height = .fit, .gap = 10, .align_y = .center });
             {
                 defer u.close();
+
+                // Two pictures out of one sheet, named by the half of it they
+                // want. A radius of half the side makes the first a circle -
+                // an image is cut to the same rounded box a rectangle is.
+                u.empty(.{
+                    .width = .fixed(34),
+                    .height = .fixed(34),
+                    .corner_radius = .all(17),
+                    .image = .{ .texture = 0, .source = .init(0, 0, 0.5, 1) },
+                });
+                u.empty(.{
+                    .width = .fixed(34),
+                    .height = .fixed(34),
+                    .corner_radius = .all(8),
+                    .image = .{ .texture = 0, .source = .init(0.5, 0, 0.5, 1) },
+                });
+
                 for ([_][2][]const u8{
                     .{ "name", "Your name" },
                     .{ "email", "you@example.com" },
@@ -367,6 +384,40 @@ fn editing(k: platform.event.KeyEvent) ?ui.text_input.Action {
         .y => if (ctrl) .redo else null,
         else => null,
     };
+}
+
+/// A sheet of two pictures, drawn here rather than loaded from a file.
+///
+/// Two cells side by side in one texture, which is how an interface with a
+/// hundred icons should keep them: everything drawn from one sheet is one
+/// draw call, because what breaks the batch is changing the texture and not
+/// changing the picture.
+const sheet_size = 64;
+
+fn drawSheet(pixels: []u8) void {
+    for (0..sheet_size) |y| {
+        for (0..sheet_size * 2) |x| {
+            const cell = x / sheet_size;
+            const u = @as(f32, @floatFromInt(x % sheet_size)) / sheet_size;
+            const v = @as(f32, @floatFromInt(y)) / sheet_size;
+            const at = (y * sheet_size * 2 + x) * 4;
+
+            if (cell == 0) {
+                // A warm corner-to-corner wash.
+                pixels[at + 0] = @intFromFloat(255 * (0.35 + 0.6 * (1 - v)));
+                pixels[at + 1] = @intFromFloat(255 * (0.25 + 0.45 * u));
+                pixels[at + 2] = @intFromFloat(255 * (0.35 + 0.3 * v));
+            } else {
+                // A cool checker, so the second cell cannot be mistaken for
+                // the first at a glance.
+                const dark = ((x / 8) + (y / 8)) % 2 == 0;
+                pixels[at + 0] = if (dark) 0x20 else 0x3A;
+                pixels[at + 1] = if (dark) 0x60 else 0x8A;
+                pixels[at + 2] = if (dark) 0xA0 else 0xD0;
+            }
+            pixels[at + 3] = 0xFF;
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -645,6 +696,23 @@ pub fn main(init: std.process.Init) !void {
 
     var renderer: render.Renderer = try .init(gpa, &device, &measured.face);
     defer renderer.deinit();
+
+    // One sheet, uploaded once, and the layout only ever names slot zero.
+    const sheet = try device.createTexture(.{
+        .width = sheet_size * 2,
+        .height = sheet_size,
+        .format = .rgba8_unorm,
+        .usage = .{ .sampled = true },
+        .label = "example sheet",
+    });
+    defer device.destroyTexture(sheet);
+    {
+        const pixels = try gpa.alloc(u8, sheet_size * 2 * sheet_size * 4);
+        defer gpa.free(pixels);
+        drawSheet(pixels);
+        try device.updateTexture(sheet, pixels, sheet_size * 2 * 4);
+    }
+    renderer.setTextures(&.{sheet});
 
     var layout: Ui = .init(gpa);
     defer layout.deinit();
@@ -959,4 +1027,146 @@ test "the scrollbar reaches the pixels, and moves when the list does" {
         try testing.expect(channel(pixels, 124, 112, 0) > 200);
         try testing.expect(channel(pixels, 124, 16, 0) < 50);
     }
+}
+
+test "a picture reaches the pixels, and only the part that was asked for" {
+    // The one thing no other test can reach: the image branch of the shader,
+    // and the texture binding that breaks the batch to get there. A glyph is
+    // one channel out of the atlas; a picture is four out of a texture
+    // nobody in the layout has ever heard of.
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    var window = Window.open(64, 64, false, true) catch |err|
+        if (Window.isAbsent(err)) return error.SkipZigTest else return err;
+    defer window.close();
+
+    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .gl = window.hooks() }) catch
+        return error.SkipZigTest;
+    defer device.deinit();
+
+    const target = try device.createTexture(.{
+        .width = 128,
+        .height = 128,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    // A two by one sheet: orange on the left, blue on the right. Two colours
+    // rather than one, so a source rectangle that was ignored would show.
+    const sheet = try device.createTexture(.{
+        .width = 2,
+        .height = 1,
+        .format = .rgba8_unorm,
+        .usage = .{ .sampled = true },
+    });
+    defer device.destroyTexture(sheet);
+    try device.updateTexture(sheet, &[_]u8{
+        0xFF, 0x80, 0x00, 0xFF,
+        0x00, 0x00, 0xFF, 0xFF,
+    }, 2 * 4);
+
+    var measured: Measured = .{ .face = try .init(bytes) };
+    var renderer: render.Renderer = try .init(testing.allocator, &device, &measured.face);
+    defer renderer.deinit();
+    renderer.setTextures(&.{sheet});
+
+    const size: ui.Dimensions = .init(128, 128);
+
+    var layout: Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(measured.measurer());
+
+    layout.begin(size);
+    {
+        layout.open(.{ .width = .grow, .height = .grow, .padding = .all(16) });
+        defer layout.close();
+        // The left half of the sheet, so the whole box should be orange.
+        layout.empty(.{
+            .width = .grow,
+            .height = .grow,
+            .image = .{ .texture = 0, .source = .init(0, 0, 0.5, 1) },
+        });
+    }
+    const commands = try layout.end();
+
+    try renderer.draw(.{ .texture = target }, size, commands, .black);
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+
+    const channel = struct {
+        fn at(data: []const u8, x: usize, y: usize, index: usize) u8 {
+            return data[(y * 128 + x) * 4 + index];
+        }
+    }.at;
+
+    // Orange everywhere inside the padding - not blue, which is what a
+    // source rectangle nobody read would give, and not white, which is what
+    // sampling one channel of an RGBA texture would give.
+    try testing.expect(channel(pixels, 64, 64, 0) > 200);
+    try testing.expectApproxEqAbs(128, @as(f32, @floatFromInt(channel(pixels, 64, 64, 1))), 12);
+    try testing.expect(channel(pixels, 64, 64, 2) < 50);
+    try testing.expect(channel(pixels, 20, 20, 0) > 200);
+
+    // And the clear colour outside it, so the picture is in its box.
+    try testing.expect(channel(pixels, 4, 4, 0) < 50);
+}
+
+test "a tint multiplies into the picture" {
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    var window = Window.open(64, 64, false, true) catch return error.SkipZigTest;
+    defer window.close();
+
+    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .gl = window.hooks() }) catch
+        return error.SkipZigTest;
+    defer device.deinit();
+
+    const target = try device.createTexture(.{
+        .width = 64,
+        .height = 64,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    // A white pixel, so whatever comes out is the tint and nothing else.
+    const white = try device.createTexture(.{
+        .width = 1,
+        .height = 1,
+        .format = .rgba8_unorm,
+        .usage = .{ .sampled = true },
+    });
+    defer device.destroyTexture(white);
+    try device.updateTexture(white, &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF }, 4);
+
+    var measured: Measured = .{ .face = try .init(bytes) };
+    var renderer: render.Renderer = try .init(testing.allocator, &device, &measured.face);
+    defer renderer.deinit();
+    renderer.setTextures(&.{white});
+
+    const size: ui.Dimensions = .init(64, 64);
+
+    var layout: Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(measured.measurer());
+
+    layout.begin(size);
+    layout.empty(.{
+        .width = .grow,
+        .height = .grow,
+        .image = .{ .texture = 0, .tint = .hex(0xFF8000) },
+    });
+    const commands = try layout.end();
+
+    try renderer.draw(.{ .texture = target }, size, commands, .black);
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+
+    const middle = (32 * 64 + 32) * 4;
+    try testing.expect(pixels[middle] > 200);
+    try testing.expectApproxEqAbs(128, @as(f32, @floatFromInt(pixels[middle + 1])), 12);
+    try testing.expect(pixels[middle + 2] < 50);
 }

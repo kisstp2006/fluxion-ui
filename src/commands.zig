@@ -92,6 +92,11 @@ pub const Image = struct {
     corner_radius: CornerRadius = .sharp,
     /// Which texture, as an index into whatever table the caller registered.
     texture: u32,
+    /// Which part of it to draw, in fractions of the whole from zero to one.
+    /// The whole of it by default. See `layout.Image.source`.
+    source: BoundingBox = .init(0, 0, 1, 1),
+    /// Multiplied into the image. White leaves it alone.
+    tint: Color = .white,
 };
 
 /// What a command actually asks for.

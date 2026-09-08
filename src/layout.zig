@@ -277,6 +277,10 @@ pub const Declaration = struct {
     /// Take it out of the flow and hang it off something. See `Floating`.
     floating: ?Floating = null,
 
+    /// A picture drawn in this element's box, instead of a plain fill. See
+    /// `Image`.
+    image: ?Image = null,
+
     /// Whether the pointer stops here rather than reaching what is behind.
     /// Ply's `.capture()`, and what a button inside a draggable panel wants:
     /// dragging the button must not also drag the panel.
@@ -355,6 +359,37 @@ pub const BorderWidth = extern struct {
 /// Where the line sits relative to the box. Ply's three, under Ply's names -
 /// which is why the middle one is `middle` rather than `center`.
 pub const BorderPosition = enum { outside, middle, inside };
+
+/// A picture drawn in an element's box. Ply's `.image(...)`.
+///
+/// **A number, not a texture.** The layout half of this library has never
+/// heard of a GPU and does not want to: what the number means is a table the
+/// program gave its renderer, and `render.Renderer.setTextures` is where the
+/// two meet. A program with one atlas of icons registers it once and then
+/// names slices of it.
+///
+/// **It does not size the element.** Nothing here knows how many pixels the
+/// texture is, so an image element is as big as it was declared - which is
+/// Ply's behaviour too. `contain` and `cover` are how a picture is held to
+/// its own proportions inside the room it was given.
+pub const Image = struct {
+    /// Which texture, as an index into whatever table the renderer was given.
+    texture: u32 = 0,
+    /// Painted under it, and visible wherever the image is transparent or
+    /// does not cover the box.
+    background_color: Color = .transparent,
+    /// Which part of the texture to draw, in fractions of the whole from
+    /// zero to one - so `.init(0, 0, 0.25, 0.25)` is the top left quarter.
+    ///
+    /// **Not in Ply**, and the reason to have it is that every real interface
+    /// has one sheet of icons rather than a texture per icon. Without it a
+    /// program cannot name a piece of one.
+    source: geometry.BoundingBox = .init(0, 0, 1, 1),
+    /// Multiplied into the image. White leaves it alone, and anything else
+    /// tints it - which is how one white icon becomes every colour of icon.
+    /// Also not in Ply.
+    tint: Color = .white,
+};
 
 /// An element positioned against another one rather than laid out in the
 /// flow. Ply's `FloatingConfig`.

@@ -145,6 +145,8 @@ const Element = struct {
 
     /// Set when this element is out of the flow. See `layout.Floating`.
     floating: ?layout.Floating = null,
+    /// A picture drawn in its box instead of a plain fill. See `layout.Image`.
+    image: ?layout.Image = null,
     /// What a floating element is allowed to be pointed at through, worked
     /// out when it is placed: the thing it is clipped to, or the whole
     /// surface. Null for everything else, which inherits from its parent.
@@ -721,6 +723,7 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
         .capture = declaration.capture,
         .preserve_focus = declaration.preserve_focus,
         .floating = declaration.floating,
+        .image = declaration.image,
     });
 
     // The new element is a child of whatever is open, unless it is the root -
@@ -2010,7 +2013,31 @@ fn emitScissor(self: *Ui, kind: commands.Config, box: BoundingBox) Error!void {
 
 fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
     const element = self.elements.items[index];
-    if (element.background_color.invisible() or box.empty()) return;
+    if (box.empty()) return;
+
+    // An image takes the place of the fill rather than sitting on top of it:
+    // the command carries the fill, so a renderer paints one rectangle and
+    // one picture rather than being handed two of everything.
+    if (element.image) |picture| {
+        try self.output.append(self.gpa, .{
+            .bounding_box = box,
+            .id = element.id,
+            .z_index = element.z_index,
+            .config = .{ .image = .{
+                .background_color = if (picture.background_color.invisible())
+                    element.background_color
+                else
+                    picture.background_color,
+                .corner_radius = element.corner_radius.clampTo(box.width, box.height),
+                .texture = picture.texture,
+                .source = picture.source,
+                .tint = picture.tint,
+            } },
+        });
+        return;
+    }
+
+    if (element.background_color.invisible()) return;
 
     try self.output.append(self.gpa, .{
         .bounding_box = box,
@@ -6964,4 +6991,135 @@ test "a wrapping row inside a column reaches its ancestors with the right height
     try testing.expectEqual(@as(f32, 60), ui.boxOf("tags").?.height);
     try testing.expectEqual(@as(f32, 60), ui.boxOf("below").?.y);
     try testing.expectEqual(@as(f32, 70), ui.boxOf("column").?.height);
+}
+
+// -------------------------------------------------------------------------
+// Images
+// -------------------------------------------------------------------------
+
+// A picture is a number and a box. Nothing here knows how many pixels the
+// texture is - the renderer does, and it is the one that has the table.
+
+fn onlyImage(drawn: []const commands.RenderCommand) ?commands.Image {
+    for (drawn) |command| {
+        if (command.config == .image) return command.config.image;
+    }
+    return null;
+}
+
+test "an image takes the place of the fill rather than sitting on it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    ui.empty(.{
+        .id = "picture",
+        .width = .fixed(64),
+        .height = .fixed(64),
+        .corner_radius = .all(8),
+        .background_color = paint,
+        .image = .{ .texture = 3 },
+    });
+    ui.close();
+    const drawn = try ui.end();
+
+    // One command, not a rectangle and a picture: the fill rides on the
+    // image command, so a renderer is not handed two of everything.
+    const emitted: commands.List = .{ .items = drawn };
+    try testing.expectEqual(@as(usize, 1), emitted.count(.image));
+    try testing.expectEqual(@as(usize, 0), emitted.count(.rectangle));
+
+    const picture = onlyImage(drawn).?;
+    try testing.expectEqual(@as(u32, 3), picture.texture);
+    try testing.expectEqual(paint, picture.background_color);
+    try testing.expectEqual(@as(f32, 8), picture.corner_radius.top_left);
+}
+
+test "the image's own background wins over the element's" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    ui.empty(.{
+        .id = "picture",
+        .width = .fixed(10),
+        .height = .fixed(10),
+        .background_color = paint,
+        .image = .{ .texture = 0, .background_color = .hex(0x112233) },
+    });
+    ui.close();
+    const drawn = try ui.end();
+
+    try testing.expectEqual(Color.hex(0x112233), onlyImage(drawn).?.background_color);
+}
+
+test "an image is sized by its declaration, and held to a ratio by contain" {
+    // Nothing in the layout knows how big the texture is, so a picture is as
+    // big as it was asked to be. `contain` is how it keeps its proportions.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    {
+        ui.open(.{ .width = .grow, .height = .grow, .align_y = .center });
+        defer ui.close();
+        ui.empty(.{
+            .id = "picture",
+            .width = .fixed(200),
+            .height = .fixed(200),
+            .contain = 2,
+            .image = .{ .texture = 0 },
+        });
+    }
+    _ = try ui.end();
+
+    // Twice as wide as it is tall, out of a two hundred square box. Where the
+    // letterbox sits is the parent's alignment, as it is for anything else -
+    // `contain` decides the size and nothing else.
+    try testing.expectEqual(@as(f32, 200), ui.boxOf("picture").?.width);
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("picture").?.height);
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("picture").?.y);
+}
+
+test "a source rectangle names a piece of a sheet" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    ui.empty(.{
+        .id = "icon",
+        .width = .fixed(16),
+        .height = .fixed(16),
+        .image = .{ .texture = 1, .source = .init(0.25, 0, 0.25, 0.5), .tint = .hex(0xFF8000) },
+    });
+    ui.close();
+    const drawn = try ui.end();
+
+    const picture = onlyImage(drawn).?;
+    try testing.expectEqual(@as(f32, 0.25), picture.source.x);
+    try testing.expectEqual(@as(f32, 0.5), picture.source.right());
+    try testing.expectEqual(Color.hex(0xFF8000), picture.tint);
+}
+
+test "an image inside a clip is clipped like anything else" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "window", .width = .fixed(50), .height = .fixed(50), .clip = .both });
+        defer ui.close();
+        ui.empty(.{ .id = "picture", .width = .fixed(200), .height = .fixed(200), .image = .{} });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    const emitted: commands.List = .{ .items = drawn };
+    try testing.expect(emitted.scissorsBalanced());
+    try testing.expectEqual(@as(usize, 1), emitted.count(.image));
+    try testing.expectEqual(@as(usize, 1), emitted.count(.scissor_start));
 }

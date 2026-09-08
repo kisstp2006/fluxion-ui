@@ -125,6 +125,7 @@ the differences are the ones Zig forces, and there are three of them.
 | `bounding_box(id)` | `ui.boxOf("save")` |
 | `.floating(\|f\| f.anchor((Right, Top), (Right, Bottom)))` | `.floating = .{ .anchor = .{ .element_x = .right, .parent_x = .right, .parent_y = .bottom } }` |
 | `.floating(\|f\| f.attach_root())` | `.floating = .{ .attach = .root }` |
+| `.image(asset)` | `.image = .{ .texture = 0 }` |
 | `.capture()` | `.capture = true` |
 | `.text_input(\|t\| t.placeholder("Name"))` | `ui.textInput(.{ ... }, .{ .placeholder = "Name" })` |
 | `{color=red\|text}` in every string | `ui.markup("{color=red\|text}", style)` |
@@ -457,6 +458,49 @@ writing is wanted more often than escaping one, and Ply buys the choice by
 giving the cursor an extra position for every closing brace - at the price of a
 right arrow that sometimes does not appear to move.
 
+## Images
+
+```zig
+renderer.setTextures(&.{sheet});          // once, on the renderer
+
+ui.empty(.{
+    .width = .fixed(34),
+    .height = .fixed(34),
+    .corner_radius = .all(17),            // a circle, cut out of the picture
+    .image = .{ .texture = 0, .source = .init(0, 0, 0.5, 1) },
+});
+```
+
+**A number, not a texture.** The layout half of this library has never heard
+of a GPU and does not want to: a command carries the number, and
+`Renderer.setTextures` is where the number becomes a texture. A number with no
+texture behind it draws the background and nothing else - a missing picture
+rather than a crash.
+
+**It does not size the element.** Nothing here knows how many pixels the
+texture is, which is Ply's position too, so a picture is as big as it was
+declared. `contain` and `cover` hold it to its own proportions inside the room
+it was given.
+
+**A picture is cut to the same rounded box a rectangle is**, so a corner
+radius of half the side gives a circle, and an image inside a scroll container
+is clipped like everything else.
+
+Two things Ply does not have, both nearly free and both needed by any real
+interface:
+
+- **`source`** names a part of the texture, in fractions from zero to one - so
+  one sheet holds a hundred icons. Everything drawn from one sheet stays in
+  one draw call, because what breaks the batch is changing the *texture*, not
+  changing the picture.
+- **`tint`** is multiplied in, so one white icon is every colour of icon.
+
+Under the renderer, a picture is one more instance of the same quad with a
+different number in it: shapes are the distance field, glyphs are one channel
+of the atlas, pictures are four channels of a texture. What breaks a batch is
+the texture that has to be bound - so a page of shapes, labels and icons from
+one sheet is three draws rather than one per icon.
+
 ## Wrapping
 
 ```zig
@@ -722,6 +766,7 @@ than from memory.
 | **Sizing** | `fit`, `grow` with weights, `fixed`, `percent`, `ratio`, with minima and maxima |
 | **Layout** | direction, padding, gaps, alignment on both axes, `contain` and `cover`, wrapping |
 | **Painting** | background colours, corner radii, borders on any side with three positions, z-index |
+| **Images** | a texture number, a source rectangle for sheets, a tint, and the same rounded box a rectangle gets |
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
 | **Clipping and scrolling** | per axis, with the position remembered between frames and clamped when the content shrinks |
@@ -740,7 +785,7 @@ the order it is worth doing in.
 | --- | --- |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus`, `on_unfocus`. Everything but the focus pair can be had today by asking - `hovered()`, `justReleased()` - so this is about the shape of the API, not about what it can do. |
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
-| **Images** | `.image(...)`, and TinyVG in Ply. The command list has an `Image` variant already; nothing fills it in. |
+| **TinyVG** | Ply can hand a vector image straight to `.image(...)` and rasterise it. Here a picture is a texture, and turning TinyVG into one is somebody else's pass. |
 | **Rotation** | `rotate_visual` and `rotate_shape`, with degrees or radians, a pivot, and flips. A render command here has no transform on it. |
 | **Shaders and effects** | `.effect(...)` and `.shader(...)`, per element, and Ply's own shader build step. |
 | **Animated text styles** | `wave`, `jitter`, `pulse`, `swing`, `type`, `fade`, `scale`, `transform`, `gradient`. Every one moves or resizes single glyphs, and a command here describes a run rather than a glyph - so these come with rotation and effects, not before them. |
