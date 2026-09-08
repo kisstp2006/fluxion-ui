@@ -203,6 +203,12 @@ pub const LayoutConfig = struct {
     align_x: AlignX = .left,
     align_y: AlignY = .top,
     direction: Direction = .left_to_right,
+    /// Whether children that do not fit start a new line. See
+    /// `Declaration.wrap`.
+    wrap: bool = false,
+    /// The space between one line of wrapped children and the next, across
+    /// the main axis. `gap` is the space along it.
+    wrap_gap: u16 = 0,
 
     pub const default: LayoutConfig = .{};
 };
@@ -226,6 +232,31 @@ pub const Declaration = struct {
     align_x: AlignX = .left,
     align_y: AlignY = .top,
     direction: Direction = .left_to_right,
+
+    /// Let children that do not fit start a new line. Ply's
+    /// `layout(|l| l.wrap())`.
+    ///
+    /// A row of tags, a toolbar, a gallery of thumbnails: anything whose
+    /// children should carry on underneath rather than be squeezed or run off
+    /// the edge. Along the main axis, so a `left_to_right` element wraps into
+    /// rows and a `top_to_bottom` one into columns.
+    ///
+    /// **Only bites when the main axis is constrained.** A row that fits its
+    /// content has room for all of it and never wraps; one that is `.fixed`,
+    /// `.grow`, `.percent` or squeezed by its parent wraps at its edge. A
+    /// growing child is broken on by its *minimum*, not by the size it will
+    /// grow to - which is what stops the answer depending on itself.
+    ///
+    /// A wrapping **column** whose width is `.fit` is the one shape that does
+    /// not settle: the extra columns are known only after the heights are
+    /// shared out, by which time the widths are already decided, so its
+    /// ancestors made room for one column. Give such a column a width and it
+    /// behaves. A row has neither problem, because the axis it wraps along is
+    /// the one that is settled first.
+    wrap: bool = false,
+    /// The space between one wrapped line and the next, across the main axis.
+    /// Ply's `wrap_gap`. `gap` is still the space along the line.
+    wrap_gap: u16 = 0,
 
     /// Shrink the resolved box to this aspect ratio, inside the room the
     /// layout gave it. Ply's `contain(ratio)`, and what a letterboxed image
@@ -268,6 +299,8 @@ pub const Declaration = struct {
             .align_x = self.align_x,
             .align_y = self.align_y,
             .direction = self.direction,
+            .wrap = self.wrap,
+            .wrap_gap = self.wrap_gap,
         };
     }
 

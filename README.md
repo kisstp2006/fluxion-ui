@@ -106,6 +106,7 @@ the differences are the ones Zig forces, and there are three of them.
 | `.layout(\|l\| l.padding(24))` | `.padding = .all(24)` |
 | `.layout(\|l\| l.padding((10, 20, 30, 40)))` | `.padding = .trbl(10, 20, 30, 40)` |
 | `.layout(\|l\| l.direction(TopToBottom))` | `.direction = .top_to_bottom` |
+| `.layout(\|l\| l.wrap().wrap_gap(6))` | `.wrap = true, .wrap_gap = 6` |
 | `.layout(\|l\| l.align(CenterX, CenterY))` | `.align_x = .center, .align_y = .center` |
 | `.background_color(0x262220)` | `.background_color = .hex(0x262220)` |
 | `.corner_radius(12.0)` | `.corner_radius = .all(12)` |
@@ -456,6 +457,46 @@ writing is wanted more often than escaping one, and Ply buys the choice by
 giving the cursor an extra position for every closing brace - at the price of a
 right arrow that sometimes does not appear to move.
 
+## Wrapping
+
+```zig
+ui.open(.{ .id = "tags", .width = .grow, .height = .fit, .gap = 6, .wrap = true, .wrap_gap = 6 });
+defer ui.close();
+// ... a tag at a time ...
+```
+
+Children that do not fit start a new line, along the main axis - a
+`left_to_right` element wraps into rows and a `top_to_bottom` one into
+columns. `gap` is still the space along a line; `wrap_gap` is the space
+between them.
+
+**It only bites when the main axis is constrained.** A row that fits its
+content has room for all of it and never wraps; one that is `.fixed`, `.grow`,
+`.percent`, or squeezed by its parent wraps at its edge. That last case is
+what makes a wrapping row possible at all: a row's smallest size is normally
+the sum of its children, and one that cannot be squeezed can never be narrow
+enough to wrap - so **a wrapping element's minimum is its widest single
+child** instead. A child too wide even for that gets a line of its own and
+overflows, which is the only answer that terminates.
+
+**A growing child is broken on by its minimum**, not by the size it will grow
+to. Where the lines fall decides how much room each one has to share out, and
+how much a child grew depends on that; asking the grown size first would be a
+loop. Ply does the same, and it means a row of `.grow` children with no
+minimum never wraps - none of them is asking for anything.
+
+**Each line is its own row.** The space is shared out per line, so a line with
+room to spare does not stretch a child on the line below it; each line is
+aligned along the main axis on its own, so a short last row under a centred
+wrap sits under the middle rather than the left; and a child is aligned across
+*its* line rather than across the whole element.
+
+One shape does not settle: **a wrapping column whose width is `.fit`**. The
+extra columns are known only once the heights are shared out, by which time
+the widths are decided and its ancestors have made room for one column. Give
+such a column a width and it behaves. A row has neither problem, because the
+axis it wraps along is the one that is settled first.
+
 ## Floating
 
 ```zig
@@ -679,7 +720,7 @@ than from memory.
 | | |
 | --- | --- |
 | **Sizing** | `fit`, `grow` with weights, `fixed`, `percent`, `ratio`, with minima and maxima |
-| **Layout** | direction, padding, gaps, alignment on both axes, `contain` and `cover` |
+| **Layout** | direction, padding, gaps, alignment on both axes, `contain` and `cover`, wrapping |
 | **Painting** | background colours, corner radii, borders on any side with three positions, z-index |
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
@@ -698,7 +739,6 @@ the order it is worth doing in.
 | | What it is, and what it needs |
 | --- | --- |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus`, `on_unfocus`. Everything but the focus pair can be had today by asking - `hovered()`, `justReleased()` - so this is about the shape of the API, not about what it can do. |
-| **Wrapping** | `.layout(\|l\| l.wrap())` and `wrap_gap`: children that run onto a second row when they do not fit. A tag list, a toolbar, a gallery. |
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
 | **Images** | `.image(...)`, and TinyVG in Ply. The command list has an `Image` variant already; nothing fills it in. |
 | **Rotation** | `rotate_visual` and `rotate_shape`, with degrees or radians, a pivot, and flips. A render command here has no transform on it. |

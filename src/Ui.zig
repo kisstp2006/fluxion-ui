@@ -378,6 +378,17 @@ const Frame = struct {
     next_child: Point,
     /// How many of this element's children have been placed.
     placed: u32 = 0,
+
+    /// For a wrapping element: the line being placed, how many of it are
+    /// down, and where the *next* line starts across the main axis.
+    ///
+    /// Carried on the frame rather than worked out again per child, because
+    /// a line has to be measured whole before its first child can be aligned
+    /// in it - each line is aligned on its own, which is the difference
+    /// between a wrapped row and a row that happens to be in two pieces.
+    line: WrapLine = .{ .count = 0, .main = 0, .cross = 0 },
+    line_placed: usize = 0,
+    line_cross_at: f32 = 0,
 };
 
 gpa: Allocator,
@@ -975,13 +986,27 @@ fn closeChecked(self: *Ui) Error!void {
         const child = self.elements.items[child_index];
         main += child.dimensions.onAxis(along_x);
         cross = @max(cross, child.dimensions.onAxis(!along_x));
-        if (!clips_main) main_min += child.min_dimensions.onAxis(along_x);
+        if (!clips_main) {
+            // A wrapping element's smallest is one child, not all of them:
+            // they can go on separate lines. Without this a row of five
+            // fixed children cannot be squeezed below the five of them, so
+            // it never gets narrow enough to wrap and `wrap` does nothing at
+            // all - which is how this was found.
+            if (config.wrap) {
+                main_min = @max(main_min, child.min_dimensions.onAxis(along_x) +
+                    (if (along_x) padding_x else padding_y));
+            } else {
+                main_min += child.min_dimensions.onAxis(along_x);
+            }
+        }
         if (!clips_cross) cross_min = @max(cross_min, child.min_dimensions.onAxis(!along_x));
         try self.children.append(self.gpa, child_index);
     }
 
     main += gaps;
-    if (!clips_main) main_min += gaps;
+    // The gaps go with the children they separate, so a wrapping element -
+    // whose smallest line is one child - does not count any of them.
+    if (!clips_main and !config.wrap) main_min += gaps;
     cross += if (along_x) padding_y else padding_x;
     cross_min += if (along_x) padding_y else padding_x;
 
@@ -1168,11 +1193,99 @@ fn sizeAlongAxis(self: *Ui, x_axis: bool, from: u32) Error!void {
     }
 }
 
+/// One run of children that fits on a line, and how big that line is.
+const WrapLine = struct {
+    /// How many children, starting from wherever it was asked about.
+    count: usize,
+    /// How long the line is along the main axis, and how thick across it.
+    main: f32,
+    cross: f32,
+};
+
+/// How much room a child asks for when deciding where a line breaks.
+///
+/// A growing child is broken on by its **minimum**, not by the size it will
+/// grow to - which is Ply's rule and the thing that stops the answer
+/// depending on itself. Where the lines fall decides how much space each one
+/// has to share out, and how much a child grew depends on that; asking the
+/// grown size first would be a loop.
+fn breakSize(self: *Ui, child_index: u32, x_axis: bool) f32 {
+    const child = self.elements.items[child_index];
+    const wanted = child.config.sizing.onAxis(x_axis);
+    return if (wanted.kind == .grow) wanted.min else child.dimensions.onAxis(x_axis);
+}
+
+/// The next line of a wrapping container, starting at the `from`th child.
+///
+/// Always takes at least one child: a child wider than the whole container
+/// goes on a line of its own and overflows it, which is the only answer that
+/// terminates.
+fn wrapLine(self: *Ui, parent: Element, from: usize, x_axis: bool, inner: f32) WrapLine {
+    const children = self.childrenOf(parent);
+    const gap: f32 = @floatFromInt(parent.config.gap);
+
+    var line: WrapLine = .{ .count = 0, .main = 0, .cross = 0 };
+    var breaking: f32 = 0;
+
+    for (children[from..]) |child_index| {
+        const step = self.breakSize(child_index, x_axis);
+        const with_gap = if (line.count == 0) step else gap + step;
+        if (line.count > 0 and breaking + with_gap > inner + epsilon) break;
+
+        breaking += with_gap;
+        const child = self.elements.items[child_index];
+        line.main += if (line.count == 0) child.dimensions.onAxis(x_axis) else gap + child.dimensions.onAxis(x_axis);
+        line.cross = @max(line.cross, child.dimensions.onAxis(!x_axis));
+        line.count += 1;
+    }
+
+    return line;
+}
+
+/// How thick a wrapping container's content is across the main axis, and how
+/// many lines it took.
+fn wrapCross(self: *Ui, parent: Element, x_axis: bool, inner: f32) f32 {
+    const children = self.childrenOf(parent);
+    const wrap_gap: f32 = @floatFromInt(parent.config.wrap_gap);
+
+    var total: f32 = 0;
+    var lines: usize = 0;
+    var at: usize = 0;
+    while (at < children.len) : (lines += 1) {
+        const line = self.wrapLine(parent, at, x_axis, inner);
+        if (line.count == 0) break;
+        total += line.cross;
+        at += line.count;
+    }
+    if (lines > 1) total += @as(f32, @floatFromInt(lines - 1)) * wrap_gap;
+    return total;
+}
+
 /// Give out, or take back, the difference between what the children add up to
 /// and what the parent has room for.
 fn distributeMainAxis(self: *Ui, parent_index: u32, x_axis: bool, inner: f32) Error!void {
     const parent = self.elements.items[parent_index];
     const children = self.childrenOf(parent);
+    if (children.len == 0) return;
+
+    // A wrapping container shares its space out one line at a time: the
+    // children on a line grow into what is left of *that* line, and a line
+    // with room to spare does not stretch a child on the line below it.
+    if (parent.config.wrap) {
+        var at: usize = 0;
+        while (at < children.len) {
+            const line = self.wrapLine(parent, at, x_axis, inner);
+            if (line.count == 0) break;
+            try self.distributeRun(parent, children[at..][0..line.count], x_axis, inner);
+            at += line.count;
+        }
+        return;
+    }
+
+    try self.distributeRun(parent, children, x_axis, inner);
+}
+
+fn distributeRun(self: *Ui, parent: Element, children: []const u32, x_axis: bool, inner: f32) Error!void {
     if (children.len == 0) return;
 
     var content: f32 = if (children.len > 1)
@@ -1519,6 +1632,17 @@ fn propagateHeights(self: *Ui) void {
         const config = element.config;
         const stacked = !config.direction.isMainAxisX();
 
+        // A wrapping row is as tall as its lines stacked up, not as tall as
+        // its tallest child. The width is settled by now, which is what makes
+        // the lines knowable here at all.
+        if (config.wrap and !stacked) {
+            const inner = @max(0, element.dimensions.width - config.padding.onAxis(true));
+            const stack = self.wrapCross(element, true, inner) + config.padding.onAxis(false);
+            self.elements.items[i].dimensions.height = config.sizing.height.clamp(stack);
+            self.elements.items[i].min_dimensions.height = config.sizing.height.clamp(stack);
+            continue;
+        }
+
         var height: f32 = 0;
         var smallest: f32 = 0;
         for (self.childrenOf(element)) |child_index| {
@@ -1693,6 +1817,7 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
         .element = root,
         .position = at,
         .next_child = self.startOffset(self.elements.items[root]),
+        .line_cross_at = self.crossLeadOf(self.elements.items[root]),
     });
     self.elements.items[root].box = .at(at.x, at.y, self.elements.items[root].dimensions);
     self.elements.items[root].paint = self.painted;
@@ -1725,28 +1850,67 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
             continue;
         }
 
-        const child_index = children[frame.placed];
-        const child = self.elements.items[child_index];
         const along_x = element.config.direction.isMainAxisX();
+        const inner = @max(0, element.dimensions.onAxis(along_x) -
+            element.config.padding.onAxis(along_x));
+
+        // A wrapping element starts a line whenever the one before it is
+        // finished, which includes the very first child.
+        if (element.config.wrap and frame.line_placed >= frame.line.count) {
+            const started = frame.placed > 0;
+            const line = self.wrapLine(element, frame.placed, along_x, inner);
+
+            var across = self.walk.items[depth].line_cross_at;
+            if (started) across += frame.line.cross + @as(f32, @floatFromInt(element.config.wrap_gap));
+
+            // Each line is aligned along the main axis on its own, so a last
+            // row of two in a centred wrap sits under the middle of the rest
+            // rather than under its left edge.
+            const lead = self.leadOf(element, along_x) +
+                (if (along_x)
+                    geometry.leadingSpaceX(inner - line.main, element.config.align_x)
+                else
+                    geometry.leadingSpaceY(inner - line.main, element.config.align_y));
+
+            self.walk.items[depth].line = line;
+            self.walk.items[depth].line_placed = 0;
+            self.walk.items[depth].line_cross_at = across;
+            if (along_x) {
+                self.walk.items[depth].next_child = .{ .x = lead, .y = across };
+            } else {
+                self.walk.items[depth].next_child = .{ .x = across, .y = lead };
+            }
+        }
+
+        const running = self.walk.items[depth];
+        const child_index = children[running.placed];
+        const child = self.elements.items[child_index];
 
         // Along the main axis the offset has been advancing as children were
-        // placed. Across it, each child is aligned on its own.
-        const cross_room = @max(0, element.dimensions.onAxis(!along_x) -
-            element.config.padding.onAxis(!along_x) -
+        // placed. Across it, each child is aligned on its own - inside its
+        // own line when the element wraps, and inside the whole inner box
+        // when it does not.
+        const cross_room = @max(0, (if (element.config.wrap)
+            running.line.cross
+        else
+            element.dimensions.onAxis(!along_x) - element.config.padding.onAxis(!along_x)) -
             child.dimensions.onAxis(!along_x));
         const cross = if (along_x)
             geometry.leadingSpaceY(cross_room, element.config.align_y)
         else
             geometry.leadingSpaceX(cross_room, element.config.align_x);
 
-        const x = frame.position.x + frame.next_child.x + (if (along_x) 0 else cross);
-        const y = frame.position.y + frame.next_child.y + (if (along_x) cross else 0);
+        const x = running.position.x + running.next_child.x + (if (along_x) 0 else cross);
+        const y = running.position.y + running.next_child.y + (if (along_x) cross else 0);
 
-        // Advance the parent's cursor past this child and the gap after it.
-        const gap: f32 = if (frame.placed + 1 < children.len)
-            @floatFromInt(element.config.gap)
+        // Advance the parent's cursor past this child and the gap after it -
+        // the gap after the last child of a line is the wrap gap, not this
+        // one, and it has already been counted.
+        const last_here = if (element.config.wrap)
+            running.line_placed + 1 >= running.line.count
         else
-            0;
+            running.placed + 1 >= children.len;
+        const gap: f32 = if (last_here) 0 else @floatFromInt(element.config.gap);
         const step = child.dimensions.onAxis(along_x) + gap;
         if (along_x) {
             self.walk.items[depth].next_child.x += step;
@@ -1754,6 +1918,7 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
             self.walk.items[depth].next_child.y += step;
         }
         self.walk.items[depth].placed += 1;
+        self.walk.items[depth].line_placed += 1;
 
         self.elements.items[child_index].box = .at(x, y, child.dimensions);
         self.elements.items[child_index].paint = self.painted;
@@ -1773,8 +1938,29 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
             .element = child_index,
             .position = .{ .x = x, .y = y },
             .next_child = self.startOffset(child),
+            .line_cross_at = self.crossLeadOf(child),
         });
     }
+}
+
+/// The same on the cross axis: where the first line of a wrapping element
+/// sits before any of it has been measured.
+fn crossLeadOf(self: *Ui, element: Element) f32 {
+    return self.leadOf(element, !element.config.direction.isMainAxisX());
+}
+
+/// The padding on the leading edge of the main axis, and the scroll position.
+///
+/// Where a line of a wrapping element starts before its own alignment is
+/// added. `startOffset` folds the alignment of the whole content in, which is
+/// exactly what a wrapping element cannot use.
+fn leadOf(self: *Ui, element: Element, along_x: bool) f32 {
+    _ = self;
+    const config = element.config;
+    return if (along_x)
+        @as(f32, @floatFromInt(config.padding.left)) - element.clip.offset.x
+    else
+        @as(f32, @floatFromInt(config.padding.top)) - element.clip.offset.y;
 }
 
 /// Where the first child of an element goes, relative to the element: the
@@ -6452,4 +6638,330 @@ test "a float can hold a whole tree of its own" {
     try testing.expectEqual(BoundingBox.init(0, 30, 120, 50), ui.boxOf("menu").?);
     try testing.expectEqual(BoundingBox.init(4, 34, 112, 20), ui.boxOf("one").?);
     try testing.expectEqual(BoundingBox.init(4, 56, 112, 20), ui.boxOf("two").?);
+}
+
+// -------------------------------------------------------------------------
+// Wrapping
+// -------------------------------------------------------------------------
+
+// A hundred pixel row with forty pixel children in it: two to a line, and the
+// third underneath. Every number below comes from that, so the arithmetic can
+// be read without holding the whole tree in mind.
+
+/// A wrapping row of `count` fixed children, `wide` pixels each.
+fn wrapRow(u: *Ui, count: usize, wide: f32, gap: u16, wrap_gap: u16) !void {
+    u.begin(.init(400, 300));
+    openRoot(u);
+    {
+        u.open(.{
+            .id = "row",
+            .width = .fixed(100),
+            .height = .fit,
+            .gap = gap,
+            .wrap = true,
+            .wrap_gap = wrap_gap,
+        });
+        defer u.close();
+        for (0..count) |i| {
+            var name: [8]u8 = undefined;
+            const id = std.fmt.bufPrint(&name, "c{d}", .{i}) catch "c";
+            leaf(u, id, .{ .width = .fixed(wide), .height = .fixed(20) });
+        }
+    }
+    u.close();
+    _ = try u.end();
+}
+
+test "children that do not fit carry on underneath" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try wrapRow(&ui, 5, 40, 0, 0);
+
+    try testing.expectEqual(BoundingBox.init(0, 0, 40, 20), ui.boxOf("c0").?);
+    try testing.expectEqual(BoundingBox.init(40, 0, 40, 20), ui.boxOf("c1").?);
+    // The third does not fit beside them, so it starts a line.
+    try testing.expectEqual(BoundingBox.init(0, 20, 40, 20), ui.boxOf("c2").?);
+    try testing.expectEqual(BoundingBox.init(40, 20, 40, 20), ui.boxOf("c3").?);
+    try testing.expectEqual(BoundingBox.init(0, 40, 40, 20), ui.boxOf("c4").?);
+
+    // And the row is as tall as its lines stacked up, not as tall as one
+    // child - which is the part that has to reach its ancestors.
+    try testing.expectEqual(@as(f32, 60), ui.boxOf("row").?.height);
+}
+
+test "a row with room for everything does not wrap" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try wrapRow(&ui, 2, 40, 0, 0);
+    try testing.expectEqual(@as(f32, 0), ui.boxOf("c1").?.y);
+    try testing.expectEqual(@as(f32, 20), ui.boxOf("row").?.height);
+}
+
+test "the gap goes along a line and the wrap gap between them" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Two forties and a ten pixel gap is ninety, which fits; a third would
+    // be a hundred and forty, which does not.
+    try wrapRow(&ui, 3, 40, 10, 6);
+
+    try testing.expectEqual(@as(f32, 50), ui.boxOf("c1").?.x);
+    try testing.expectEqual(@as(f32, 0), ui.boxOf("c2").?.x);
+    // Twenty of line, six of wrap gap.
+    try testing.expectEqual(@as(f32, 26), ui.boxOf("c2").?.y);
+    try testing.expectEqual(@as(f32, 46), ui.boxOf("row").?.height);
+}
+
+test "a child too wide for the row gets a line of its own and overflows it" {
+    // The case that has to terminate. A line always takes at least one child,
+    // however little room is left, or the loop never moves on.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fixed(100), .height = .fit, .wrap = true });
+        defer ui.close();
+        leaf(&ui, "small", .{ .width = .fixed(30), .height = .fixed(20) });
+        leaf(&ui, "huge", .{ .width = .fixed(400), .height = .fixed(20) });
+        leaf(&ui, "after", .{ .width = .fixed(30), .height = .fixed(20) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(@as(f32, 0), ui.boxOf("small").?.y);
+    try testing.expectEqual(@as(f32, 20), ui.boxOf("huge").?.y);
+    try testing.expectEqual(@as(f32, 400), ui.boxOf("huge").?.width);
+    try testing.expectEqual(@as(f32, 40), ui.boxOf("after").?.y);
+}
+
+test "each line shares out its own space" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fixed(100), .height = .fit, .wrap = true });
+        defer ui.close();
+        for (0..3) |i| {
+            var name: [8]u8 = undefined;
+            const id = std.fmt.bufPrint(&name, "g{d}", .{i}) catch "g";
+            leaf(&ui, id, .{ .width = .growBetween(40, 1000), .height = .fixed(20) });
+        }
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Two forties fit on a line and a third does not, so the first two share
+    // the hundred between them and the third has a line to itself.
+    try testing.expectEqual(@as(f32, 50), ui.boxOf("g0").?.width);
+    try testing.expectEqual(@as(f32, 50), ui.boxOf("g1").?.width);
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("g2").?.width);
+    try testing.expectEqual(@as(f32, 20), ui.boxOf("g2").?.y);
+}
+
+test "a growing child is broken on by its minimum, not by what it grows to" {
+    // The rule that stops the answer depending on itself: where the lines
+    // fall decides how much each one has to share out, and how much a child
+    // grew depends on that.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fixed(100), .height = .fit, .wrap = true });
+        defer ui.close();
+        // No minimum: each asks for nothing, so they all fit on one line and
+        // then share it.
+        leaf(&ui, "a", .{ .width = .grow, .height = .fixed(20) });
+        leaf(&ui, "b", .{ .width = .grow, .height = .fixed(20) });
+        leaf(&ui, "c", .{ .width = .grow, .height = .fixed(20) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(@as(f32, 0), ui.boxOf("c").?.y);
+    try testing.expectApproxEqAbs(@as(f32, 100.0 / 3.0), ui.boxOf("a").?.width, 0.01);
+}
+
+test "each line is aligned along the main axis on its own" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "row",
+            .width = .fixed(100),
+            .height = .fit,
+            .wrap = true,
+            .align_x = .center,
+        });
+        defer ui.close();
+        leaf(&ui, "a", .{ .width = .fixed(40), .height = .fixed(20) });
+        leaf(&ui, "b", .{ .width = .fixed(40), .height = .fixed(20) });
+        leaf(&ui, "c", .{ .width = .fixed(40), .height = .fixed(20) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // The full line is eighty in a hundred, so it starts ten in. The last
+    // line is one child, centred on its own - thirty in, not ten.
+    try testing.expectEqual(@as(f32, 10), ui.boxOf("a").?.x);
+    try testing.expectEqual(@as(f32, 30), ui.boxOf("c").?.x);
+}
+
+test "a child is aligned across its own line, not across the whole row" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "row",
+            .width = .fixed(100),
+            .height = .fit,
+            .wrap = true,
+            .align_y = .center,
+        });
+        defer ui.close();
+        leaf(&ui, "tall", .{ .width = .fixed(40), .height = .fixed(40) });
+        leaf(&ui, "short", .{ .width = .fixed(40), .height = .fixed(10) });
+        leaf(&ui, "next", .{ .width = .fixed(40), .height = .fixed(20) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // The first line is forty tall, so the ten pixel child sits fifteen down
+    // in it. If it were centred in the whole sixty pixel row it would be at
+    // twenty-five, and it would be on top of the second line.
+    try testing.expectEqual(@as(f32, 15), ui.boxOf("short").?.y);
+    try testing.expectEqual(@as(f32, 40), ui.boxOf("next").?.y);
+}
+
+test "padding is inside the lines, not around each of them" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "row",
+            .width = .fixed(100),
+            .height = .fit,
+            .padding = .all(10),
+            .wrap = true,
+        });
+        defer ui.close();
+        leaf(&ui, "a", .{ .width = .fixed(40), .height = .fixed(20) });
+        leaf(&ui, "b", .{ .width = .fixed(40), .height = .fixed(20) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Eighty of inner width holds two forties exactly, so they stay on one
+    // line, both inside the padding.
+    try testing.expectEqual(BoundingBox.init(10, 10, 40, 20), ui.boxOf("a").?);
+    try testing.expectEqual(BoundingBox.init(50, 10, 40, 20), ui.boxOf("b").?);
+    try testing.expectEqual(@as(f32, 40), ui.boxOf("row").?.height);
+}
+
+test "a column wraps into columns" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "column",
+            .width = .fixed(200),
+            .height = .fixed(50),
+            .direction = .top_to_bottom,
+            .wrap = true,
+        });
+        defer ui.close();
+        for (0..3) |i| {
+            var name: [8]u8 = undefined;
+            const id = std.fmt.bufPrint(&name, "d{d}", .{i}) catch "d";
+            leaf(&ui, id, .{ .width = .fixed(30), .height = .fixed(20) });
+        }
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Two twenties fit in fifty and a third does not, so the third starts a
+    // column beside them.
+    try testing.expectEqual(BoundingBox.init(0, 0, 30, 20), ui.boxOf("d0").?);
+    try testing.expectEqual(BoundingBox.init(0, 20, 30, 20), ui.boxOf("d1").?);
+    try testing.expectEqual(BoundingBox.init(30, 0, 30, 20), ui.boxOf("d2").?);
+}
+
+test "a wrapping row can be squeezed down to one child, and no further" {
+    // The rule the nested test above found by failing: a wrapping row's
+    // smallest is one of its children, not all of them. Without it a row of
+    // fixed children can never be made narrow enough to wrap, and `wrap` does
+    // nothing at all.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        // Narrower than one child, so the row is held at its widest child and
+        // overflows - which is what any element does when it cannot fit.
+        ui.open(.{ .id = "narrow", .width = .fixed(30), .height = .fit, .direction = .top_to_bottom });
+        defer ui.close();
+
+        ui.open(.{ .id = "row", .width = .grow, .height = .fit, .wrap = true });
+        defer ui.close();
+        leaf(&ui, "a", .{ .width = .fixed(40), .height = .fixed(20) });
+        leaf(&ui, "b", .{ .width = .fixed(40), .height = .fixed(20) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(@as(f32, 40), ui.boxOf("row").?.width);
+    // One child a line, so two lines.
+    try testing.expectEqual(@as(f32, 40), ui.boxOf("row").?.height);
+    try testing.expectEqual(@as(f32, 20), ui.boxOf("b").?.y);
+}
+
+test "a wrapping row inside a column reaches its ancestors with the right height" {
+    // The reason the height is worked out where it is: a wrapped row that
+    // told its parent it was one line tall would have the rest of the page
+    // drawn over it.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "column", .width = .fixed(100), .height = .fit, .direction = .top_to_bottom });
+        defer ui.close();
+        {
+            ui.open(.{ .id = "tags", .width = .grow, .height = .fit, .wrap = true });
+            defer ui.close();
+            for (0..5) |i| {
+                var name: [8]u8 = undefined;
+                const id = std.fmt.bufPrint(&name, "t{d}", .{i}) catch "t";
+                leaf(&ui, id, .{ .width = .fixed(40), .height = .fixed(20) });
+            }
+        }
+        leaf(&ui, "below", .{ .width = .grow, .height = .fixed(10) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(@as(f32, 60), ui.boxOf("tags").?.height);
+    try testing.expectEqual(@as(f32, 60), ui.boxOf("below").?.y);
+    try testing.expectEqual(@as(f32, 70), ui.boxOf("column").?.height);
 }

@@ -248,6 +248,38 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                 .{ .font_size = 13, .color = theme.ink },
             );
 
+            // A wrapping row: the tags carry on underneath rather than
+            // being squeezed or running off the edge. The row is as tall as
+            // the lines it took, so the panel below it moves down.
+            u.open(.{
+                .id = "tags",
+                .width = .grow,
+                .height = .fit,
+                .gap = 6,
+                .wrap = true,
+                .wrap_gap = 6,
+            });
+            {
+                defer u.close();
+                for ([_][]const u8{
+                    "layout",   "sizing",     "text",       "markup",
+                    "clipping", "scrolling",  "scrollbars", "hit testing",
+                    "focus",    "text input", "floating",   "wrapping",
+                }) |label| {
+                    u.open(.{
+                        .id = label,
+                        .width = .fit,
+                        .height = .fit,
+                        .padding = .xy(10, 5),
+                        .corner_radius = .all(12),
+                        .background_color = if (u.isPointerOver(label)) theme.hover else theme.card,
+                        .border = .all(theme.line, 1),
+                    });
+                    defer u.close();
+                    u.text(label, .{ .font_size = 12, .color = theme.ink });
+                }
+            }
+
             // Two text inputs. The first is one line and scrolls sideways
             // when what is typed runs past it; the second wraps and scrolls
             // up and down, and has a bar to show how far.
