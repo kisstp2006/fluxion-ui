@@ -117,6 +117,9 @@ const Element = struct {
     /// Which run of text this element draws, if it is one. Index into `runs`.
     run: ?u32 = null,
 
+    /// What it does with content larger than itself. See `layout.Clip`.
+    clip: layout.Clip = .none,
+
     /// The size it currently believes it is. Filled by the fit pass, then
     /// adjusted by the grow and shrink passes.
     dimensions: Dimensions = .zero,
@@ -143,6 +146,59 @@ const Open = struct {
     /// after that point is one of its children - which is how `close` finds
     /// them in constant time instead of searching.
     pending_at: u32,
+};
+
+/// Where one scroll container is, and how much there is to scroll through.
+pub const Scroll = struct {
+    /// How far the content has been moved, in pixels. **Positive means up and
+    /// left**, so a container scrolled to the bottom has a positive `y`.
+    position: geometry.Vec2 = .{ .x = 0, .y = 0 },
+    /// How big everything inside turned out to be.
+    content: Dimensions = .zero,
+    /// How big the window onto it is - the element's own inner size.
+    viewport: Dimensions = .zero,
+    scroll_x: bool = false,
+    scroll_y: bool = false,
+    /// Whether the element was declared in the frame just finished. One that
+    /// was not is dropped, so a page that stops showing a list stops
+    /// remembering where it was scrolled to.
+    live: bool = false,
+
+    /// The furthest it can be scrolled: how much content there is past the
+    /// window. Never negative - content smaller than its window does not
+    /// scroll, and a stored position from when it was larger is clamped away.
+    pub fn limit(self: Scroll) geometry.Vec2 {
+        return .{
+            .x = @max(0, self.content.width - self.viewport.width),
+            .y = @max(0, self.content.height - self.viewport.height),
+        };
+    }
+
+    pub inline fn overflowsX(self: Scroll) bool {
+        return self.scroll_x and self.content.width > self.viewport.width;
+    }
+
+    pub inline fn overflowsY(self: Scroll) bool {
+        return self.scroll_y and self.content.height > self.viewport.height;
+    }
+
+    /// How far through the content the window is, from zero to one. What a
+    /// scrollbar thumb is positioned by.
+    pub fn progress(self: Scroll) geometry.Vec2 {
+        const max = self.limit();
+        return .{
+            .x = if (max.x > 0) std.math.clamp(self.position.x / max.x, 0, 1) else 0,
+            .y = if (max.y > 0) std.math.clamp(self.position.y / max.y, 0, 1) else 0,
+        };
+    }
+
+    fn clamped(self: Scroll) geometry.Vec2 {
+        const max = self.limit();
+        return .{
+            .x = if (self.scroll_x) std.math.clamp(self.position.x, 0, max.x) else 0,
+            .y = if (self.scroll_y) std.math.clamp(self.position.y, 0, max.y) else 0,
+        };
+    }
 };
 
 /// A run of text, and where its lines ended up.
@@ -197,6 +253,14 @@ open_stack: std.ArrayList(Open),
 /// This frame's output.
 output: std.ArrayList(RenderCommand),
 
+/// What each scroll container was scrolled to, kept between frames.
+///
+/// The one piece of state in this library that outlives a frame. A layout is
+/// otherwise a pure function of its declaration, and a scroll position cannot
+/// be: it is what the person reading has done to the page, and redeclaring
+/// the page must not undo it.
+scrolls: std.AutoHashMapUnmanaged(u32, Scroll),
+
 /// The text declared this frame. One entry per `text` call.
 runs: std.ArrayList(TextRun),
 /// Every run's lines, flattened, after wrapping.
@@ -242,6 +306,7 @@ pub fn init(gpa: Allocator) Ui {
         .pending = .empty,
         .open_stack = .empty,
         .output = .empty,
+        .scrolls = .empty,
         .runs = .empty,
         .lines = .empty,
         .queue = .empty,
@@ -256,6 +321,7 @@ pub fn deinit(self: *Ui) void {
     self.pending.deinit(self.gpa);
     self.open_stack.deinit(self.gpa);
     self.output.deinit(self.gpa);
+    self.scrolls.deinit(self.gpa);
     self.runs.deinit(self.gpa);
     self.lines.deinit(self.gpa);
     self.queue.deinit(self.gpa);
@@ -280,6 +346,58 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
     self.output.clearRetainingCapacity();
     self.runs.clearRetainingCapacity();
     self.lines.clearRetainingCapacity();
+
+    // Nothing has been declared yet, so nothing is live. Whatever is still
+    // not live when the frame ends was not on the page and is forgotten.
+    var seen = self.scrolls.valueIterator();
+    while (seen.next()) |scroll| scroll.live = false;
+}
+
+/// The clip an element asked for, with the scroll position this `Ui`
+/// remembers already in it.
+///
+/// Ply does the same thing at the same point - it fills `child_offset` from
+/// the stored position as the element is configured - and the reason is that
+/// positioning happens long afterwards, by which time the declaration is
+/// gone. The caller writes `.clip = .scrollY` and never touches the offset.
+fn remembered(self: *Ui, declaration: layout.Declaration) layout.Clip {
+    var clip = declaration.clip;
+    if (!clip.scrolls()) return clip;
+
+    const name = identify(declaration.id, @intCast(self.elements.items.len));
+    if (self.scrolls.get(name)) |scroll| clip.offset = scroll.clamped();
+    return clip;
+}
+
+/// Where a scroll container is, or null if there is no such element or it was
+/// not on the page last frame.
+///
+/// Named rather than numbered, so a caller asks the way it declared.
+pub fn scrollOf(self: *Ui, name: []const u8) ?Scroll {
+    return self.scrolls.get(identify(name, 0));
+}
+
+/// Move a scroll container by this much, in pixels.
+///
+/// Takes effect on the next frame, and is clamped when that frame ends - so
+/// a wheel event that runs past the bottom of a list stops at the bottom
+/// rather than scrolling into nothing. Nudging an element that does not
+/// scroll, or does not exist, does nothing.
+pub fn scrollBy(self: *Ui, name: []const u8, dx: f32, dy: f32) void {
+    const key = identify(name, 0);
+    const scroll = self.scrolls.getPtr(key) orelse return;
+    scroll.position.x += dx;
+    scroll.position.y += dy;
+    scroll.position = scroll.clamped();
+}
+
+/// Put a scroll container at this position, in pixels from the top left of
+/// its content.
+pub fn scrollTo(self: *Ui, name: []const u8, x: f32, y: f32) void {
+    const key = identify(name, 0);
+    const scroll = self.scrolls.getPtr(key) orelse return;
+    scroll.position = .{ .x = x, .y = y };
+    scroll.position = scroll.clamped();
 }
 
 /// Say how to measure text. See `text_mod.Measurer`.
@@ -309,6 +427,7 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
         .border = declaration.border,
         .z_index = declaration.z_index,
         .slot_fit = declaration.slotFit(),
+        .clip = self.remembered(declaration),
     });
 
     // The new element is a child of whatever is open, unless it is the root.
@@ -426,17 +545,24 @@ fn closeChecked(self: *Ui) Error!void {
     var cross_min: f32 = 0;
 
     const children_start: u32 = @intCast(self.children.items.len);
+    // What this element clips, which changes what its children may ask of
+    // it. Rule one of three: a clipped axis takes nothing from its children's
+    // minimum, so a long list does not make the box round it un-shrinkable.
+    const clip = self.elements.items[index].clip;
+    const clips_main = clip.onAxis(along_x);
+    const clips_cross = clip.onAxis(!along_x);
+
     for (mine) |child_index| {
         const child = self.elements.items[child_index];
         main += child.dimensions.onAxis(along_x);
-        main_min += child.min_dimensions.onAxis(along_x);
         cross = @max(cross, child.dimensions.onAxis(!along_x));
-        cross_min = @max(cross_min, child.min_dimensions.onAxis(!along_x));
+        if (!clips_main) main_min += child.min_dimensions.onAxis(along_x);
+        if (!clips_cross) cross_min = @max(cross_min, child.min_dimensions.onAxis(!along_x));
         try self.children.append(self.gpa, child_index);
     }
 
     main += gaps;
-    main_min += gaps;
+    if (!clips_main) main_min += gaps;
     cross += if (along_x) padding_y else padding_x;
     cross_min += if (along_x) padding_y else padding_x;
 
@@ -514,6 +640,7 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
     try self.applySlotFit();
 
     try self.positionAndEmit();
+    try self.measureScroll();
     return self.output.items;
 }
 
@@ -562,6 +689,15 @@ fn sizeAlongAxis(self: *Ui, x_axis: bool, from: u32) Error!void {
         const inner = @max(0, parent.dimensions.onAxis(x_axis) - config.padding.onAxis(x_axis));
         const children = self.childrenOf(parent);
 
+        // The widest child, for a parent that clips across this axis and so
+        // must not squeeze them. Computed before anything is resized.
+        var widest: f32 = 0;
+        if (parent.clip.onAxis(x_axis)) {
+            for (children) |child_index| {
+                widest = @max(widest, self.elements.items[child_index].dimensions.onAxis(x_axis));
+            }
+        }
+
         // Percentages resolve first: they are a share of the parent, not of
         // what is left after the others, so they take no part in the
         // distribution that follows.
@@ -592,8 +728,12 @@ fn sizeAlongAxis(self: *Ui, x_axis: bool, from: u32) Error!void {
                 // width it measured, which for text is the whole run
                 // unbroken, and the wrap pass is handed a width it can never
                 // break at.
+                //
+                // Rule three: unless the parent clips this axis, in which case
+                // a child wider than its container is exactly the point.
+                const room = if (parent.clip.onAxis(x_axis)) @max(inner, widest) else inner;
                 const smallest = child.min_dimensions.onAxis(x_axis);
-                const held = @max(smallest, @min(child.dimensions.onAxis(x_axis), inner));
+                const held = @max(smallest, @min(child.dimensions.onAxis(x_axis), room));
                 setSize(child, x_axis, held);
             }
         }
@@ -623,6 +763,11 @@ fn distributeMainAxis(self: *Ui, parent_index: u32, x_axis: bool, inner: f32) Er
     if (spare > 0) {
         try self.grow(children, x_axis, spare);
     } else {
+        // Rule two: a container that clips this axis lets its children run
+        // off the end rather than squeezing them. That overflow *is* the
+        // content a scroll position moves through - squeezing it away would
+        // leave nothing to scroll.
+        if (parent.clip.onAxis(x_axis)) return;
         try self.shrink(children, x_axis, -spare);
     }
 }
@@ -1028,6 +1173,9 @@ fn positionAndEmit(self: *Ui) Error!void {
     self.elements.items[0].box = .at(0, 0, self.elements.items[0].dimensions);
     try self.emitBackground(0, self.elements.items[0].box);
     try self.emitText(0, self.elements.items[0].box);
+    if (self.elements.items[0].clip.clips()) {
+        try self.emitScissor(.scissor_start, self.elements.items[0].box);
+    }
 
     while (self.walk.items.len > 0) {
         // Read what is needed out of the top frame before anything can grow
@@ -1039,7 +1187,11 @@ fn positionAndEmit(self: *Ui) Error!void {
         const children = self.childrenOf(element);
 
         if (frame.placed >= children.len) {
-            // Everything inside is done, so the border goes on top of it.
+            // The clip is let go before the border is drawn, so an element's
+            // own outline is not cut off by the rectangle it imposes on its
+            // children. A border clipped by its own scissor loses a pixel on
+            // every side, which looks like a rounding bug and is not.
+            if (element.clip.clips()) try self.emitScissor(.scissor_end, element.box);
             try self.emitBorder(frame.element, element.box);
             _ = self.walk.pop();
             continue;
@@ -1079,6 +1231,12 @@ fn positionAndEmit(self: *Ui) Error!void {
         try self.emitBackground(child_index, self.elements.items[child_index].box);
         try self.emitText(child_index, self.elements.items[child_index].box);
 
+        // The background goes down first and is not clipped by the element's
+        // own rectangle; everything inside it is.
+        if (child.clip.clips()) {
+            try self.emitScissor(.scissor_start, self.elements.items[child_index].box);
+        }
+
         if (self.walk.items.len >= max_depth) return error.TooDeep;
         try self.walk.append(self.gpa, .{
             .element = child_index,
@@ -1095,9 +1253,13 @@ fn startOffset(self: *Ui, element: Element) Point {
     const along_x = config.direction.isMainAxisX();
     const children = self.childrenOf(element);
 
+    // The scroll position moves the content, not the window: a container
+    // scrolled down has a positive `y`, so its children start that far *above*
+    // where they otherwise would. Everything after this - alignment, gaps,
+    // the boxes handed to the renderer - is the same arithmetic it always was.
     var offset: Point = .{
-        .x = @floatFromInt(config.padding.left),
-        .y = @floatFromInt(config.padding.top),
+        .x = @as(f32, @floatFromInt(config.padding.left)) - element.clip.offset.x,
+        .y = @as(f32, @floatFromInt(config.padding.top)) - element.clip.offset.y,
     };
     if (children.len == 0) return offset;
 
@@ -1116,6 +1278,17 @@ fn startOffset(self: *Ui, element: Element) Point {
         offset.y += geometry.leadingSpaceY(room, config.align_y);
     }
     return offset;
+}
+
+/// One end of a clip pair.
+///
+/// The rectangle is the element's whole box rather than its inside: a
+/// container clips at its own edge, and its padding is part of what it shows.
+fn emitScissor(self: *Ui, kind: commands.Config, box: BoundingBox) Error!void {
+    try self.output.append(self.gpa, .{
+        .bounding_box = box,
+        .config = kind,
+    });
 }
 
 fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
@@ -1149,6 +1322,65 @@ fn emitBorder(self: *Ui, index: u32, box: BoundingBox) Error!void {
             .corner_radius = element.corner_radius.clampTo(box.width, box.height),
         } },
     });
+}
+
+/// Work out how much content each scroll container has, and remember it.
+///
+/// Only possible once everything has a box, which is why this runs last.
+/// The content is measured from the children's boxes rather than from the
+/// sizes they asked for, because a child that grew or wrapped is a different
+/// size from the one it declared - and it is where it ended up that decides
+/// whether there is anything to scroll to.
+///
+/// The children have already been moved by the scroll position, so it is
+/// added back to find where the content would sit unscrolled. Forgetting that
+/// gives a container whose scroll limit shrinks as it is scrolled, which
+/// creeps to a stop halfway down.
+fn measureScroll(self: *Ui) Error!void {
+    for (self.elements.items) |element| {
+        if (!element.clip.scrolls()) continue;
+
+        const padding = element.config.padding;
+        const origin_x = element.box.x + @as(f32, @floatFromInt(padding.left));
+        const origin_y = element.box.y + @as(f32, @floatFromInt(padding.top));
+
+        var content: Dimensions = .zero;
+        for (self.childrenOf(element)) |child_index| {
+            const child = self.elements.items[child_index];
+            content.width = @max(content.width, child.box.right() + element.clip.offset.x - origin_x);
+            content.height = @max(content.height, child.box.bottom() + element.clip.offset.y - origin_y);
+        }
+
+        const entry = try self.scrolls.getOrPut(self.gpa, element.id);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+
+        entry.value_ptr.content = content;
+        entry.value_ptr.viewport = .init(
+            @max(0, element.box.width - padding.onAxis(true)),
+            @max(0, element.box.height - padding.onAxis(false)),
+        );
+        entry.value_ptr.scroll_x = element.clip.scroll_x;
+        entry.value_ptr.scroll_y = element.clip.scroll_y;
+        entry.value_ptr.live = true;
+        // A container that has shrunk, or whose content has, may be scrolled
+        // past its end. Clamping here rather than when it is nudged is what
+        // makes that self-correcting.
+        entry.value_ptr.position = entry.value_ptr.clamped();
+    }
+
+    // Anything that was not declared this frame is off the page, and where it
+    // was scrolled to is no longer anybody's business.
+    var stale: [64]u32 = undefined;
+    var count: usize = 0;
+    var seen = self.scrolls.iterator();
+    while (seen.next()) |entry| {
+        if (entry.value_ptr.live) continue;
+        if (count < stale.len) {
+            stale[count] = entry.key_ptr.*;
+            count += 1;
+        }
+    }
+    for (stale[0..count]) |key| _ = self.scrolls.remove(key);
 }
 
 // -------------------------------------------------------------------------
@@ -2161,4 +2393,461 @@ test "the style carries through to the command a renderer sees" {
     try testing.expectEqual(1, run.letter_spacing);
     try testing.expectEqual(3, run.font);
     try testing.expectEqual(Color.hex(0xFF8800), run.color);
+}
+
+// -------------------------------------------------------------------------
+// Clipping and scrolling
+// -------------------------------------------------------------------------
+//
+// The three rules a clip changes are each a place the layout would otherwise
+// refuse to overflow, and each has a test that fails without it. Then the
+// scissor pair, then the scroll position.
+
+test "a clip container lets its children overflow rather than squeezing them" {
+    // Rule two. Without it the two hundred pixels of content would be
+    // compressed into a hundred, and there would be nothing left to scroll.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "window", .width = .fixed(100), .height = .fixed(100), .clip = .both });
+        defer ui.close();
+        leaf(&ui, "wide", .{ .width = .fixed(300), .height = .fixed(50) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // The child kept every pixel it asked for and runs off the right.
+    try testing.expectEqual(@as(f32, 300), ui.boxOf("wide").?.width);
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("window").?.width);
+}
+
+test "the same container without a clip squeezes them instead" {
+    // The other half of the same test: `fitBetween` gives way when nothing
+    // says it may overflow, and that is the behaviour a clip turns off.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "window", .width = .fixed(100), .height = .fixed(100) });
+        defer ui.close();
+        leaf(&ui, "wide", .{ .width = .fitBetween(0, 300), .height = .fixed(50) });
+        leaf(&ui, "also", .{ .width = .fitBetween(0, 300), .height = .fixed(50) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Two children that between them wanted more than the hundred available
+    // are held inside it.
+    const total = ui.boxOf("wide").?.width + ui.boxOf("also").?.width;
+    try testing.expect(total <= 100.01);
+}
+
+test "a clipped axis does not raise the container's minimum" {
+    // Rule one. A long list inside a scroll container must not make the
+    // container itself un-shrinkable, or the panel round it cannot be
+    // resized.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(200, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{ .width = .fixed(200), .height = .grow });
+        defer ui.close();
+
+        ui.open(.{ .id = "list", .width = .fit, .height = .grow, .clip = .scrollX });
+        {
+            defer ui.close();
+            leaf(&ui, "row", .{ .width = .fixed(600), .height = .fixed(20) });
+        }
+        leaf(&ui, "beside", .{ .width = .fixed(150), .height = .grow, .background_color = paint });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // The fixed sibling kept its width, so the list gave way - which it could
+    // only do because its six-hundred-pixel row does not count towards its
+    // minimum.
+    try testing.expectEqual(@as(f32, 150), ui.boxOf("beside").?.width);
+    try testing.expect(ui.boxOf("list").?.width <= 50.01);
+}
+
+test "a child may be wider than the container across a clipped axis" {
+    // Rule three. In a column, width is the cross axis, and a child is
+    // normally held inside the parent there.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "column",
+            .width = .fixed(100),
+            .height = .fixed(200),
+            .direction = .top_to_bottom,
+            .clip = .both,
+        });
+        defer ui.close();
+        leaf(&ui, "wide", .{ .width = .fixed(400), .height = .fixed(30) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(@as(f32, 400), ui.boxOf("wide").?.width);
+}
+
+test "a clip emits a scissor pair around its children and nothing else" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "window",
+            .width = .fixed(100),
+            .height = .fixed(100),
+            .clip = .both,
+            .background_color = paint,
+            .border = .all(paint, 1),
+        });
+        defer ui.close();
+        leaf(&ui, "inside", .{ .width = .fixed(300), .height = .fixed(50) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // Background, clip on, the child, clip off, border - in that order. The
+    // background is not clipped by the element's own rectangle and neither is
+    // the border, which would otherwise lose a pixel on every side.
+    try testing.expectEqual(5, drawn.len);
+    try testing.expectEqual(commands.Config.rectangle, std.meta.activeTag(drawn[0].config));
+    try testing.expectEqual(commands.Config.scissor_start, std.meta.activeTag(drawn[1].config));
+    try testing.expectEqual(commands.Config.rectangle, std.meta.activeTag(drawn[2].config));
+    try testing.expectEqual(commands.Config.scissor_end, std.meta.activeTag(drawn[3].config));
+    try testing.expectEqual(commands.Config.border, std.meta.activeTag(drawn[4].config));
+
+    // The scissor is the element's whole box, padding included.
+    try testing.expectEqual(ui.boxOf("window").?, drawn[1].bounding_box);
+    try testing.expect(commands.List.scissorsBalanced(.{ .items = drawn }));
+}
+
+test "a clip inside a clip leaves the pairs balanced" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{ .width = .fixed(200), .height = .fixed(200), .clip = .both });
+        defer ui.close();
+        ui.open(.{ .width = .fixed(100), .height = .fixed(100), .clip = .both });
+        defer ui.close();
+        leaf(&ui, "deep", .{ .width = .fixed(300), .height = .fixed(30) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    const emitted: commands.List = .{ .items = drawn };
+    try testing.expect(emitted.scissorsBalanced());
+    try testing.expectEqual(2, emitted.count(.scissor_start));
+    try testing.expectEqual(2, emitted.count(.scissor_end));
+}
+
+test "a container that does not clip emits no scissor at all" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{ .width = .fixed(100), .height = .fixed(100) });
+        defer ui.close();
+        leaf(&ui, "inside", .{ .width = .fixed(50), .height = .fixed(50) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    const emitted: commands.List = .{ .items = drawn };
+    try testing.expectEqual(0, emitted.count(.scissor_start));
+}
+
+test "a scroll container remembers how much content it has" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "list",
+            .width = .fixed(200),
+            .height = .fixed(100),
+            .direction = .top_to_bottom,
+            .clip = .scrollY,
+        });
+        defer ui.close();
+        for (0..10) |_| {
+            ui.empty(.{ .width = .grow, .height = .fixed(30), .background_color = paint });
+        }
+    }
+    ui.close();
+    _ = try ui.end();
+
+    const scroll = ui.scrollOf("list").?;
+    try testing.expectEqual(@as(f32, 300), scroll.content.height);
+    try testing.expectEqual(@as(f32, 100), scroll.viewport.height);
+    // Two hundred pixels of content past the bottom of the window.
+    try testing.expectEqual(@as(f32, 200), scroll.limit().y);
+    try testing.expect(scroll.overflowsY());
+    try testing.expect(!scroll.overflowsX());
+}
+
+test "scrolling moves the content and stops at the end" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const declare = struct {
+        fn frame(u: *Ui) !void {
+            u.begin(.init(400, 400));
+            u.open(.{ .width = .grow, .height = .grow });
+            {
+                u.open(.{
+                    .id = "list",
+                    .width = .fixed(200),
+                    .height = .fixed(100),
+                    .direction = .top_to_bottom,
+                    .clip = .scrollY,
+                });
+                defer u.close();
+                for (0..10) |i| {
+                    var d: layout.Declaration = .{
+                        .width = .grow,
+                        .height = .fixed(30),
+                        .background_color = paint,
+                    };
+                    if (i == 0) d.id = "first";
+                    u.open(d);
+                    u.close();
+                }
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.frame;
+
+    // The first frame is where the container is measured, so there is
+    // something to scroll before the second.
+    try declare(&ui);
+    const before = ui.boxOf("first").?.y;
+
+    ui.scrollBy("list", 0, 50);
+    try declare(&ui);
+    try testing.expectApproxEqAbs(before - 50, ui.boxOf("first").?.y, 0.01);
+
+    // Past the end, and it stops at the end rather than scrolling into
+    // nothing.
+    ui.scrollBy("list", 0, 10_000);
+    try declare(&ui);
+    try testing.expectEqual(@as(f32, 200), ui.scrollOf("list").?.position.y);
+    try testing.expectApproxEqAbs(before - 200, ui.boxOf("first").?.y, 0.01);
+
+    // And back past the start.
+    ui.scrollBy("list", 0, -10_000);
+    try declare(&ui);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.position.y);
+    try testing.expectApproxEqAbs(before, ui.boxOf("first").?.y, 0.01);
+}
+
+test "the scroll limit does not shrink as the container is scrolled" {
+    // The mistake this catches: measuring the content from where the children
+    // ended up, without adding the scroll position back. A container like
+    // that creeps to a stop halfway down.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const declare = struct {
+        fn frame(u: *Ui) !void {
+            u.begin(.init(400, 400));
+            u.open(.{ .width = .grow, .height = .grow });
+            {
+                u.open(.{
+                    .id = "list",
+                    .width = .fixed(200),
+                    .height = .fixed(100),
+                    .direction = .top_to_bottom,
+                    .clip = .scrollY,
+                });
+                defer u.close();
+                for (0..10) |_| {
+                    u.empty(.{ .width = .grow, .height = .fixed(30), .background_color = paint });
+                }
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.frame;
+
+    try declare(&ui);
+    const limit = ui.scrollOf("list").?.limit().y;
+
+    for (0..4) |_| {
+        ui.scrollBy("list", 0, 40);
+    }
+    try declare(&ui);
+
+    try testing.expectEqual(limit, ui.scrollOf("list").?.limit().y);
+    try testing.expectEqual(@as(f32, 300), ui.scrollOf("list").?.content.height);
+}
+
+test "scrollTo puts it where it was told, within the limits" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const declare = struct {
+        fn frame(u: *Ui) !void {
+            u.begin(.init(400, 400));
+            u.open(.{ .width = .grow, .height = .grow });
+            {
+                u.open(.{
+                    .id = "list",
+                    .width = .fixed(200),
+                    .height = .fixed(100),
+                    .direction = .top_to_bottom,
+                    .clip = .scrollY,
+                });
+                defer u.close();
+                for (0..10) |_| {
+                    u.empty(.{ .width = .grow, .height = .fixed(30), .background_color = paint });
+                }
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.frame;
+
+    try declare(&ui);
+    ui.scrollTo("list", 0, 120);
+    try declare(&ui);
+    try testing.expectEqual(@as(f32, 120), ui.scrollOf("list").?.position.y);
+
+    ui.scrollTo("list", 0, 9999);
+    try declare(&ui);
+    try testing.expectEqual(@as(f32, 200), ui.scrollOf("list").?.position.y);
+}
+
+test "content smaller than its window does not scroll" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "roomy",
+            .width = .fixed(200),
+            .height = .fixed(300),
+            .direction = .top_to_bottom,
+            .clip = .scrollY,
+        });
+        defer ui.close();
+        ui.empty(.{ .width = .grow, .height = .fixed(40), .background_color = paint });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    const scroll = ui.scrollOf("roomy").?;
+    try testing.expectEqual(@as(f32, 0), scroll.limit().y);
+    try testing.expect(!scroll.overflowsY());
+    try testing.expectEqual(@as(f32, 0), scroll.progress().y);
+}
+
+test "a container that leaves the page is forgotten" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "list",
+            .width = .fixed(100),
+            .height = .fixed(50),
+            .direction = .top_to_bottom,
+            .clip = .scrollY,
+        });
+        defer ui.close();
+        ui.empty(.{ .width = .grow, .height = .fixed(200), .background_color = paint });
+    }
+    ui.close();
+    _ = try ui.end();
+    try testing.expect(ui.scrollOf("list") != null);
+
+    // A frame without it at all.
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(null, ui.scrollOf("list"));
+}
+
+test "an element with no clip has no scroll state to remember" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    leaf(&ui, "plain", .{ .width = .fixed(100), .height = .fixed(100) });
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(null, ui.scrollOf("plain"));
+    // And nudging something that does not scroll is not an error.
+    ui.scrollBy("plain", 0, 100);
+    ui.scrollBy("nothing at all", 0, 100);
+}
+
+test "progress runs from zero to one across the content" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const declare = struct {
+        fn frame(u: *Ui) !void {
+            u.begin(.init(400, 400));
+            u.open(.{ .width = .grow, .height = .grow });
+            {
+                u.open(.{
+                    .id = "list",
+                    .width = .fixed(200),
+                    .height = .fixed(100),
+                    .direction = .top_to_bottom,
+                    .clip = .scrollY,
+                });
+                defer u.close();
+                for (0..10) |_| {
+                    u.empty(.{ .width = .grow, .height = .fixed(30), .background_color = paint });
+                }
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.frame;
+
+    try declare(&ui);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.progress().y);
+
+    ui.scrollTo("list", 0, 100);
+    try declare(&ui);
+    try testing.expectApproxEqAbs(0.5, ui.scrollOf("list").?.progress().y, 0.001);
+
+    ui.scrollTo("list", 0, 200);
+    try declare(&ui);
+    try testing.expectEqual(@as(f32, 1), ui.scrollOf("list").?.progress().y);
 }

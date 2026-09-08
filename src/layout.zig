@@ -240,6 +240,9 @@ pub const Declaration = struct {
     corner_radius: CornerRadius = .sharp,
     border: ?Border = null,
 
+    /// What happens to content larger than this element. See `Clip`.
+    clip: Clip = .none,
+
     /// Drawn above lower numbers, below higher ones. Elements at the same
     /// z-index are drawn in the order they were declared.
     z_index: i16 = 0,
@@ -307,6 +310,81 @@ pub const BorderWidth = extern struct {
 /// Where the line sits relative to the box. Ply's three, under Ply's names -
 /// which is why the middle one is `middle` rather than `center`.
 pub const BorderPosition = enum { outside, middle, inside };
+
+/// What happens to content larger than the element holding it.
+///
+/// Ply spells this with an `OverflowBuilder` - `clip()`, `scroll_y()`,
+/// `no_drag_scroll()` - and the flags underneath are the same four. The
+/// declarations below are those builder calls as values.
+///
+/// **Clipping is what makes scrolling possible**, and the two are separate on
+/// purpose: an element may clip without scrolling, which is what a fixed-width
+/// chip with a long label wants. Scrolling without clipping is not a thing,
+/// so every `scroll` constructor turns the matching clip on too.
+///
+/// Three things change for an element that clips, and each is a place the
+/// layout would otherwise refuse to overflow:
+///
+///   1. **Its children do not raise its minimum** on the clipped axis. A
+///      paragraph inside a scroll container does not make the container
+///      un-shrinkable.
+///   2. **Its children are not squeezed to fit** along a clipped main axis.
+///      They keep their sizes and run off the end, which is the content a
+///      scrollbar scrolls through.
+///   3. **Its children may be larger than it** across a clipped cross axis.
+pub const Clip = struct {
+    /// Cut off anything past the left and right edges.
+    horizontal: bool = false,
+    /// Cut off anything past the top and bottom.
+    vertical: bool = false,
+    /// Whether the content may be moved sideways. Implies `horizontal`.
+    scroll_x: bool = false,
+    /// Whether it may be moved up and down. Implies `vertical`.
+    scroll_y: bool = false,
+
+    /// How far the content has been scrolled, in pixels, and the direction is
+    /// worth being careful about: **positive means the content has moved up
+    /// and left**, so a container scrolled to the bottom has a positive `y`.
+    /// A renderer never sees this - it is already in the boxes.
+    ///
+    /// Filled in by `Ui` from what it remembers of this element, so a caller
+    /// declares `.clip = .scrollY` and never touches it.
+    offset: geometry.Vec2 = .{ .x = 0, .y = 0 },
+
+    pub const none: Clip = .{};
+
+    /// Ply's `clip_x()`, `clip_y()`, `clip()`.
+    pub const x: Clip = .{ .horizontal = true };
+    pub const y: Clip = .{ .vertical = true };
+    pub const both: Clip = .{ .horizontal = true, .vertical = true };
+
+    /// Ply's `scroll_x()`, `scroll_y()`, `scroll()`. Each clips the axis it
+    /// scrolls, because content that is not cut off has nowhere to scroll to.
+    pub const scrollX: Clip = .{ .horizontal = true, .scroll_x = true };
+    pub const scrollY: Clip = .{ .vertical = true, .scroll_y = true };
+    pub const scroll: Clip = .{
+        .horizontal = true,
+        .vertical = true,
+        .scroll_x = true,
+        .scroll_y = true,
+    };
+
+    /// Whether this element cuts anything off at all.
+    pub inline fn clips(self: Clip) bool {
+        return self.horizontal or self.vertical;
+    }
+
+    /// Whether it clips along one axis. The solver asks this at three points,
+    /// once per rule in the doc comment above.
+    pub inline fn onAxis(self: Clip, x_axis: bool) bool {
+        return if (x_axis) self.horizontal else self.vertical;
+    }
+
+    /// Whether it scrolls at all, and so needs its position remembered.
+    pub inline fn scrolls(self: Clip) bool {
+        return self.scroll_x or self.scroll_y;
+    }
+};
 
 /// Holding a resolved box to an aspect ratio, after the layout has decided
 /// how much room it gets.

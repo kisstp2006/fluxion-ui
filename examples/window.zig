@@ -45,7 +45,9 @@ const theme = struct {
 const body =
     "One instanced draw for the whole frame. Every rectangle, every border " ++
     "and every glyph is the same unit quad under a different set of numbers, " ++
-    "and the fragment shader decides what it is looking at.";
+    "and the fragment shader decides what it is looking at. The list on the " ++
+    "left scrolls with the wheel, and is clipped by a scissor rectangle that " ++
+    "breaks the batch in two.";
 
 fn shell(u: *Ui, size: ui.Dimensions) void {
     u.open(.{
@@ -99,7 +101,24 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
         });
         {
             defer u.close();
-            for ([_][]const u8{ "Layout", "Text", "Renderer", "Atlas" }) |label| {
+
+            // Thirty rows in a box that holds a handful: the whole point of a
+            // clip. Without one the rows would be squeezed until they all
+            // fitted, and there would be nothing to scroll.
+            u.open(.{
+                .id = "list",
+                .width = .grow,
+                .height = .grow,
+                .gap = 6,
+                .direction = .top_to_bottom,
+                .clip = .scrollY,
+            });
+            defer u.close();
+
+            for (0..30) |i| {
+                var label: [24]u8 = undefined;
+                const text = std.fmt.bufPrint(&label, "Item {d}", .{i + 1}) catch "Item";
+
                 u.open(.{
                     .width = .grow,
                     .height = .fixed(28),
@@ -109,7 +128,7 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                     .background_color = theme.card,
                 });
                 defer u.close();
-                u.text(label, .{ .font_size = 13, .color = theme.ink });
+                u.text(text, .{ .font_size = 13, .color = theme.ink });
             }
         }
 
@@ -190,6 +209,8 @@ const Window = struct {
     /// Boxed, because the hooks below hand a pointer to it across to the
     /// device and it has to stay where it is.
     inner: *Inner,
+    /// How far the wheel has turned since this was last asked.
+    wheel: f32 = 0,
 
     const Inner = struct {
         ctx: platform.Context,
@@ -254,9 +275,17 @@ const Window = struct {
             .key => |k| if (k.key == .escape and k.action == .press) {
                 self.inner.win.setShouldClose(true);
             },
+            // One notch is one line of a list, near enough. Turning a wheel
+            // event into pixels is the program's business, not the layout's.
+            .scroll => |w| self.wheel -= @as(f32, @floatCast(w.y)) * 40,
             else => {},
         };
         return !self.inner.win.shouldClose();
+    }
+
+    fn takeWheel(self: *Window) f32 {
+        defer self.wheel = 0;
+        return self.wheel;
     }
 
     /// What the OpenGL backend needs from whoever made the context, which is
@@ -332,12 +361,30 @@ pub fn main(init: std.process.Init) !void {
     while (window.pump()) {
         const size = window.size();
 
+        // The wheel moves the list, and the layout clamps it at either end
+        // when the frame finishes. A program with a pointer under the cursor
+        // would ask which container is under it; this one has only the one.
+        const wheel = window.takeWheel();
+        if (wheel != 0) layout.scrollBy("list", 0, wheel);
+
         layout.begin(size);
         shell(&layout, size);
         const commands = try layout.end();
 
         try renderer.draw(.{ .surface = surface }, size, commands, theme.window);
         try device.present(surface);
+
+        // Say once what there is to scroll through, so a run with `--frames`
+        // leaves something behind to read.
+        if (drawn == 0) {
+            if (layout.scrollOf("list")) |scroll| {
+                try w.print("list: {d:.0} of {d:.0} pixels visible\n", .{
+                    scroll.viewport.height,
+                    scroll.content.height,
+                });
+                try w.flush();
+            }
+        }
 
         drawn += 1;
         if (frames) |limit| {

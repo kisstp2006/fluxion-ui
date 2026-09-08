@@ -110,6 +110,10 @@ the differences are the ones Zig forces, and there are three of them.
 | `.background_color(0x262220)` | `.background_color = .hex(0x262220)` |
 | `.corner_radius(12.0)` | `.corner_radius = .all(12)` |
 | `.corner_radius((8, 8, 0, 0))` | `.corner_radius = .corners(8, 8, 0, 0)` |
+| `.overflow(\|o\| o.clip())` | `.clip = .both` |
+| `.overflow(\|o\| o.scroll_y())` | `.clip = .scrollY` |
+| `.overflow(\|o\| o.clip_x())` | `.clip = .x` |
+| `ui.scroll_offset()` | `ui.scrollOf("list").?.position` |
 | `.contain(16.0/9.0)` | `.contain = 16.0 / 9.0` |
 | `.cover(16.0/9.0)` | `.cover = 16.0 / 9.0` |
 | `.id("save")` | `.id = "save"` |
@@ -235,6 +239,53 @@ passes run in the order they do -
 Getting steps two and three the wrong way round makes a wrapped paragraph
 overflow the card drawn round it, which is a bug that only shows on long text.
 
+## Clipping and scrolling
+
+```zig
+ui.open(.{ .id = "list", .height = .grow, .direction = .top_to_bottom, .clip = .scrollY });
+defer ui.close();
+// ... thirty rows in a box that holds five ...
+```
+
+```zig
+ui.scrollBy("list", 0, wheel_delta);        // before the next frame
+const scroll = ui.scrollOf("list").?;       // after it
+scroll.overflowsY();                        // is there anything to scroll?
+scroll.progress().y;                        // where a scrollbar thumb goes
+```
+
+**Clipping and scrolling are separate**, and every `scroll` constructor turns
+the matching clip on because content that is not cut off has nowhere to scroll
+to. An element may clip without scrolling, which is what a fixed-width chip
+with a long label wants.
+
+A clip changes three things, and each is a place the layout would otherwise
+refuse to overflow:
+
+1. **Its children do not raise its minimum** on the clipped axis, so a long
+   list does not make the panel round it un-shrinkable.
+2. **Its children are not squeezed** along a clipped main axis. They keep
+   their sizes and run off the end - and that overflow *is* the content a
+   scroll position moves through. Squeezing it away would leave nothing to
+   scroll.
+3. **Its children may be larger than it** across a clipped cross axis.
+
+All three are Ply's, and each has a test that fails without it.
+
+The scroll position is **the one piece of state that outlives a frame**. A
+layout is otherwise a pure function of its declaration and a scroll position
+cannot be: it is what the reader has done to the page, and redeclaring the
+page must not undo it. It is remembered per element, clamped when each frame
+ends - so a container whose content shrank is self-correcting - and forgotten
+when the element stops being declared.
+
+Positive means the content has moved **up and left**, so a list scrolled to
+the bottom has a positive `y`. A renderer never sees it: it is already in the
+boxes by the time the commands come out.
+
+Wiring a wheel to `scrollBy` is the program's business, and
+`examples/window.zig` is four lines of it.
+
 ## The renderer
 
 Optional, and a separate module. The library's own output is a command list;
@@ -310,13 +361,13 @@ Ported and tested:
 - Direction, padding, gaps, and alignment on both axes
 - The element tree, and a stable number per element for state to hang off
 - Rectangles, corner radii, borders, and the command list they come out as
+- Clipping and scrolling, with the position remembered between frames
 - An optional renderer over Fluxion RHI: one instanced draw, an SDF for the shapes, a glyph atlas for the text
 
 Not yet, in the order it is worth doing:
 
 | | Why it is not here |
 | --- | --- |
-| **Scroll and clipping** | `scissor_start` / `scissor_end` are in the command list already. The clip container that emits them is not. |
 | **Hit testing, hover, focus** | Every element's final box is recorded - see `Ui.boxOf` - which is the half of it that had to come first. |
 | **Floating elements, wrapping, shaders, images** | Ply has all of these. They sit above the core rather than inside it. |
 | **Accessibility, networking, audio, storage** | Deliberately out of scope. Ply's are bound to its own subsystems, and this library builds on the fluxion ones. |

@@ -24,7 +24,10 @@ const std = @import("std");
 const testing = std.testing;
 const math = @import("fluxion_math");
 
-const Vec2 = math.Vec2;
+/// A point or a displacement. [Fluxion Math](https://github.com/kisstp2006/fluxion-math)'s,
+/// re-exported because a scroll offset is one and nothing else here needs the
+/// rest of that library.
+pub const Vec2 = math.Vec2;
 
 /// How big something is. Not where it is - that is `BoundingBox`.
 pub const Dimensions = extern struct {
