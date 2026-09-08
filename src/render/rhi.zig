@@ -55,6 +55,15 @@ pub const Instance = extern struct {
     /// The corners of the glyph in the atlas. All zero for anything that is
     /// not text.
     uv: [4]f32,
+    /// Where the quad ends up, if something turned it: the two axes of the
+    /// motion, as (x.x, x.y, y.x, y.y). The identity for almost everything.
+    ///
+    /// Only the *position* goes through it. The distance field is still
+    /// measured in the box's own frame, which is why a turned rounded corner
+    /// is still a rounded corner and its edge is still one pixel wide - a
+    /// rigid motion cannot stretch either.
+    motion: [4]f32,
+
     /// How thick the border is, in pixels. Zero fills the whole box.
     border: f32,
     /// What the fragment shader is looking at: `Kind`, as a float because
@@ -62,6 +71,9 @@ pub const Instance = extern struct {
     /// pipelines, because three pipelines would be three draw calls and a
     /// state change between every label and the box behind it.
     textured: f32,
+    /// Where the origin lands after `motion`. Beside `border` and `textured`
+    /// so the three of them are one `float4` attribute rather than two.
+    origin: [2]f32,
 
     /// The three things one quad can be.
     pub const Kind = struct {
@@ -166,7 +178,8 @@ pub const Renderer = struct {
                 .{ .location = 2, .format = .float4, .offset = @offsetOf(Instance, "color"), .buffer = 1 },
                 .{ .location = 3, .format = .float4, .offset = @offsetOf(Instance, "radii"), .buffer = 1 },
                 .{ .location = 4, .format = .float4, .offset = @offsetOf(Instance, "uv"), .buffer = 1 },
-                .{ .location = 5, .format = .float2, .offset = @offsetOf(Instance, "border"), .buffer = 1 },
+                .{ .location = 5, .format = .float4, .offset = @offsetOf(Instance, "border"), .buffer = 1 },
+                .{ .location = 6, .format = .float4, .offset = @offsetOf(Instance, "motion"), .buffer = 1 },
             },
             .topology = .triangle_strip,
             // Straight alpha, because that is what a colour written as
@@ -328,6 +341,7 @@ pub const Renderer = struct {
         var bound: ?rhi.types.Texture = null;
 
         for (commands) |command| {
+            const turn = turnOf(command.transform);
             switch (command.config) {
                 .scissor_start => {
                     try self.closeBatch(&batch_start, scissor, bound);
@@ -349,8 +363,10 @@ pub const Renderer = struct {
                     .color = fill.color.array(),
                     .radii = fill.corner_radius.array(),
                     .uv = @splat(0),
+                    .motion = turn.motion,
                     .border = 0,
                     .textured = Instance.Kind.shape,
+                    .origin = turn.origin,
                 }),
                 .border => |line| try self.instances.append(self.gpa, .{
                     .rect = boxArray(command.bounding_box),
@@ -359,11 +375,13 @@ pub const Renderer = struct {
                     .uv = @splat(0),
                     // One width for all four sides. Four different ones would
                     // need four quads, and no interface has ever asked.
+                    .motion = turn.motion,
                     .border = @floatFromInt(@max(
                         @max(line.width.left, line.width.right),
                         @max(line.width.top, line.width.bottom),
                     )),
                     .textured = Instance.Kind.shape,
+                    .origin = turn.origin,
                 }),
                 .text => |run| {
                     if (bound != null and !std.meta.eql(bound.?, self.atlas_texture)) {
@@ -383,8 +401,10 @@ pub const Renderer = struct {
                             .color = picture.background_color.array(),
                             .radii = picture.corner_radius.array(),
                             .uv = @splat(0),
+                            .motion = turn.motion,
                             .border = 0,
                             .textured = Instance.Kind.shape,
+                            .origin = turn.origin,
                         });
                     }
 
@@ -405,8 +425,10 @@ pub const Renderer = struct {
                             picture.source.right(),
                             picture.source.bottom(),
                         },
+                        .motion = turn.motion,
                         .border = 0,
                         .textured = Instance.Kind.image,
+                        .origin = turn.origin,
                     });
                 },
                 .none => {},
@@ -416,8 +438,22 @@ pub const Renderer = struct {
         try self.closeBatch(&batch_start, scissor, bound);
     }
 
+    /// The two instance fields a command's transform becomes.
+    fn turnOf(transform: ui.geometry.Transform) struct { motion: [4]f32, origin: [2]f32 } {
+        return .{
+            .motion = .{
+                transform.x_axis.x,
+                transform.x_axis.y,
+                transform.y_axis.x,
+                transform.y_axis.y,
+            },
+            .origin = .{ transform.origin.x, transform.origin.y },
+        };
+    }
+
     /// One instance per glyph of a line.
     fn addText(self: *Renderer, command: ui.RenderCommand, run: ui.commands.Text) Error!void {
+        const turn = turnOf(command.transform);
         const size: u16 = run.font_size;
         const scale = self.face.scaleFor(@floatFromInt(size));
 
@@ -446,8 +482,10 @@ pub const Renderer = struct {
                     .color = run.color.array(),
                     .radii = @splat(0),
                     .uv = .{ entry.u0, entry.v0, entry.u1, entry.v1 },
+                    .motion = turn.motion,
                     .border = 0,
                     .textured = Instance.Kind.glyph,
+                    .origin = turn.origin,
                 });
             }
             pen += entry.advance;
@@ -539,7 +577,8 @@ const glsl_vertex =
     \\layout(location = 2) in vec4 a_color;
     \\layout(location = 3) in vec4 a_radii;
     \\layout(location = 4) in vec4 a_uv;
-    \\layout(location = 5) in vec2 a_params;
+    \\layout(location = 5) in vec4 a_params;
+    \\layout(location = 6) in vec4 a_motion;
     \\
     \\layout(std140) uniform Frame { vec4 u_viewport; };
     \\
@@ -553,6 +592,11 @@ const glsl_vertex =
     \\
     \\void main() {
     \\    vec2 pixel = a_rect.xy + a_corner * a_rect.zw;
+    \\    // Only the position turns. Everything below is in the box's own
+    \\    // frame and stays there, which is what keeps a turned corner round
+    \\    // and its edge one pixel wide.
+    \\    pixel = vec2(a_motion.x * pixel.x + a_motion.z * pixel.y,
+    \\                 a_motion.y * pixel.x + a_motion.w * pixel.y) + a_params.zw;
     \\    v_local = (a_corner - 0.5) * a_rect.zw;
     \\    v_half = a_rect.zw * 0.5;
     \\    v_color = a_color;
@@ -623,7 +667,8 @@ const hlsl_vertex =
     \\    float4 color  : ATTR2;
     \\    float4 radii  : ATTR3;
     \\    float4 uv     : ATTR4;
-    \\    float2 params : ATTR5;
+    \\    float4 params : ATTR5;
+    \\    float4 motion : ATTR6;
     \\};
     \\
     \\struct Output {
@@ -633,12 +678,14 @@ const hlsl_vertex =
     \\    float4 color    : TEXCOORD2;
     \\    float4 radii    : TEXCOORD3;
     \\    float2 uv       : TEXCOORD4;
-    \\    float2 params   : TEXCOORD5;
+    \\    float4 params   : TEXCOORD5;
     \\};
     \\
     \\Output main(Input input) {
     \\    Output output;
     \\    float2 pixel = input.rect.xy + input.corner * input.rect.zw;
+    \\    pixel = float2(input.motion.x * pixel.x + input.motion.z * pixel.y,
+    \\                   input.motion.y * pixel.x + input.motion.w * pixel.y) + input.params.zw;
     \\    output.local = (input.corner - 0.5) * input.rect.zw;
     \\    output.half_ = input.rect.zw * 0.5;
     \\    output.color = input.color;
@@ -662,7 +709,7 @@ const hlsl_fragment =
     \\    float4 color    : TEXCOORD2;
     \\    float4 radii    : TEXCOORD3;
     \\    float2 uv       : TEXCOORD4;
-    \\    float2 params   : TEXCOORD5;
+    \\    float4 params   : TEXCOORD5;
     \\};
     \\
     \\float roundedBox(float2 p, float2 b, float4 r) {
@@ -1109,6 +1156,60 @@ test "the Direct3D shaders compile and the frame reaches the pixels" {
 
     // And the edge is where the padding put it.
     try testing.expect(channel(pixels, 30, 64, 0) > 200);
+    try testing.expect(channel(pixels, 10, 64, 0) < 50);
+}
+
+test "the Direct3D shader turns a box too" {
+    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .backend = .d3d11 }) catch
+        return error.SkipZigTest;
+    defer device.deinit();
+    try testing.expectEqual(rhi.Backend.d3d11, device.backendTag());
+
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    const target = try device.createTexture(.{
+        .width = 128,
+        .height = 128,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    var face: font.Font = try .init(bytes);
+    var renderer: Renderer = try .init(testing.allocator, &device, &face);
+    defer renderer.deinit();
+
+    const size: ui.Dimensions = .init(128, 128);
+
+    var layout: ui.Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(.monospace(0.5, 1.0));
+
+    layout.begin(size);
+    {
+        layout.open(.{ .width = .grow, .height = .grow, .align_y = .center });
+        defer layout.close();
+        layout.empty(.{
+            .width = .grow,
+            .height = .fixed(24),
+            .background_color = .hex(0xFF8000),
+            .rotate = .degrees(90),
+        });
+    }
+    const commands = try layout.end();
+
+    try renderer.draw(.{ .texture = target }, size, commands, .black);
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+
+    const channel = struct {
+        fn at(data: []const u8, x: usize, y: usize, index: usize) u8 {
+            return data[(y * 128 + x) * 4 + index];
+        }
+    }.at;
+
+    try testing.expect(channel(pixels, 64, 10, 0) > 200);
     try testing.expect(channel(pixels, 10, 64, 0) < 50);
 }
 

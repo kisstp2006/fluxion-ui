@@ -29,6 +29,95 @@ const math = @import("fluxion_math");
 /// rest of that library.
 pub const Vec2 = math.Vec2;
 
+/// Where a quad ends up, when something rotated it.
+///
+/// A **rigid motion** and nothing more: a turn, a mirror, and where the origin
+/// lands. Not a general matrix - there is no scale and no shear in it, and two
+/// things depend on that. The inverse is the transpose, which is what lets the
+/// pointer be moved into a rotated element's own frame without a division. And
+/// a distance field measured in the element's own space is still measured in
+/// pixels after the motion, so an antialiased edge stays one pixel wide.
+///
+/// Kept as the two axes rather than as an angle and a pivot because that is
+/// what composes: a rotated card holding a rotated icon is one of these, and
+/// is not an angle and a pivot without arithmetic nobody wants in a shader.
+pub const Transform = extern struct {
+    /// Where the x axis points afterwards.
+    x_axis: Vec2 = .{ .x = 1, .y = 0 },
+    /// Where the y axis points.
+    y_axis: Vec2 = .{ .x = 0, .y = 1 },
+    /// Where the origin lands, in surface pixels.
+    origin: Vec2 = .{ .x = 0, .y = 0 },
+
+    pub const identity: Transform = .{};
+
+    /// Whether this leaves everything where it was, which most elements do -
+    /// worth asking before writing six numbers into a vertex buffer.
+    pub inline fn isIdentity(self: Transform) bool {
+        return self.x_axis.x == 1 and self.x_axis.y == 0 and
+            self.y_axis.x == 0 and self.y_axis.y == 1 and
+            self.origin.x == 0 and self.origin.y == 0;
+    }
+
+    pub inline fn apply(self: Transform, point: Vec2) Vec2 {
+        return .{
+            .x = self.x_axis.x * point.x + self.y_axis.x * point.y + self.origin.x,
+            .y = self.x_axis.y * point.x + self.y_axis.y * point.y + self.origin.y,
+        };
+    }
+
+    /// Where a point *came from*: the motion undone.
+    ///
+    /// The transpose and a subtraction, which is only the inverse because
+    /// there is no scale in here. What the hit test uses to ask a rotated
+    /// button whether the pointer is on it.
+    pub fn unapply(self: Transform, point: Vec2) Vec2 {
+        const moved: Vec2 = .{ .x = point.x - self.origin.x, .y = point.y - self.origin.y };
+        return .{
+            .x = self.x_axis.x * moved.x + self.x_axis.y * moved.y,
+            .y = self.y_axis.x * moved.x + self.y_axis.y * moved.y,
+        };
+    }
+
+    /// This one, and then `outer`. The order a nested rotation needs: the
+    /// icon turns in the card's frame, and then the card turns.
+    pub fn then(self: Transform, outer: Transform) Transform {
+        return .{
+            .x_axis = .{
+                .x = outer.x_axis.x * self.x_axis.x + outer.y_axis.x * self.x_axis.y,
+                .y = outer.x_axis.y * self.x_axis.x + outer.y_axis.y * self.x_axis.y,
+            },
+            .y_axis = .{
+                .x = outer.x_axis.x * self.y_axis.x + outer.y_axis.x * self.y_axis.y,
+                .y = outer.x_axis.y * self.y_axis.x + outer.y_axis.y * self.y_axis.y,
+            },
+            .origin = outer.apply(self.origin),
+        };
+    }
+
+    /// A turn about a point, and a mirror through it, in that order - the
+    /// mirror first, as Ply applies its flips before its rotation.
+    pub fn about(pivot: Vec2, radians: f32, flip_x: bool, flip_y: bool) Transform {
+        const cos = @cos(radians);
+        const sin = @sin(radians);
+        const sx: f32 = if (flip_x) -1 else 1;
+        const sy: f32 = if (flip_y) -1 else 1;
+
+        // The 2x2 is the mirror and then the turn; the origin is whatever
+        // keeps the pivot where it is.
+        const x_axis: Vec2 = .{ .x = cos * sx, .y = sin * sx };
+        const y_axis: Vec2 = .{ .x = -sin * sy, .y = cos * sy };
+        return .{
+            .x_axis = x_axis,
+            .y_axis = y_axis,
+            .origin = .{
+                .x = pivot.x - (x_axis.x * pivot.x + y_axis.x * pivot.y),
+                .y = pivot.y - (x_axis.y * pivot.x + y_axis.y * pivot.y),
+            },
+        };
+    }
+};
+
 /// How big something is. Not where it is - that is `BoundingBox`.
 pub const Dimensions = extern struct {
     width: f32 = 0,
@@ -388,4 +477,51 @@ test "alignment gives the leading edge its share and no more" {
     // Right and bottom push the content the whole way across.
     try testing.expectEqual(@as(f32, 100), leadingSpaceX(100, .right));
     try testing.expectEqual(@as(f32, 100), leadingSpaceY(100, .bottom));
+}
+
+test "a transform leaves the pivot alone and moves the rest round it" {
+    const quarter: Transform = .about(.{ .x = 10, .y = 10 }, std.math.pi / 2.0, false, false);
+
+    const pivot = quarter.apply(.{ .x = 10, .y = 10 });
+    try testing.expectApproxEqAbs(@as(f32, 10), pivot.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 10), pivot.y, 0.001);
+
+    // A quarter turn clockwise on screen, where y points down: the point to
+    // the right of the pivot ends up below it.
+    const right = quarter.apply(.{ .x = 20, .y = 10 });
+    try testing.expectApproxEqAbs(@as(f32, 10), right.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 20), right.y, 0.001);
+}
+
+test "undoing a transform is the transform undone" {
+    for ([_]f32{ 0.3, 1.0, -2.2 }) |angle| {
+        for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true }, .{ true, true } }) |flips| {
+            const motion: Transform = .about(.{ .x = 7, .y = -3 }, angle, flips[0], flips[1]);
+            const there = motion.apply(.{ .x = 21, .y = 5 });
+            const back = motion.unapply(there);
+            try testing.expectApproxEqAbs(@as(f32, 21), back.x, 0.001);
+            try testing.expectApproxEqAbs(@as(f32, 5), back.y, 0.001);
+        }
+    }
+}
+
+test "two turns about two pivots compose into one motion" {
+    // The reason this is two axes and an origin rather than an angle and a
+    // pivot: a rotated card holding a rotated icon has to be one of these.
+    const inner: Transform = .about(.{ .x = 0, .y = 0 }, 0.4, false, false);
+    const outer: Transform = .about(.{ .x = 50, .y = 20 }, -1.1, false, true);
+    const both = inner.then(outer);
+
+    const point: Vec2 = .{ .x = 13, .y = 29 };
+    const step_by_step = outer.apply(inner.apply(point));
+    const at_once = both.apply(point);
+    try testing.expectApproxEqAbs(step_by_step.x, at_once.x, 0.001);
+    try testing.expectApproxEqAbs(step_by_step.y, at_once.y, 0.001);
+}
+
+test "the identity is the identity, and says so" {
+    try testing.expect(Transform.identity.isIdentity());
+    try testing.expect(!Transform.about(.{ .x = 1, .y = 1 }, 0.5, false, false).isIdentity());
+    // A turn of nothing about anywhere still leaves everything where it was.
+    try testing.expect(Transform.about(.{ .x = 40, .y = 40 }, 0, false, false).isIdentity());
 }

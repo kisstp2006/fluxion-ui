@@ -126,6 +126,8 @@ the differences are the ones Zig forces, and there are three of them.
 | `.floating(\|f\| f.anchor((Right, Top), (Right, Bottom)))` | `.floating = .{ .anchor = .{ .element_x = .right, .parent_x = .right, .parent_y = .bottom } }` |
 | `.floating(\|f\| f.attach_root())` | `.floating = .{ .attach = .root }` |
 | `.image(asset)` | `.image = .{ .texture = 0 }` |
+| `.rotate_visual(\|r\| r.degrees(30))` | `.rotate = .degrees(30)` |
+| `.rotate_shape(\|r\| r.degrees(30))` | `.rotate_shape = .degrees(30)` |
 | `.capture()` | `.capture = true` |
 | `.text_input(\|t\| t.placeholder("Name"))` | `ui.textInput(.{ ... }, .{ .placeholder = "Name" })` |
 | `{color=red\|text}` in every string | `ui.markup("{color=red\|text}", style)` |
@@ -458,6 +460,44 @@ writing is wanted more often than escaping one, and Ply buys the choice by
 giving the cursor an extra position for every closing brace - at the price of a
 right arrow that sometimes does not appear to move.
 
+## Rotation
+
+```zig
+.rotate = .degrees(-7),          // this element and everything in it
+.rotate_shape = .degrees(90),    // only its own box
+```
+
+Ply's two, under Ply's names. `rotate` turns the element and its children;
+`rotate_shape` turns the element's own drawing and leaves its children where
+they were. Both take a `pivot` in fractions of the box - the middle by default
+- and `flip_x` / `flip_y`, mirrored before the turn as Ply does it.
+
+**It changes nothing about the layout.** An element takes up the room its
+unturned box does and its neighbours do not move, which is Ply's behaviour and
+the only sensible one: a badge tilted seven degrees should not reflow the page.
+
+**Turns nest.** A rotated icon in a rotated card is one motion, which is why a
+command carries two axes and an origin rather than an angle and a pivot: two
+turns about two different pivots compose into the first and not into the
+second.
+
+**The pointer follows.** A rotated button is clickable where it was drawn,
+because the hit test moves the *pointer* into the element's frame rather than
+trying to test a point against a turned rectangle. That is a transpose and a
+subtraction, and it is only the inverse because a `Transform` here is a rigid
+motion - a turn, a mirror and a move, with no scale in it anywhere.
+
+One thing does not turn: **a scissor**. Clipping is axis-aligned in every
+graphics API there is, so a rotated element that clips clips by its unturned
+box. Ply has the same limitation.
+
+Under the renderer this is six more floats on the instance and two lines of
+vertex shader. Only the *position* goes through the motion: the distance field
+is still measured in the box's own frame, so a turned rounded corner is still
+round and its edge is still one pixel wide. Ply instead renders the subtree to
+an offscreen target and draws that target rotated, which costs a pass and
+resamples the text; this costs neither.
+
 ## Images
 
 ```zig
@@ -767,6 +807,7 @@ than from memory.
 | **Layout** | direction, padding, gaps, alignment on both axes, `contain` and `cover`, wrapping |
 | **Painting** | background colours, corner radii, borders on any side with three positions, z-index |
 | **Images** | a texture number, a source rectangle for sheets, a tint, and the same rounded box a rectangle gets |
+| **Rotation** | of an element and its children or of its own box alone, with a pivot and flips, nesting, and a hit test that follows |
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
 | **Clipping and scrolling** | per axis, with the position remembered between frames and clamped when the content shrinks |
@@ -786,8 +827,7 @@ the order it is worth doing in.
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus`, `on_unfocus`. Everything but the focus pair can be had today by asking - `hovered()`, `justReleased()` - so this is about the shape of the API, not about what it can do. |
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
 | **TinyVG** | Ply can hand a vector image straight to `.image(...)` and rasterise it. Here a picture is a texture, and turning TinyVG into one is somebody else's pass. |
-| **Rotation** | `rotate_visual` and `rotate_shape`, with degrees or radians, a pivot, and flips. A render command here has no transform on it. |
-| **Shaders and effects** | `.effect(...)` and `.shader(...)`, per element, and Ply's own shader build step. |
+| **Shaders and effects** | `.effect(...)` and `.shader(...)`: a fragment shader per element, with Ply's own build step behind it. This renderer is one pipeline and one draw call by design, and a shader per element is a pipeline per element - so this is not a missing feature so much as a different renderer. A program that wants it can consume the command list itself. |
 | **Animated text styles** | `wave`, `jitter`, `pulse`, `swing`, `type`, `fade`, `scale`, `transform`, `gradient`. Every one moves or resizes single glyphs, and a command here describes a run rather than a glyph - so these come with rotation and effects, not before them. |
 | **Drag scrolling** | Dragging the content itself, with momentum, a decay curve and a smoothing filter. This scrolls by wheel, by `scrollBy`, and by the scrollbar. Ply's `no_drag_scroll` exists to turn the thing off that is not here. |
 | **Smooth scrolling** | Ply animates towards a target position over a duration. Here a scroll position is a number, and it changes when something changes it. |

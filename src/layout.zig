@@ -281,6 +281,13 @@ pub const Declaration = struct {
     /// `Image`.
     image: ?Image = null,
 
+    /// Turn this element **and everything inside it**. Ply's
+    /// `rotate_visual`.
+    rotate: ?Rotation = null,
+    /// Turn only this element's own box, leaving its children where they
+    /// were. Ply's `rotate_shape`.
+    rotate_shape: ?Rotation = null,
+
     /// Whether the pointer stops here rather than reaching what is behind.
     /// Ply's `.capture()`, and what a button inside a draggable panel wants:
     /// dragging the button must not also drag the panel.
@@ -359,6 +366,55 @@ pub const BorderWidth = extern struct {
 /// Where the line sits relative to the box. Ply's three, under Ply's names -
 /// which is why the middle one is `middle` rather than `center`.
 pub const BorderPosition = enum { outside, middle, inside };
+
+/// A turn, and which way round. Ply's `VisualRotationConfig` and its shape
+/// twin, which differ only in what they turn.
+///
+/// ```zig
+/// .rotate = .degrees(-4),                       // this and everything in it
+/// .rotate_shape = .{ .radians = 0.3 },          // only its own box
+/// ```
+///
+/// **It changes nothing about the layout.** An element takes up the room its
+/// unrotated box does, and the boxes beside it do not move - which is Ply's
+/// behaviour and the only one that makes sense: a badge tilted four degrees
+/// should not reflow the page.
+pub const Rotation = struct {
+    radians: f32 = 0,
+    /// Where the turn happens, in fractions of the element's own box. The
+    /// middle by default; `.{ .x = 0, .y = 0 }` is its top left corner.
+    ///
+    /// Ply has a pivot on its visual rotation and none on its shape rotation.
+    /// Both have one here, because there is no reason for them to differ and
+    /// one fewer thing to remember.
+    pivot: geometry.Vec2 = .{ .x = 0.5, .y = 0.5 },
+    /// Mirrored before the turn, as Ply applies its flips.
+    flip_x: bool = false,
+    flip_y: bool = false,
+
+    /// The same in degrees, which is how a designer says it.
+    pub inline fn degrees(angle: f32) Rotation {
+        return .{ .radians = angle * std.math.pi / 180.0 };
+    }
+
+    /// Whether it leaves everything where it was.
+    pub inline fn isNone(self: Rotation) bool {
+        return self.radians == 0 and !self.flip_x and !self.flip_y;
+    }
+
+    /// The motion this is, for an element with this box.
+    pub fn motion(self: Rotation, box: geometry.BoundingBox) geometry.Transform {
+        return .about(
+            .{
+                .x = box.x + box.width * self.pivot.x,
+                .y = box.y + box.height * self.pivot.y,
+            },
+            self.radians,
+            self.flip_x,
+            self.flip_y,
+        );
+    }
+};
 
 /// A picture drawn in an element's box. Ply's `.image(...)`.
 ///

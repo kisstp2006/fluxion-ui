@@ -126,6 +126,19 @@ pub const RenderCommand = struct {
     /// field is here so a renderer can batch by it.
     z_index: i16 = 0,
 
+    /// Where this command's box actually ends up, when something turned it.
+    ///
+    /// The identity for almost everything, and a renderer that wants no part
+    /// of rotation can ignore it and be right about every interface that does
+    /// not use one. It is on the command rather than in a group-begin and
+    /// group-end pair - which is how Ply does it - so that a command says
+    /// where it goes without anything having to remember what came before.
+    ///
+    /// `bounding_box` is still the box **before** the turn: that is what the
+    /// layout decided, what the hit test undoes the motion to ask about, and
+    /// what a rounded corner is measured against.
+    transform: geometry.Transform = .identity,
+
     /// Whether drawing this would put any pixels on the screen.
     ///
     /// A fully transparent fill and a zero-area box are both common - the

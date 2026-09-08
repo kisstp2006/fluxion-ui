@@ -175,6 +175,23 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
             {
                 defer u.close();
                 u.text("One draw call", .{ .font_size = 22, .color = theme.ink });
+
+                // Tilted, and it costs the layout nothing: the badge takes up
+                // the room its unturned box does and the title does not move.
+                u.open(.{
+                    .id = "badge",
+                    .width = .fit,
+                    .height = .fit,
+                    .padding = .xy(8, 3),
+                    .corner_radius = .all(4),
+                    .background_color = theme.accent,
+                    .rotate = .degrees(-7),
+                });
+                {
+                    defer u.close();
+                    u.text("0.1", .{ .font_size = 11, .color = theme.window });
+                }
+
                 u.empty(.{ .width = .grow, .height = .fixed(1) });
 
                 // Asked about both, because a floating element ends the chain
@@ -1169,4 +1186,71 @@ test "a tint multiplies into the picture" {
     try testing.expect(pixels[middle] > 200);
     try testing.expectApproxEqAbs(128, @as(f32, @floatFromInt(pixels[middle + 1])), 12);
     try testing.expect(pixels[middle + 2] < 50);
+}
+
+test "a turned box reaches the pixels turned" {
+    // The vertex shader's half of rotation. A transform written into the
+    // instance and never read, or read in the wrong order, draws the box
+    // exactly where it would have been anyway - which is why this looks for
+    // the corners rather than for the middle.
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    var window = Window.open(64, 64, false, true) catch |err|
+        if (Window.isAbsent(err)) return error.SkipZigTest else return err;
+    defer window.close();
+
+    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .gl = window.hooks() }) catch
+        return error.SkipZigTest;
+    defer device.deinit();
+
+    const target = try device.createTexture(.{
+        .width = 128,
+        .height = 128,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    var measured: Measured = .{ .face = try .init(bytes) };
+    var renderer: render.Renderer = try .init(testing.allocator, &device, &measured.face);
+    defer renderer.deinit();
+
+    const size: ui.Dimensions = .init(128, 128);
+
+    var layout: Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(measured.measurer());
+
+    // A wide flat bar across the middle, turned a quarter so it stands up.
+    layout.begin(size);
+    {
+        layout.open(.{ .width = .grow, .height = .grow, .align_y = .center });
+        defer layout.close();
+        layout.empty(.{
+            .width = .grow,
+            .height = .fixed(24),
+            .background_color = .hex(0xFF8000),
+            .rotate = .degrees(90),
+        });
+    }
+    const commands = try layout.end();
+
+    try renderer.draw(.{ .texture = target }, size, commands, .black);
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+
+    const channel = struct {
+        fn at(data: []const u8, x: usize, y: usize, index: usize) u8 {
+            return data[(y * 128 + x) * 4 + index];
+        }
+    }.at;
+
+    // Standing up: orange near the top and bottom of the middle column...
+    try testing.expect(channel(pixels, 64, 10, 0) > 200);
+    try testing.expect(channel(pixels, 64, 118, 0) > 200);
+    // ...and nothing at the left and right of the middle row, which is where
+    // the bar would be if it had not turned.
+    try testing.expect(channel(pixels, 10, 64, 0) < 50);
+    try testing.expect(channel(pixels, 118, 64, 0) < 50);
 }

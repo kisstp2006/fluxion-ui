@@ -147,6 +147,13 @@ const Element = struct {
     floating: ?layout.Floating = null,
     /// A picture drawn in its box instead of a plain fill. See `layout.Image`.
     image: ?layout.Image = null,
+    /// A turn applied to this element and everything inside it, and one
+    /// applied to its own box alone. See `layout.Rotation`.
+    rotate: ?layout.Rotation = null,
+    rotate_shape: ?layout.Rotation = null,
+    /// What was in force when this element was drawn, which is what the hit
+    /// test undoes to ask whether the pointer is on it.
+    motion: geometry.Transform = .identity,
     /// What a floating element is allowed to be pointed at through, worked
     /// out when it is placed: the thing it is clipped to, or the whole
     /// surface. Null for everything else, which inherits from its parent.
@@ -216,12 +223,32 @@ const Hit = struct {
     /// floating element is not inside its declared parent on screen, so the
     /// parent is not under the pointer when the float is.
     floating: bool,
+    /// What turned it, so the pointer can be asked in the element's own
+    /// frame. See `holds`.
+    motion: geometry.Transform,
     capture: bool,
     preserve_focus: bool,
     /// Whether this is a text input, which a press has more to do about.
     field: bool,
     /// Whether dragging in it selects text.
     drag_select: bool,
+
+    /// Whether a point is on this element.
+    ///
+    /// The motion is undone rather than the box turned: a rotated box is not a
+    /// box any more, and asking whether a point is inside one means four edge
+    /// tests. Moving the pointer into the element's own frame instead is a
+    /// transpose and a subtraction, and then it is the same rectangle test as
+    /// everything else - which is the whole reason `Transform` is a rigid motion
+    /// and not a matrix.
+    ///
+    /// `visible` is asked in surface coordinates, because what clips is a scissor
+    /// and a scissor never turns.
+    fn holds(self: Hit, point: geometry.Vec2) bool {
+        if (!self.visible.contains(point)) return false;
+        if (self.motion.isIdentity()) return self.box.contains(point);
+        return self.box.contains(self.motion.unapply(point));
+    }
 };
 
 /// Where one scroll container is, and how much there is to scroll through.
@@ -381,6 +408,10 @@ const Frame = struct {
     /// How many of this element's children have been placed.
     placed: u32 = 0,
 
+    /// What everything in this element is turned by, inherited from its
+    /// ancestors and its own `rotate`.
+    motion: geometry.Transform = .identity,
+
     /// For a wrapping element: the line being placed, how many of it are
     /// down, and where the *next* line starts across the main axis.
     ///
@@ -437,6 +468,10 @@ focus: u32 = 0,
 floats: std.ArrayList(Float),
 /// Counts the elements as they are drawn, for `Element.paint`.
 painted: u32 = 0,
+/// What the element being drawn is turned by, stamped onto every command it
+/// emits. Set by `positionAndEmit` and read by the six emitters, which is a
+/// great deal less threading than passing it to all of them.
+stamp: geometry.Transform = .identity,
 
 /// What each text input holds, kept between frames.
 ///
@@ -724,6 +759,8 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
         .preserve_focus = declaration.preserve_focus,
         .floating = declaration.floating,
         .image = declaration.image,
+        .rotate = declaration.rotate,
+        .rotate_shape = declaration.rotate_shape,
     });
 
     // The new element is a child of whatever is open, unless it is the root -
@@ -1794,6 +1831,7 @@ fn emitPiece(
         .bounding_box = box,
         .id = element.id,
         .z_index = element.z_index,
+        .transform = self.stamp,
         .config = .{ .text = .{
             .text = piece,
             .color = ink,
@@ -1825,6 +1863,12 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
     self.elements.items[root].box = .at(at.x, at.y, self.elements.items[root].dimensions);
     self.elements.items[root].paint = self.painted;
     self.painted += 1;
+
+    const root_motion = self.turnOf(root, .identity);
+    self.walk.items[0].motion = root_motion;
+    self.elements.items[root].motion = root_motion;
+    self.stamp = self.ownTurnOf(root, root_motion);
+
     try self.emitBackground(root, self.elements.items[root].box);
     try self.emitText(root, self.elements.items[root].box);
     try self.emitField(root, self.elements.items[root].box);
@@ -1847,6 +1891,7 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
             // children. A border clipped by its own scissor loses a pixel on
             // every side, which looks like a rounding bug and is not.
             if (element.clip.clips()) try self.emitScissor(.scissor_end, element.box);
+            self.stamp = self.ownTurnOf(frame.element, frame.motion);
             try self.emitBorder(frame.element, element.box);
             try self.emitScrollbars(frame.element, element.box);
             _ = self.walk.pop();
@@ -1926,6 +1971,14 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
         self.elements.items[child_index].box = .at(x, y, child.dimensions);
         self.elements.items[child_index].paint = self.painted;
         self.painted += 1;
+
+        // A turn on this child applies to it and to everything inside it, so
+        // it is what the child's own frame inherits. A turn on its *shape*
+        // applies to its own drawing and stops there.
+        const inherited = self.turnOf(child_index, running.motion);
+        self.elements.items[child_index].motion = inherited;
+        self.stamp = self.ownTurnOf(child_index, inherited);
+
         try self.emitBackground(child_index, self.elements.items[child_index].box);
         try self.emitText(child_index, self.elements.items[child_index].box);
         try self.emitField(child_index, self.elements.items[child_index].box);
@@ -1942,6 +1995,7 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
             .position = .{ .x = x, .y = y },
             .next_child = self.startOffset(child),
             .line_cross_at = self.crossLeadOf(child),
+            .motion = inherited,
         });
     }
 }
@@ -1950,6 +2004,23 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
 /// sits before any of it has been measured.
 fn crossLeadOf(self: *Ui, element: Element) f32 {
     return self.leadOf(element, !element.config.direction.isMainAxisX());
+}
+
+/// What an element and everything inside it is turned by.
+fn turnOf(self: *Ui, index: u32, inherited: geometry.Transform) geometry.Transform {
+    const element = self.elements.items[index];
+    const turn = element.rotate orelse return inherited;
+    if (turn.isNone()) return inherited;
+    return turn.motion(element.box).then(inherited);
+}
+
+/// What an element's **own** drawing is turned by: the above, and then its
+/// shape rotation, which its children do not inherit.
+fn ownTurnOf(self: *Ui, index: u32, inherited: geometry.Transform) geometry.Transform {
+    const element = self.elements.items[index];
+    const turn = element.rotate_shape orelse return inherited;
+    if (turn.isNone()) return inherited;
+    return turn.motion(element.box).then(inherited);
 }
 
 /// The padding on the leading edge of the main axis, and the scroll position.
@@ -2004,6 +2075,11 @@ fn startOffset(self: *Ui, element: Element) Point {
 ///
 /// The rectangle is the element's whole box rather than its inside: a
 /// container clips at its own edge, and its padding is part of what it shows.
+///
+/// A scissor is axis-aligned and stays that way under a turn: the graphics
+/// API has no other kind. A rotated element that clips therefore clips by
+/// its unrotated box, which is Ply's behaviour too and is said out loud in
+/// the README rather than left to be found.
 fn emitScissor(self: *Ui, kind: commands.Config, box: BoundingBox) Error!void {
     try self.output.append(self.gpa, .{
         .bounding_box = box,
@@ -2023,6 +2099,7 @@ fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
             .bounding_box = box,
             .id = element.id,
             .z_index = element.z_index,
+            .transform = self.stamp,
             .config = .{ .image = .{
                 .background_color = if (picture.background_color.invisible())
                     element.background_color
@@ -2043,6 +2120,7 @@ fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
         .bounding_box = box,
         .id = element.id,
         .z_index = element.z_index,
+        .transform = self.stamp,
         .config = .{ .rectangle = .{
             .color = element.background_color,
             .corner_radius = element.corner_radius.clampTo(box.width, box.height),
@@ -2059,6 +2137,7 @@ fn emitBorder(self: *Ui, index: u32, box: BoundingBox) Error!void {
         .bounding_box = box,
         .id = element.id,
         .z_index = element.z_index,
+        .transform = self.stamp,
         .config = .{ .border = .{
             .color = border.color,
             .width = border.width,
@@ -2200,6 +2279,7 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
                     .bounding_box = .init(origin_x + left, line_y, right - left, step),
                     .id = element.id,
                     .z_index = element.z_index,
+                    .transform = self.stamp,
                     .config = .{ .rectangle = .{
                         .color = config.selection_color,
                         .corner_radius = .sharp,
@@ -2246,6 +2326,7 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
             ),
             .id = element.id,
             .z_index = element.z_index,
+            .transform = self.stamp,
             .config = .{ .rectangle = .{
                 .color = config.cursor_color,
                 .corner_radius = .sharp,
@@ -2509,6 +2590,7 @@ fn emitBar(
             .bounding_box = bar.track,
             .id = element.id,
             .z_index = element.z_index,
+            .transform = self.stamp,
             .config = .{ .rectangle = .{
                 .color = faded(track, alpha),
                 .corner_radius = radius.clampTo(bar.track.width, bar.track.height),
@@ -2520,6 +2602,7 @@ fn emitBar(
         .bounding_box = bar.thumb,
         .id = element.id,
         .z_index = element.z_index,
+        .transform = self.stamp,
         .config = .{ .rectangle = .{
             .color = faded(config.thumb_color, alpha),
             .corner_radius = radius.clampTo(bar.thumb.width, bar.thumb.height),
@@ -2638,6 +2721,7 @@ fn recordHits(self: *Ui) Error!void {
             .id = element.id,
             .box = element.box,
             .visible = visible,
+            .motion = element.motion,
             .paint = element.paint,
             .parent = parent,
             .floating = element.floating != null,
@@ -2881,7 +2965,7 @@ fn chainUnder(self: *Ui, point: geometry.Vec2) Error!void {
     var topmost: ?u32 = null;
     var latest: u32 = 0;
     for (self.hits.items, 0..) |hit, i| {
-        if (!hit.box.contains(point) or !hit.visible.contains(point)) continue;
+        if (!hit.holds(point)) continue;
         if (topmost == null or hit.paint > latest) {
             topmost = @intCast(i);
             latest = hit.paint;
@@ -7122,4 +7206,267 @@ test "an image inside a clip is clipped like anything else" {
     try testing.expect(emitted.scissorsBalanced());
     try testing.expectEqual(@as(usize, 1), emitted.count(.image));
     try testing.expectEqual(@as(usize, 1), emitted.count(.scissor_start));
+}
+
+// -------------------------------------------------------------------------
+// Rotation
+// -------------------------------------------------------------------------
+
+// A turn changes nothing about the layout: the box an element takes up is the
+// box it would have had, and its neighbours do not move. What changes is
+// where the drawing of it lands, and where the pointer has to be to hit it.
+
+/// The transform stamped on the first command belonging to this element.
+fn motionIn(drawn: []const commands.RenderCommand, name: []const u8) ?geometry.Transform {
+    const wanted = identify(name, 0);
+    for (drawn) |command| {
+        if (command.id == wanted) return command.transform;
+    }
+    return null;
+}
+
+test "a turn moves the drawing and leaves the layout alone" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui, turn: ?layout.Rotation) ![]const commands.RenderCommand {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{ .id = "row", .width = .fit, .height = .fit, .gap = 10 });
+                defer u.close();
+                u.empty(.{
+                    .id = "badge",
+                    .width = .fixed(40),
+                    .height = .fixed(40),
+                    .background_color = paint,
+                    .rotate = turn,
+                });
+                leaf(u, "after", .{ .width = .fixed(40), .height = .fixed(40) });
+            }
+            u.close();
+            return try u.end();
+        }
+    }.run;
+
+    _ = try frame(&ui, null);
+    const straight = ui.boxOf("badge").?;
+    const beside = ui.boxOf("after").?;
+
+    const drawn = try frame(&ui, .degrees(90));
+
+    // Same boxes, both of them: a badge tilted on the page must not reflow
+    // the page.
+    try testing.expectEqual(straight, ui.boxOf("badge").?);
+    try testing.expectEqual(beside, ui.boxOf("after").?);
+
+    // But the command says where it really went. A quarter turn about the
+    // middle of a square puts its top left corner at the top right.
+    const motion = motionIn(drawn, "badge").?;
+    const corner = motion.apply(.{ .x = 0, .y = 0 });
+    try testing.expectApproxEqAbs(@as(f32, 40), corner.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), corner.y, 0.001);
+
+    // And its neighbour is not turned at all.
+    try testing.expect(motionIn(drawn, "after").?.isIdentity());
+}
+
+test "a turn on an element carries everything inside it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "card",
+            .width = .fixed(100),
+            .height = .fixed(100),
+            .background_color = paint,
+            .rotate = .degrees(180),
+        });
+        defer ui.close();
+        leaf(&ui, "inside", .{ .width = .fixed(20), .height = .fixed(20) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // Half a turn about the middle of the card sends its top left corner to
+    // the bottom right, and takes the child with it.
+    const child = motionIn(drawn, "inside").?;
+    const at = child.apply(.{ .x = 0, .y = 0 });
+    try testing.expectApproxEqAbs(@as(f32, 100), at.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 100), at.y, 0.001);
+}
+
+test "a shape turn stops at the element's own box" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "card",
+            .width = .fixed(100),
+            .height = .fixed(100),
+            .background_color = paint,
+            .rotate_shape = .degrees(180),
+        });
+        defer ui.close();
+        leaf(&ui, "inside", .{ .width = .fixed(20), .height = .fixed(20) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // The card's own fill is turned...
+    try testing.expect(!motionIn(drawn, "card").?.isIdentity());
+    // ...and the child is where it was, which is the whole difference between
+    // this and `rotate`.
+    try testing.expect(motionIn(drawn, "inside").?.isIdentity());
+}
+
+test "turns nest" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "card",
+            .width = .fixed(100),
+            .height = .fixed(100),
+            .rotate = .degrees(90),
+        });
+        defer ui.close();
+        ui.empty(.{
+            .id = "icon",
+            .width = .fixed(20),
+            .height = .fixed(20),
+            .background_color = paint,
+            .rotate = .degrees(90),
+        });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // A quarter turn inside a quarter turn is a half turn about the icon's
+    // own middle, moved by the card's turn - which is what composing means
+    // and is why a transform is two axes rather than an angle.
+    const icon = motionIn(drawn, "icon").?;
+    const middle = icon.apply(.{ .x = 10, .y = 10 });
+    // The icon's middle only moves by the card's turn: (10,10) about (50,50)
+    // a quarter clockwise is (90,10).
+    try testing.expectApproxEqAbs(@as(f32, 90), middle.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 10), middle.y, 0.001);
+
+    // And a corner ends up half a turn from where the card alone would put it.
+    const corner = icon.apply(.{ .x = 0, .y = 0 });
+    try testing.expectApproxEqAbs(@as(f32, 100), corner.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 20), corner.y, 0.001);
+}
+
+test "the pointer finds a turned element where it was drawn" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            // A tall thin box turned a quarter, so it lies across the page.
+            u.empty(.{
+                .id = "bar",
+                .width = .fixed(20),
+                .height = .fixed(200),
+                .background_color = paint,
+                .rotate = .degrees(90),
+            });
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+    // The box is at (0,0,20,200) and turns about its middle (10,100), so it
+    // ends up lying from (-90,90) to (110,110).
+    ui.setPointer(100, 100, false);
+    try frame(&ui);
+    try testing.expect(ui.isPointerOver("bar"));
+
+    // Where the *unturned* box was, there is nothing.
+    ui.setPointer(10, 190, false);
+    try frame(&ui);
+    try testing.expect(!ui.isPointerOver("bar"));
+}
+
+test "a flip mirrors without moving the box" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    ui.empty(.{
+        .id = "mirror",
+        .width = .fixed(100),
+        .height = .fixed(40),
+        .background_color = paint,
+        .rotate = .{ .flip_x = true },
+    });
+    ui.close();
+    const drawn = try ui.end();
+
+    const motion = motionIn(drawn, "mirror").?;
+    // The left edge becomes the right edge and the other way about.
+    try testing.expectApproxEqAbs(@as(f32, 100), motion.apply(.{ .x = 0, .y = 0 }).x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0), motion.apply(.{ .x = 100, .y = 0 }).x, 0.001);
+    // And nothing moved vertically.
+    try testing.expectApproxEqAbs(@as(f32, 7), motion.apply(.{ .x = 0, .y = 7 }).y, 0.001);
+}
+
+test "a turn of nothing is not a turn" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    ui.empty(.{
+        .id = "still",
+        .width = .fixed(10),
+        .height = .fixed(10),
+        .background_color = paint,
+        .rotate = .{ .radians = 0 },
+    });
+    ui.close();
+    const drawn = try ui.end();
+
+    // Worth checking rather than assuming: an interface that sets a rotation
+    // to zero should cost exactly what one that sets none costs.
+    try testing.expect(motionIn(drawn, "still").?.isIdentity());
+}
+
+test "text inside a turned element is turned with it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "label", .width = .fit, .height = .fit, .rotate = .degrees(45) });
+        defer ui.close();
+        ui.text("tilted", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // The run belongs to a text element of its own, so look for any text
+    // command and check it carries the card's motion.
+    for (drawn) |command| {
+        if (std.meta.activeTag(command.config) != .text) continue;
+        try testing.expect(!command.transform.isIdentity());
+        return;
+    }
+    try testing.expect(false);
 }
