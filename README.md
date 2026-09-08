@@ -385,6 +385,27 @@ pictures, and there is no scaling one into the other that does not look wrong.
 Both dependencies are lazy. A program that only lays out, or that brings its
 own renderer, fetches neither.
 
+**Both backends are proved on a GPU.** The shader is written twice - GLSL for
+OpenGL, HLSL for Direct3D - and a pair written side by side where only one of
+them is ever run is a trap: a semantic that does not match, a constant buffer
+packed differently, a `float2` where a `float4` was expected. None of those is
+an error anywhere; all of them are a blank window. So there are two tests, one
+per backend, each rendering a frame into a texture and reading the pixels back.
+
+They draw an orange square rather than a white one, on purpose: white is the
+same number in every channel and would pass just as happily out of a backend
+that handed the bytes back as BGRA. Orange does not, so the two backends are
+held to the same channel order as well as the same picture.
+
+The Direct3D test needs no window at all - a device is made without one - so
+it runs anywhere Windows does. The OpenGL one opens a hidden window and skips
+where there is no display.
+
+```bash
+zig build example-window                     # OpenGL
+zig build example-window -- --backend d3d11  # Direct3D 11
+```
+
 ## Colour
 
 Four floats from zero to one, which is what a GPU takes. Ply keeps the same

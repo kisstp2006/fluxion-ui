@@ -932,3 +932,80 @@ test "a frame with more boxes than the buffer holds grows it" {
     try testing.expect(fixture.renderer.instance_capacity > before);
     try testing.expectEqual(before + 100, fixture.renderer.instances.items.len);
 }
+
+test "the Direct3D shaders compile and the frame reaches the pixels" {
+    // The other half of the shader pair. The OpenGL one is proved by
+    // `examples/window.zig`, which needs a display; this one needs no window
+    // at all - a Direct3D device is made without one, and the frame goes into
+    // a texture that is read straight back.
+    //
+    // Worth its own test because HLSL and GLSL are written side by side and
+    // only one of them was ever run. A semantic that does not match, a
+    // constant buffer packed differently, a `float2` where a `float4` was
+    // expected: all of them produce a blank window and none of them produce
+    // an error anywhere else.
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .backend = .d3d11 }) catch
+        return error.SkipZigTest;
+    defer device.deinit();
+
+    // Said out loud, because a test that quietly ran on another backend
+    // would prove exactly nothing about the HLSL it was written for.
+    try testing.expectEqual(rhi.Backend.d3d11, device.backendTag());
+
+    const target = try device.createTexture(.{
+        .width = 128,
+        .height = 128,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    var face: font.Font = try .init(bytes);
+    var renderer: Renderer = try .init(testing.allocator, &device, &face);
+    defer renderer.deinit();
+
+    const size: ui.Dimensions = .init(128, 128);
+
+    var layout: ui.Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(.monospace(0.5, 1.0));
+
+    layout.begin(size);
+    {
+        layout.open(.{ .width = .grow, .height = .grow, .padding = .all(24) });
+        defer layout.close();
+        // Orange rather than white. White is the same number in every
+        // channel, so it would pass just as happily out of a backend that
+        // handed the bytes back as BGRA - and the two backends disagreeing
+        // about that is exactly the kind of thing this test is for.
+        layout.empty(.{ .width = .grow, .height = .grow, .background_color = .hex(0xFF8000) });
+    }
+    const commands = try layout.end();
+
+    try renderer.draw(.{ .texture = target }, size, commands, .black);
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+
+    const channel = struct {
+        fn at(data: []const u8, x: usize, y: usize, index: usize) u8 {
+            return data[(y * 128 + x) * 4 + index];
+        }
+    }.at;
+
+    // In the middle: the square, and in the order the format promised.
+    try testing.expect(channel(pixels, 64, 64, 0) > 200);
+    try testing.expectApproxEqAbs(128, @as(f32, @floatFromInt(channel(pixels, 64, 64, 1))), 8);
+    try testing.expect(channel(pixels, 64, 64, 2) < 50);
+
+    // In the corners: the clear colour. Both wrong means the shader did not
+    // run; one wrong means it ran upside down or at the wrong scale.
+    try testing.expect(channel(pixels, 2, 2, 0) < 50);
+    try testing.expect(channel(pixels, 126, 126, 0) < 50);
+
+    // And the edge is where the padding put it.
+    try testing.expect(channel(pixels, 30, 64, 0) > 200);
+    try testing.expect(channel(pixels, 10, 64, 0) < 50);
+}

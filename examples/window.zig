@@ -5,6 +5,7 @@
 //!
 //! ```bash
 //! zig build example-window
+//! zig build example-window -- --backend d3d11
 //! zig build example-window -- --frames 120
 //! ```
 //!
@@ -237,7 +238,11 @@ const Window = struct {
         win: platform.Window,
     };
 
-    fn open(width: u32, height: u32, visible: bool) !Window {
+    /// `gl` decides whether the window comes with an OpenGL context, and it
+    /// has to be decided here: no platform lets a window change its mind
+    /// afterwards. A Direct3D window wants no context at all - the device is
+    /// made from the window handle instead.
+    fn open(width: u32, height: u32, visible: bool, gl: bool) !Window {
         const gpa = std.heap.smp_allocator;
 
         const inner = try gpa.create(Inner);
@@ -251,12 +256,14 @@ const Window = struct {
             .width = width,
             .height = height,
             .visible = visible,
-            .gl = .{ .major = 3, .minor = 3, .profile = .core },
+            .gl = if (gl) .{ .major = 3, .minor = 3, .profile = .core } else null,
         });
         errdefer inner.win.destroy();
 
-        try inner.win.makeContextCurrent();
-        inner.win.setSwapInterval(.vsync) catch {};
+        if (gl) {
+            try inner.win.makeContextCurrent();
+            inner.win.setSwapInterval(.vsync) catch {};
+        }
 
         return .{ .inner = inner };
     }
@@ -323,6 +330,12 @@ const Window = struct {
         return self.down;
     }
 
+    /// The platform's own handle - an `HWND` on Windows - which is what the
+    /// Direct3D backend makes a swapchain from.
+    fn nativeHandle(self: Window) usize {
+        return self.inner.win.native();
+    }
+
     /// What the OpenGL backend needs from whoever made the context, which is
     /// never the renderer: four callbacks onto this window.
     fn hooks(self: Window) rhi.GlHooks {
@@ -355,11 +368,15 @@ pub fn main(init: std.process.Init) !void {
 
     const arguments = try init.minimal.args.toSlice(gpa);
     var frames: ?u32 = null;
+    var backend: rhi.Backend = .gl;
     var i: usize = 1;
     while (i < arguments.len) : (i += 1) {
         if (std.mem.eql(u8, arguments[i], "--frames") and i + 1 < arguments.len) {
             i += 1;
             frames = std.fmt.parseInt(u32, arguments[i], 10) catch null;
+        } else if (std.mem.eql(u8, arguments[i], "--backend") and i + 1 < arguments.len) {
+            i += 1;
+            backend = if (std.mem.eql(u8, arguments[i], "d3d11")) .d3d11 else .gl;
         }
     }
 
@@ -367,19 +384,33 @@ pub fn main(init: std.process.Init) !void {
     var stdout: std.Io.File.Writer = .init(.stdout(), init.io, &out_buffer);
     const w = &stdout.interface;
 
-    var window = Window.open(1100, 680, true) catch |err| {
+    var window = Window.open(1100, 680, true, backend == .gl) catch |err| {
         try w.print("no window: {s}\n", .{@errorName(err)});
         try w.flush();
         return;
     };
     defer window.close();
 
-    var device: rhi.Device = try .init(gpa, .{ .gl = window.hooks() });
+    var device: rhi.Device = try .init(gpa, .{
+        .backend = switch (backend) {
+            .gl => .gl,
+            .d3d11 => .d3d11,
+            else => .auto,
+        },
+        // Only the OpenGL backend wants the context; Direct3D makes its own
+        // device and takes the window handle at surface time instead.
+        .gl = if (backend == .gl) window.hooks() else null,
+    });
     defer device.deinit();
     try w.print("{f}\n", .{device.info()});
     try w.flush();
 
-    const surface = try device.createSurface(.{});
+    const size_now = window.size();
+    const surface = try device.createSurface(.{
+        .native_window = window.nativeHandle(),
+        .width = @intFromFloat(size_now.width),
+        .height = @intFromFloat(size_now.height),
+    });
     defer device.destroySurface(surface);
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, defaultFont(), gpa, .limited(32 << 20));
@@ -461,7 +492,7 @@ test "the shaders compile and the frame reaches the pixels" {
     const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
 
-    var window = Window.open(64, 64, false) catch |err|
+    var window = Window.open(64, 64, false, true) catch |err|
         if (Window.isAbsent(err)) return error.SkipZigTest else return err;
     defer window.close();
 
@@ -491,8 +522,11 @@ test "the shaders compile and the frame reaches the pixels" {
     {
         layout.open(.{ .width = .grow, .height = .grow, .padding = .all(24) });
         defer layout.close();
-        // One white square in the middle of a black frame.
-        layout.empty(.{ .width = .grow, .height = .grow, .background_color = .white });
+        // Orange, and not white: white is the same number in every channel,
+        // so it would pass out of a backend that handed the bytes back in a
+        // different order. The Direct3D test beside this one checks the same
+        // colour, which is what makes the two comparable.
+        layout.empty(.{ .width = .grow, .height = .grow, .background_color = .hex(0xFF8000) });
     }
     const commands = try layout.end();
 
@@ -502,29 +536,32 @@ test "the shaders compile and the frame reaches the pixels" {
     defer testing.allocator.free(pixels);
     try testing.expectEqual(128 * 128 * 4, pixels.len);
 
-    const at = struct {
-        fn red(data: []const u8, x: usize, y: usize) u8 {
-            return data[(y * 128 + x) * 4];
+    const channel = struct {
+        fn at(data: []const u8, x: usize, y: usize, index: usize) u8 {
+            return data[(y * 128 + x) * 4 + index];
         }
-    }.red;
+    }.at;
 
-    // The middle is the white square and the corner is the clear colour.
-    // Both wrong means the shader did not run; one wrong means it ran upside
-    // down or at the wrong scale.
-    try testing.expect(at(pixels, 64, 64) > 200);
-    try testing.expect(at(pixels, 2, 2) < 50);
-    try testing.expect(at(pixels, 126, 126) < 50);
+    // The middle is the square, in the order the format promised.
+    try testing.expect(channel(pixels, 64, 64, 0) > 200);
+    try testing.expectApproxEqAbs(128, @as(f32, @floatFromInt(channel(pixels, 64, 64, 1))), 8);
+    try testing.expect(channel(pixels, 64, 64, 2) < 50);
+
+    // The corners are the clear colour. Both wrong means the shader did not
+    // run; one wrong means it ran upside down or at the wrong scale.
+    try testing.expect(channel(pixels, 2, 2, 0) < 50);
+    try testing.expect(channel(pixels, 126, 126, 0) < 50);
 
     // And the edge of the square is where the padding put it.
-    try testing.expect(at(pixels, 30, 64) > 200);
-    try testing.expect(at(pixels, 10, 64) < 50);
+    try testing.expect(channel(pixels, 30, 64, 0) > 200);
+    try testing.expect(channel(pixels, 10, 64, 0) < 50);
 }
 
 test "text reaches the pixels too" {
     const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
 
-    var window = Window.open(64, 64, false) catch |err|
+    var window = Window.open(64, 64, false, true) catch |err|
         if (Window.isAbsent(err)) return error.SkipZigTest else return err;
     defer window.close();
 
