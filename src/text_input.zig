@@ -35,6 +35,7 @@ const testing = std.testing;
 const Color = @import("color.zig").Color;
 const geometry = @import("geometry.zig");
 const layout = @import("layout.zig");
+const markup = @import("markup.zig");
 const text_mod = @import("text.zig");
 
 const Vec2 = geometry.Vec2;
@@ -70,6 +71,14 @@ pub const Config = struct {
     /// Whether dragging inside the box selects text. Off means a drag
     /// scrolls, which is what a touch screen wants.
     drag_select: bool = false,
+    /// Whether the text is markup: `{color=red|edited like this}`.
+    ///
+    /// The cursor still moves through the characters the reader sees - the
+    /// tags are not in their way - and what a program reads back is the
+    /// string with the tags in. Typing one of the four syntax characters
+    /// stores it escaped, so a brace is a brace and not the start of a tag.
+    /// See `markup`.
+    markup: bool = false,
 
     font_size: u16 = 16,
     text_color: Color = .white,
@@ -591,6 +600,28 @@ pub const TextEdit = struct {
     undo_stack: std.ArrayList(Undone) = .empty,
     redo_stack: std.ArrayList(Undone) = .empty,
 
+    /// Whether `text` is markup. See `Config.markup`.
+    markup: bool = false,
+    /// The text with the tags taken out - what the reader sees, and what
+    /// every position in this type is an offset into.
+    ///
+    /// Ply solves this the other way: its cursor is a character index into
+    /// the stripped text and every one of its editing methods has a second
+    /// `_styled` copy that converts on the way in and out, which is about a
+    /// thousand lines. Keeping the stripped text beside the raw one instead
+    /// means the movement, the selection and the word boundaries are the same
+    /// code for both kinds of field, and only the two places that actually
+    /// change the string have anything to say about markup.
+    ///
+    /// Rebuilt from `text` after every edit. Empty when this is not a markup
+    /// field, and `shown` is what to read either way.
+    visible: std.ArrayList(u8) = .empty,
+    /// Where each byte of `visible` came from in `text`, which is what turns
+    /// an edit the reader made into an edit of the string.
+    marks: std.ArrayList(markup.Mark) = .empty,
+    /// How `visible` is coloured, for the drawing.
+    spans: std.ArrayList(markup.Span) = .empty,
+
     /// What the last declaration said.
     ///
     /// Kept here rather than looked up, because an action arrives *between*
@@ -644,6 +675,9 @@ pub const TextEdit = struct {
 
     pub fn deinit(self: *TextEdit, gpa: std.mem.Allocator) void {
         self.text.deinit(gpa);
+        self.visible.deinit(gpa);
+        self.marks.deinit(gpa);
+        self.spans.deinit(gpa);
         for (self.undo_stack.items) |*entry| entry.deinit(gpa);
         self.undo_stack.deinit(gpa);
         for (self.redo_stack.items) |*entry| entry.deinit(gpa);
@@ -651,8 +685,118 @@ pub const TextEdit = struct {
         self.* = undefined;
     }
 
+    /// The string as it is stored, tags and all. What a program reads back.
     pub inline fn value(self: TextEdit) []const u8 {
         return self.text.items;
+    }
+
+    /// The text as the reader sees it, which is the same string unless this
+    /// is a markup field.
+    ///
+    /// **Every position in this type is an offset into this** - the cursor,
+    /// the anchor, a selection, the answer a click gives. The reader points
+    /// at what they can see.
+    pub inline fn shown(self: TextEdit) []const u8 {
+        return if (self.markup) self.visible.items else self.text.items;
+    }
+
+    /// Put the raw string and the view of it back in agreement.
+    ///
+    /// Called after everything that changes the text. Does nothing at all to
+    /// a plain field, which is why the cost of markup is paid only by the
+    /// fields that asked for it.
+    ///
+    /// `visible` is scratch for the compaction on the way through, which is
+    /// safe because the next thing that happens to it is being rebuilt from
+    /// the result - and it saves a buffer per text input.
+    pub fn settle(self: *TextEdit, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (!self.markup) return;
+
+        self.visible.clearRetainingCapacity();
+        const tidied = try markup.compact(&self.visible, gpa, self.text.items);
+        if (tidied.len != self.text.items.len) {
+            self.text.clearRetainingCapacity();
+            try self.text.appendSlice(gpa, tidied);
+        }
+
+        self.visible.clearRetainingCapacity();
+        self.marks.clearRetainingCapacity();
+        self.spans.clearRetainingCapacity();
+        _ = try markup.parse(&self.visible, &self.spans, &self.marks, gpa, self.text.items);
+    }
+
+    /// Where in the raw string an insertion at this visible offset belongs.
+    ///
+    /// Just after the byte to its left, so typing at the edge of a style
+    /// carries on in that style - which is what a word processor does, and it
+    /// is the one thing a single cursor position has to choose. Ply gives the
+    /// cursor an extra position for every closing brace so it can be on
+    /// either side of one; that buys the choice at the price of a right arrow
+    /// that sometimes does not appear to move, and this does not.
+    ///
+    /// What it costs: text that ends inside a style has no position outside
+    /// it, so typing at the end goes on being red. Continuing a style while
+    /// writing is wanted far more often than escaping one.
+    fn rawInsertAt(self: TextEdit, at: usize) usize {
+        if (!self.markup) return at;
+        if (self.marks.items.len == 0) return self.text.items.len;
+        if (at == 0) return self.marks.items[0].start;
+        const before = @min(at, self.marks.items.len);
+        return self.marks.items[before - 1].end;
+    }
+
+    /// The stretch of the raw string a visible range stands for.
+    fn rawSpan(self: TextEdit, from: usize, to: usize) markup.Range {
+        if (!self.markup) return .{ .start = from, .end = to };
+        if (from >= to or from >= self.marks.items.len) return .{ .start = 0, .end = 0 };
+        const last = @min(to, self.marks.items.len);
+        return .{
+            .start = self.marks.items[from].start,
+            .end = self.marks.items[last - 1].end,
+        };
+    }
+
+    /// Take a stretch of what the reader sees out of the string.
+    ///
+    /// One of the two places markup is anybody's business. Everything above
+    /// it works in visible offsets and does not care.
+    fn removeVisible(
+        self: *TextEdit,
+        gpa: std.mem.Allocator,
+        from: usize,
+        to: usize,
+    ) std.mem.Allocator.Error!void {
+        if (from >= to) return;
+        const raw = self.rawSpan(from, to);
+        if (raw.end <= raw.start) return;
+
+        self.text.replaceRange(undefined, raw.start, raw.end - raw.start, "") catch unreachable;
+        try self.settle(gpa);
+        self.revision +%= 1;
+    }
+
+    /// Put text in where the reader is pointing. The other of the two.
+    fn insertVisible(
+        self: *TextEdit,
+        gpa: std.mem.Allocator,
+        at: usize,
+        run: []const u8,
+    ) std.mem.Allocator.Error!void {
+        if (run.len == 0) return;
+        const where = self.rawInsertAt(at);
+
+        if (self.markup) {
+            // Escaped on the way in, or typing a brace would open a tag. The
+            // reader typed a brace and should get a brace.
+            self.visible.clearRetainingCapacity();
+            const escaped = try markup.escape(&self.visible, gpa, run);
+            try self.text.insertSlice(gpa, where, escaped);
+        } else {
+            try self.text.insertSlice(gpa, where, run);
+        }
+
+        try self.settle(gpa);
+        self.revision +%= 1;
     }
 
     // -- selection --
@@ -671,21 +815,20 @@ pub const TextEdit = struct {
     /// is only good until the next edit.
     pub fn selected(self: TextEdit) []const u8 {
         const range = self.selection() orelse return "";
-        return self.text.items[range.start..range.end];
+        return self.shown()[range.start..range.end];
     }
 
     /// Remove the selection and put the cursor where it started. True when
     /// there was one.
-    pub fn deleteSelection(self: *TextEdit) bool {
+    pub fn deleteSelection(self: *TextEdit, gpa: std.mem.Allocator) std.mem.Allocator.Error!bool {
         const range = self.selection() orelse return false;
         if (range.empty()) {
             self.anchor = null;
             return false;
         }
-        self.text.replaceRange(undefined, range.start, range.end - range.start, "") catch unreachable;
+        try self.removeVisible(gpa, range.start, range.end);
         self.cursor = range.start;
         self.anchor = null;
-        self.revision +%= 1;
         return true;
     }
 
@@ -703,11 +846,11 @@ pub const TextEdit = struct {
         run: []const u8,
         max_length: ?usize,
     ) std.mem.Allocator.Error!void {
-        _ = self.deleteSelection();
+        _ = try self.deleteSelection(gpa);
 
         var run_to_insert = run;
         if (max_length) |max| {
-            const have = characters(self.text.items);
+            const have = characters(self.shown());
             if (have >= max) return;
             const room = max - have;
 
@@ -718,56 +861,51 @@ pub const TextEdit = struct {
         }
         if (run_to_insert.len == 0) return;
 
-        try self.text.insertSlice(gpa, self.cursor, run_to_insert);
+        try self.insertVisible(gpa, self.cursor, run_to_insert);
         self.cursor += run_to_insert.len;
-        self.revision +%= 1;
         self.resetBlink();
     }
 
     /// Delete the character before the cursor, or the selection.
-    pub fn backspace(self: *TextEdit) void {
+    pub fn backspace(self: *TextEdit, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
         defer self.resetBlink();
-        if (self.deleteSelection()) return;
+        if (try self.deleteSelection(gpa)) return;
         if (self.cursor == 0) return;
 
-        const from = previous(self.text.items, self.cursor);
-        self.text.replaceRange(undefined, from, self.cursor - from, "") catch unreachable;
+        const from = previous(self.shown(), self.cursor);
+        try self.removeVisible(gpa, from, self.cursor);
         self.cursor = from;
-        self.revision +%= 1;
     }
 
     /// Delete the character after the cursor, or the selection.
-    pub fn deleteForward(self: *TextEdit) void {
+    pub fn deleteForward(self: *TextEdit, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
         defer self.resetBlink();
-        if (self.deleteSelection()) return;
-        if (self.cursor >= self.text.items.len) return;
+        if (try self.deleteSelection(gpa)) return;
+        if (self.cursor >= self.shown().len) return;
 
-        const to = next(self.text.items, self.cursor);
-        self.text.replaceRange(undefined, self.cursor, to - self.cursor, "") catch unreachable;
-        self.revision +%= 1;
+        const to = next(self.shown(), self.cursor);
+        try self.removeVisible(gpa, self.cursor, to);
     }
 
     /// Delete back to the start of the word, or the selection.
-    pub fn backspaceWord(self: *TextEdit) void {
+    pub fn backspaceWord(self: *TextEdit, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
         defer self.resetBlink();
-        if (self.deleteSelection()) return;
+        if (try self.deleteSelection(gpa)) return;
 
-        const from = wordLeft(self.text.items, self.cursor);
+        const from = wordLeft(self.shown(), self.cursor);
         if (from == self.cursor) return;
-        self.text.replaceRange(undefined, from, self.cursor - from, "") catch unreachable;
+        try self.removeVisible(gpa, from, self.cursor);
         self.cursor = from;
-        self.revision +%= 1;
     }
 
     /// Delete forward over the word and the space after it, or the selection.
-    pub fn deleteWordForward(self: *TextEdit) void {
+    pub fn deleteWordForward(self: *TextEdit, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
         defer self.resetBlink();
-        if (self.deleteSelection()) return;
+        if (try self.deleteSelection(gpa)) return;
 
-        const to = wordDeleteRight(self.text.items, self.cursor);
+        const to = wordDeleteRight(self.shown(), self.cursor);
         if (to == self.cursor) return;
-        self.text.replaceRange(undefined, self.cursor, to - self.cursor, "") catch unreachable;
-        self.revision +%= 1;
+        try self.removeVisible(gpa, self.cursor, to);
     }
 
     // -- movement --
@@ -792,7 +930,7 @@ pub const TextEdit = struct {
 
     /// Apply a movement. The switch is the whole of Ply's fifteen methods.
     pub fn move(self: *TextEdit, motion: Move) void {
-        const body = self.text.items;
+        const body = self.shown();
 
         // Up and down keep the column they started from; everything else
         // gives it up, so a left arrow between two ups does what it looks
@@ -872,9 +1010,9 @@ pub const TextEdit = struct {
     /// Select everything. Does nothing to an empty input, so Ctrl+A in an
     /// empty box does not leave an anchor behind.
     pub fn selectAll(self: *TextEdit) void {
-        if (self.text.items.len > 0) {
+        if (self.shown().len > 0) {
             self.anchor = 0;
-            self.cursor = self.text.items.len;
+            self.cursor = self.shown().len;
         }
         self.resetBlink();
     }
@@ -882,12 +1020,12 @@ pub const TextEdit = struct {
     /// Put the cursor at an offset a click resolved to.
     pub fn clickTo(self: *TextEdit, offset: usize, select: bool) void {
         self.preferred_column = null;
-        self.moveTo(@min(offset, self.text.items.len), select);
+        self.moveTo(@min(offset, self.shown().len), select);
     }
 
     /// Select the word at an offset. What a double click does.
     pub fn selectWordAt(self: *TextEdit, offset: usize) void {
-        const word = wordAt(self.text.items, offset);
+        const word = wordAt(self.shown(), offset);
         if (!word.empty()) {
             self.anchor = word.start;
             self.cursor = word.end;
@@ -1004,9 +1142,10 @@ pub const TextEdit = struct {
 
         self.text.clearRetainingCapacity();
         try self.text.appendSlice(gpa, entry.text);
+        try self.settle(gpa);
         self.revision +%= 1;
-        self.cursor = @min(entry.cursor, self.text.items.len);
-        self.anchor = if (entry.anchor) |anchor| @min(anchor, self.text.items.len) else null;
+        self.cursor = @min(entry.cursor, self.shown().len);
+        self.anchor = if (entry.anchor) |anchor| @min(anchor, self.shown().len) else null;
         entry.deinit(gpa);
 
         self.resetBlink();
@@ -1023,8 +1162,9 @@ pub const TextEdit = struct {
     pub fn setValue(self: *TextEdit, gpa: std.mem.Allocator, run: []const u8) std.mem.Allocator.Error!void {
         self.text.clearRetainingCapacity();
         try self.text.appendSlice(gpa, run);
+        try self.settle(gpa);
         self.revision +%= 1;
-        self.cursor = @min(self.cursor, self.text.items.len);
+        self.cursor = @min(self.cursor, self.shown().len);
         self.anchor = null;
         self.preferred_column = null;
         self.resetBlink();
@@ -1219,14 +1359,14 @@ test "backspace and delete step by character" {
     var state = try edit(testing.allocator, "tűz");
     defer state.deinit(testing.allocator);
 
-    state.backspace();
+    try state.backspace(testing.allocator);
     try testing.expectEqualStrings("tű", state.value());
     // One backspace took the whole two-byte "ű", not half of it.
-    state.backspace();
+    try state.backspace(testing.allocator);
     try testing.expectEqualStrings("t", state.value());
 
     state.cursor = 0;
-    state.deleteForward();
+    try state.deleteForward(testing.allocator);
     try testing.expectEqualStrings("", state.value());
 }
 
@@ -1351,13 +1491,13 @@ test "deleting a word forward takes the space after it" {
     defer state.deinit(testing.allocator);
     state.cursor = 0;
 
-    state.deleteWordForward();
+    try state.deleteWordForward(testing.allocator);
     try testing.expectEqualStrings("two three", state.value());
 
     // And backwards does not, because the space is behind the cursor either
     // way and taking it would eat the previous word's edge.
     state.cursor = state.value().len;
-    state.backspaceWord();
+    try state.backspaceWord(testing.allocator);
     try testing.expectEqualStrings("two ", state.value());
 }
 
@@ -1574,4 +1714,203 @@ test "setting the value from the program clamps the cursor" {
     try testing.expectEqualStrings("hi", state.value());
     try testing.expectEqual(@as(usize, 2), state.cursor);
     try testing.expect(state.anchor == null);
+}
+
+// -------------------------------------------------------------------------
+// Editing markup
+// -------------------------------------------------------------------------
+
+// A markup field holds the string with the tags in and shows the reader the
+// string without them. Every position below is an offset into what they see,
+// which is the whole point: the tags are not in their way.
+
+/// A markup `TextEdit` holding this raw string, cursor at the end.
+fn styled(gpa: std.mem.Allocator, raw: []const u8) !TextEdit {
+    var state: TextEdit = .empty;
+    state.markup = true;
+    try state.text.appendSlice(gpa, raw);
+    try state.settle(gpa);
+    state.cursor = state.shown().len;
+    return state;
+}
+
+test "the cursor moves through the text, not through the tags" {
+    var state = try styled(testing.allocator, "a{color=red|bc}d");
+    defer state.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("abcd", state.shown());
+    try testing.expectEqualStrings("a{color=red|bc}d", state.value());
+    try testing.expectEqual(@as(usize, 4), state.cursor);
+
+    // Four characters, four steps - the eleven bytes of tag are not stops
+    // along the way.
+    var steps: usize = 0;
+    while (state.cursor > 0) : (steps += 1) state.move(.{ .to = .left });
+    try testing.expectEqual(@as(usize, 4), steps);
+}
+
+test "typing inside a style stays in it" {
+    var state = try styled(testing.allocator, "a{color=red|bc}d");
+    defer state.deinit(testing.allocator);
+
+    // Between b and c.
+    state.cursor = 2;
+    try state.insert(testing.allocator, "X", null);
+    try testing.expectEqualStrings("a{color=red|bXc}d", state.value());
+    try testing.expectEqualStrings("abXcd", state.shown());
+    try testing.expectEqual(@as(usize, 3), state.cursor);
+}
+
+test "typing at the end of a style carries on in it" {
+    // The one thing a single cursor position has to choose, and it inherits
+    // from the left as a word processor does. Ply has an extra position for
+    // every closing brace so it can be on either side.
+    var state = try styled(testing.allocator, "{color=red|ab}c");
+    defer state.deinit(testing.allocator);
+
+    state.cursor = 2; // between b and c
+    try state.insert(testing.allocator, "X", null);
+    try testing.expectEqualStrings("{color=red|abX}c", state.value());
+}
+
+test "a style at the end of the text goes on being typed in" {
+    // The other half of inheriting from the left, and the price of it: text
+    // that ends inside a style has no cursor position outside that style, so
+    // carrying on typing carries on red. Continuing a style while writing is
+    // wanted far more often than escaping one, and escaping is what choosing
+    // a different style is for - which is a thing to add, not a reason to
+    // give the cursor two places to be.
+    var state = try styled(testing.allocator, "{color=red|ab}");
+    defer state.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), state.cursor);
+    try state.insert(testing.allocator, "X", null);
+    try testing.expectEqualStrings("{color=red|abX}", state.value());
+
+    // Where the text ends outside one, it stays outside.
+    var after = try styled(testing.allocator, "{color=red|ab}c");
+    defer after.deinit(testing.allocator);
+    try after.insert(testing.allocator, "X", null);
+    try testing.expectEqualStrings("{color=red|ab}cX", after.value());
+}
+
+test "typing a brace types a brace" {
+    var state = try styled(testing.allocator, "");
+    defer state.deinit(testing.allocator);
+
+    try state.insert(testing.allocator, "{color=red|", null);
+    // Stored escaped, so it is text and not the start of a tag.
+    try testing.expectEqualStrings("\\{color=red\\|", state.value());
+    try testing.expectEqualStrings("{color=red|", state.shown());
+}
+
+test "backspace over an escaped character takes its backslash too" {
+    var state = try styled(testing.allocator, "a\\{b");
+    defer state.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("a{b", state.shown());
+    state.cursor = 2; // after the brace
+    try state.backspace(testing.allocator);
+
+    try testing.expectEqualStrings("ab", state.shown());
+    // And not "a\b", which is what deleting one raw byte would leave.
+    try testing.expectEqualStrings("ab", state.value());
+}
+
+test "deleting a whole styled run takes the tag with it" {
+    var state = try styled(testing.allocator, "a{color=red|bc}d");
+    defer state.deinit(testing.allocator);
+
+    state.anchor = 1;
+    state.cursor = 3;
+    try testing.expectEqualStrings("bc", state.selected());
+    try testing.expect(try state.deleteSelection(testing.allocator));
+
+    // The tag had nothing left in it, so it is gone rather than left behind
+    // as a ghost for the next edit to fall into.
+    try testing.expectEqualStrings("ad", state.value());
+    try testing.expectEqualStrings("ad", state.shown());
+}
+
+test "a selection that spans a tag boundary deletes cleanly" {
+    var state = try styled(testing.allocator, "ab{color=red|cd}ef");
+    defer state.deinit(testing.allocator);
+
+    state.anchor = 1;
+    state.cursor = 5;
+    try testing.expectEqualStrings("bcde", state.selected());
+    try testing.expect(try state.deleteSelection(testing.allocator));
+
+    try testing.expectEqualStrings("af", state.shown());
+    try testing.expectEqualStrings("af", state.value());
+}
+
+test "word movement and selection work on what the reader sees" {
+    var state = try styled(testing.allocator, "one {color=red|two} three");
+    defer state.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("one two three", state.shown());
+
+    state.cursor = 0;
+    state.move(.{ .to = .word_right });
+    try testing.expectEqual(@as(usize, 3), state.cursor);
+    state.move(.{ .to = .word_right });
+    try testing.expectEqual(@as(usize, 7), state.cursor);
+
+    // A double click in the middle of the styled word selects the word, not
+    // the tag around it.
+    state.selectWordAt(5);
+    try testing.expectEqualStrings("two", state.selected());
+}
+
+test "undo puts the tags back as they were" {
+    var state = try styled(testing.allocator, "{color=red|abc}");
+    defer state.deinit(testing.allocator);
+    const gpa = testing.allocator;
+
+    state.anchor = 0;
+    state.cursor = 3;
+    try state.pushUndo(gpa, .cut);
+    _ = try state.deleteSelection(gpa);
+    try testing.expectEqualStrings("", state.value());
+
+    try testing.expect(try state.undo(gpa));
+    try testing.expectEqualStrings("{color=red|abc}", state.value());
+    try testing.expectEqualStrings("abc", state.shown());
+}
+
+test "the colours a field draws come out of its own text" {
+    var state = try styled(testing.allocator, "a{color=red|bc}d");
+    defer state.deinit(testing.allocator);
+
+    // Three spans over "abcd", and only the middle one is coloured.
+    try testing.expectEqual(@as(usize, 3), state.spans.items.len);
+    try testing.expect(state.spans.items[0].color == null);
+    try testing.expect(state.spans.items[1].color != null);
+    try testing.expectEqualStrings("bc", state.shown()[state.spans.items[1].start..state.spans.items[1].end]);
+}
+
+test "a length limit counts what the reader sees" {
+    var state = try styled(testing.allocator, "{color=red|abc}");
+    defer state.deinit(testing.allocator);
+
+    // Three visible characters in fifteen bytes. A limit of four leaves room
+    // for one more, not for none.
+    try state.insert(testing.allocator, "de", 4);
+    try testing.expectEqualStrings("abcd", state.shown());
+}
+
+test "a plain field is untouched by any of this" {
+    // The refactor that made markup possible runs through every edit, so the
+    // plain path needs saying out loud: no second buffer, no parsing, and the
+    // string it holds is the string it shows.
+    var state = try edit(testing.allocator, "{color=red|not markup}");
+    defer state.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("{color=red|not markup}", state.shown());
+    try testing.expectEqual(@as(usize, 0), state.visible.items.len);
+    try testing.expectEqual(@as(usize, 0), state.marks.items.len);
+
+    try state.backspace(testing.allocator);
+    try testing.expectEqualStrings("{color=red|not markup", state.value());
 }

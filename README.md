@@ -124,6 +124,7 @@ the differences are the ones Zig forces, and there are three of them.
 | `bounding_box(id)` | `ui.boxOf("save")` |
 | `.capture()` | `.capture = true` |
 | `.text_input(\|t\| t.placeholder("Name"))` | `ui.textInput(.{ ... }, .{ .placeholder = "Name" })` |
+| `{color=red\|text}` in every string | `ui.markup("{color=red\|text}", style)` |
 | `ui.get_text_value(id)` | `ui.textValueOf("name")` |
 | `ui.set_text_value(id, v)` | `ui.setTextValue("name", v)` |
 | `.on_changed(\|t\| ...)` | `if (ui.textChanged("name")) ...` |
@@ -386,6 +387,73 @@ when anything moves - in frames rather than seconds, because a layout library
 is never told the frame rate. Ply's curve exactly: it holds for the whole
 count, then fades over a quarter as many frames again.
 
+## Markup
+
+```zig
+ui.markup("Press {color=red|Escape} to leave", .{ .font_size = 14 });
+```
+
+A tag is a brace, a command, a bar, the text it covers, and a closing brace,
+and tags nest:
+
+| | |
+| --- | --- |
+| `{color=red\|...}` | a name, `#RRGGBB`, or `(r,g,b)` in 0..255 |
+| `{opacity=0.5\|...}` | multiplied through nesting, not replaced |
+| `{hide\|...}` | takes up its room and is not drawn |
+| `{shadow_color=black_offset=-0.3,0.3\|...}` | offset in ems, so it scales with the size |
+
+One command per tag, as in Ply. Nesting is how they combine, and it is what
+decides which wins: the innermost `color` is the one drawn, while `opacity`
+multiplies all the way up.
+
+**The tags come off when the run is declared**, so what the layout measures,
+wraps and boxes is the text the reader will see. A tagged label is the width
+of its words rather than of its tags, and a line breaks between two words
+rather than in the middle of a tag. Ply carries the tags to its renderer
+instead, which works because its measurer knows to skip them.
+
+**It is a separate call**, and that is the second departure. Ply turns markup
+on for a whole program with a build feature, so every brace in every label has
+to be escaped; asking for it a run at a time costs one word and leaves `text`
+never surprising.
+
+**Malformed markup keeps the text.** A space inside a tag means it was never a
+tag - so `use { x } here` is prose, not a parse error. A `}` with nothing open
+is a `}`. A tag left open runs to the end. Ply errors on all three; showing the
+reader the text in the wrong colour beats showing them nothing.
+
+Ply's animated styles are not here - see the table above - and a tag naming one
+is ignored rather than refused, so the text still reads.
+
+### Editing it
+
+```zig
+ui.textInput(.{ .id = "notes", .width = .grow, .height = .grow }, .{
+    .multiline = true,
+    .markup = true,
+});
+```
+
+The cursor moves through the characters the reader sees; the tags are not in
+its way. Typing inside a style stays in it, deleting the last character out of
+one takes the tag with it, and typing one of the four syntax characters stores
+it escaped. `textValueOf` gives back the string with the tags in.
+
+Ply does this by giving every editing method a second `_styled` copy that
+converts between visual and raw positions - about a thousand lines. Here the
+stripped text is kept beside the raw one with a map between them, so the
+movement, the selection and the word boundaries are the same code for both
+kinds of field, and only the two places that actually change the string know
+markup exists.
+
+One thing to know: an insertion inherits the style to its **left**, as a word
+processor does. That means text ending inside a style has no cursor position
+outside it, so typing at the end goes on being red. Continuing a style while
+writing is wanted more often than escaping one, and Ply buys the choice by
+giving the cursor an extra position for every closing brace - at the price of a
+right arrow that sometimes does not appear to move.
+
 ## Text input
 
 ```zig
@@ -557,6 +625,7 @@ Ported and tested:
 - Hit testing, hover, press and focus, with capture and clip-aware picking
 - Scrollbars, with a draggable thumb and an optional fade
 - Text input: selection, undo, word movement, click and drag, password, multiline
+- Rich text markup, drawn and edited: colour, opacity, hide, shadow
 - An optional renderer over Fluxion RHI: one instanced draw, an SDF for the shapes, a glyph atlas for the text
 
 Not yet, in the order it is worth doing:
@@ -564,7 +633,7 @@ Not yet, in the order it is worth doing:
 | | Why it is not here |
 | --- | --- |
 | **Floating elements, wrapping, shaders, images** | Ply has all of these. They sit above the core rather than inside it. |
-| **Rich text markup** | Ply's `{red\|like this}`, and half of its `text_input.rs`. A milestone of its own; the plain editing model does not need it. |
+| **Animated text styles** | Ply's `wave`, `jitter`, `pulse`, `swing`, `type`, `fade`, `scale`, `transform`, `gradient`. Every one moves or resizes single glyphs, and a render command here describes a run rather than a glyph. They belong with rotation and effects. |
 | **Input methods** | Composing Japanese or Chinese needs preedit events this library never sees. `text_input.Action` has room for them. |
 | **Accessibility, networking, audio, storage** | Deliberately out of scope. Ply's are bound to its own subsystems, and this library builds on the fluxion ones. |
 

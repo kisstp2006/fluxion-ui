@@ -171,6 +171,16 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
             u.text("One draw call", .{ .font_size = 22, .color = theme.ink });
             u.text(body, .{ .font_size = 13, .color = theme.ink });
 
+            // Markup: the tags come off when the run is declared, so this
+            // line is measured and wrapped as the words it shows.
+            u.markup(
+                "Tags come off before the layout sees them, so this is " ++
+                    "{color=#F2A53A|coloured}, this is {opacity=0.45|faded}, " ++
+                    "this has a {shadow_color=#000000|shadow}, and " ++
+                    "{color=#53A3F2|{opacity=0.7|both at once}}.",
+                .{ .font_size = 13, .color = theme.ink },
+            );
+
             // Two text inputs. The first is one line and scrolls sideways
             // when what is typed runs past it; the second wraps and scrolls
             // up and down, and has a bar to show how far.
@@ -214,8 +224,9 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                 .width = .grow,
                 .height = .grow,
             }, .{
-                .placeholder = "Notes. Enter starts a new line, and this one wraps.",
+                .placeholder = "Notes. Enter starts a new line, and this one wraps. Markup is on: try {color=red|words like this}.",
                 .multiline = true,
+                .markup = true,
                 .font_size = 13,
                 .text_color = theme.ink,
                 .placeholder_color = .hex(0x6E7681),

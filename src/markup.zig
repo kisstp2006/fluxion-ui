@@ -100,12 +100,25 @@ pub const Span = struct {
     }
 };
 
+/// Where one byte of the stripped text came from in the raw string.
+///
+/// Usually one byte to one byte, but not always: an escaped brace is `\\{` in
+/// the raw and `{` in the text, so its mark is two bytes wide. What this is
+/// for is editing - a cursor lives in the text the reader sees, and every
+/// change has to land in the string the tags are in.
+pub const Mark = struct {
+    start: u32,
+    end: u32,
+};
+
 /// What a parse produced.
 pub const Parsed = struct {
     /// The text with the tags taken out. A slice of whatever was parsed into.
     text: []const u8,
     /// In order, covering the text end to end with no gaps.
     spans: []const Span,
+    /// One per byte of `text`, when a map was asked for.
+    marks: []const Mark,
 };
 
 /// Ply's palette, at Ply's numbers, which are macroquad's.
@@ -276,11 +289,33 @@ pub const max_depth = 16;
 pub fn parse(
     out_text: *std.ArrayList(u8),
     out_spans: *std.ArrayList(Span),
+    out_marks: ?*std.ArrayList(Mark),
     gpa: std.mem.Allocator,
     raw: []const u8,
 ) std.mem.Allocator.Error!Parsed {
     const text_from = out_text.items.len;
     const spans_from = out_spans.items.len;
+    const marks_from = if (out_marks) |marks| marks.items.len else 0;
+
+    // Every byte of text goes through here, so the map cannot fall out of
+    // step with the text it is a map of.
+    const Sink = struct {
+        text: *std.ArrayList(u8),
+        marks: ?*std.ArrayList(Mark),
+        gpa: std.mem.Allocator,
+
+        fn one(self: @This(), byte: u8, from: usize, to: usize) std.mem.Allocator.Error!void {
+            try self.text.append(self.gpa, byte);
+            if (self.marks) |marks| {
+                try marks.append(self.gpa, .{ .start = @intCast(from), .end = @intCast(to) });
+            }
+        }
+
+        fn many(self: @This(), bytes: []const u8, from: usize) std.mem.Allocator.Error!void {
+            for (bytes, 0..) |byte, offset| try self.one(byte, from + offset, from + offset + 1);
+        }
+    };
+    const sink: Sink = .{ .text = out_text, .marks = out_marks, .gpa = gpa };
 
     var stack: [max_depth]Fold = undefined;
     var depth: usize = 0;
@@ -303,7 +338,9 @@ pub fn parse(
 
         if (escaped) {
             escaped = false;
-            if (header_at != null) try header.append(gpa, byte) else try out_text.append(gpa, byte);
+            // The backslash before it is part of where this byte came from,
+            // so deleting the character takes the escape with it.
+            if (header_at != null) try header.append(gpa, byte) else try sink.one(byte, i - 1, i + 1);
             continue;
         }
 
@@ -323,11 +360,11 @@ pub fn parse(
 
             '|' => {
                 if (header_at == null) {
-                    try out_text.append(gpa, byte);
+                    try sink.one(byte, i, i + 1);
                 } else if (depth >= max_depth) {
                     // Too deep to remember the way out. Give the header back
                     // as text and carry on.
-                    try out_text.appendSlice(gpa, raw[header_at.?..][0 .. i - header_at.? + 1]);
+                    try sink.many(raw[header_at.?..][0 .. i - header_at.? + 1], header_at.?);
                     header_at = null;
                 } else {
                     const here = out_text.items.len - text_from;
@@ -347,7 +384,7 @@ pub fn parse(
                     try header.append(gpa, byte);
                 } else if (depth == 0) {
                     // Nothing open, so it is a brace the reader meant.
-                    try out_text.append(gpa, byte);
+                    try sink.one(byte, i, i + 1);
                 } else {
                     const here = out_text.items.len - text_from;
                     if (here > span_start) {
@@ -364,22 +401,22 @@ pub fn parse(
                 // since the brace is text, including the brace, and the space
                 // itself is handled by the loop going round again.
                 if (header_at != null and (byte == ' ' or byte == '\t' or byte == '\n')) {
-                    try out_text.appendSlice(gpa, raw[header_at.?..i]);
+                    try sink.many(raw[header_at.?..i], header_at.?);
                     header_at = null;
                 }
                 if (header_at != null) {
                     try header.append(gpa, byte);
                 } else {
-                    try out_text.append(gpa, byte);
+                    try sink.one(byte, i, i + 1);
                 }
             },
         }
     }
 
     // A header the input ended inside was never a tag either.
-    if (header_at) |from| try out_text.appendSlice(gpa, raw[from..]);
+    if (header_at) |from| try sink.many(raw[from..], from);
     // A trailing backslash is a backslash.
-    if (escaped) try out_text.append(gpa, '\\');
+    if (escaped) try sink.one('\\', raw.len - 1, raw.len);
 
     const total = out_text.items.len - text_from;
     if (total > span_start or out_spans.items.len == spans_from) {
@@ -389,8 +426,64 @@ pub fn parse(
     return .{
         .text = out_text.items[text_from..],
         .spans = out_spans.items[spans_from..],
+        .marks = if (out_marks) |marks| marks.items[marks_from..] else &.{},
     };
 }
+
+/// Drop the tags that have nothing left inside them.
+///
+/// Deleting the last character out of `{color=red|a}` leaves `{color=red|}`,
+/// which draws as nothing and reads back as nonsense - so an editor that
+/// never removed them would slowly fill a string with the ghosts of styles
+/// somebody deleted. Ply calls this `cleanup_empty_styles`.
+///
+/// Innermost first and around again, because taking one out can empty the one
+/// it was in: `{a|{b|}}` is two passes and an empty string. Quadratic in the
+/// number of nested empty tags, which is a number that is never large.
+pub fn compact(
+    out: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    raw: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    const from = out.items.len;
+    try out.appendSlice(gpa, raw);
+
+    while (emptyTag(out.items[from..])) |range| {
+        out.replaceRange(undefined, from + range.start, range.end - range.start, "") catch unreachable;
+    }
+    return out.items[from..];
+}
+
+/// The first `{header|}` with nothing between the bar and the brace.
+fn emptyTag(raw: []const u8) ?Range {
+    var escaped = false;
+    var header_at: ?usize = null;
+
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const byte = raw[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        switch (byte) {
+            '\\' => escaped = true,
+            '{' => header_at = i,
+            ' ', '\t', '\n' => header_at = null,
+            '|' => if (header_at) |start| {
+                if (i + 1 < raw.len and raw[i + 1] == '}') {
+                    return .{ .start = start, .end = i + 2 };
+                }
+                header_at = null;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// A half-open byte range, as `compact` hands one back.
+pub const Range = struct { start: usize, end: usize };
 
 /// Put the tags back, so a string can be handed to `parse` as literal text.
 ///
@@ -422,7 +515,7 @@ const Fixture = struct {
     spans: std.ArrayList(Span) = .empty,
 
     fn run(self: *Fixture, gpa: std.mem.Allocator, raw: []const u8) !Parsed {
-        return parse(&self.text, &self.spans, gpa, raw);
+        return parse(&self.text, &self.spans, null, gpa, raw);
     }
 
     fn deinit(self: *Fixture, gpa: std.mem.Allocator) void {
@@ -633,4 +726,71 @@ test "parsing twice into one buffer keeps each run's offsets its own" {
     try testing.expectEqualStrings("second two", second.text);
     try testing.expectEqual(@as(u32, 0), second.spans[0].start);
     try testing.expectEqualStrings("two", second.text[second.spans[1].start..second.spans[1].end]);
+}
+
+test "the map says where each visible byte came from" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(testing.allocator);
+    var marks: std.ArrayList(Mark) = .empty;
+    defer marks.deinit(testing.allocator);
+
+    //           0123456789...
+    const raw = "a{color=red|bc}d";
+    const parsed = try parse(&text, &spans, &marks, testing.allocator, raw);
+    try testing.expectEqualStrings("abcd", parsed.text);
+    try testing.expectEqual(parsed.text.len, parsed.marks.len);
+
+    try testing.expectEqual(@as(u32, 0), parsed.marks[0].start);
+    try testing.expectEqual(@as(u32, 12), parsed.marks[1].start);
+    try testing.expectEqual(@as(u32, 13), parsed.marks[2].start);
+    try testing.expectEqual(@as(u32, 15), parsed.marks[3].start);
+
+    // And every mark points at the byte it stands for.
+    for (parsed.marks, parsed.text) |mark, byte| {
+        try testing.expectEqual(byte, raw[mark.end - 1]);
+    }
+}
+
+test "an escaped brace is one visible byte from two raw ones" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    var spans: std.ArrayList(Span) = .empty;
+    defer spans.deinit(testing.allocator);
+    var marks: std.ArrayList(Mark) = .empty;
+    defer marks.deinit(testing.allocator);
+
+    const parsed = try parse(&text, &spans, &marks, testing.allocator, "a\\{b");
+    try testing.expectEqualStrings("a{b", parsed.text);
+
+    // The mark for the brace is two bytes wide, so deleting the character
+    // takes its backslash with it rather than leaving a stray escape.
+    try testing.expectEqual(@as(u32, 1), parsed.marks[1].start);
+    try testing.expectEqual(@as(u32, 3), parsed.marks[1].end);
+}
+
+test "an emptied tag is taken away, innermost first" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("ab", try compact(&out, testing.allocator, "a{color=red|}b"));
+
+    out.clearRetainingCapacity();
+    // Taking the inner one out empties the outer, so it goes round again.
+    try testing.expectEqualStrings("", try compact(&out, testing.allocator, "{a|{b|}}"));
+
+    out.clearRetainingCapacity();
+    // One with something in it stays.
+    try testing.expectEqualStrings(
+        "{color=red|x}",
+        try compact(&out, testing.allocator, "{color=red|x}"),
+    );
+
+    out.clearRetainingCapacity();
+    // And a brace that was never a tag is not one now either.
+    try testing.expectEqualStrings(
+        "use { x } here",
+        try compact(&out, testing.allocator, "use { x } here"),
+    );
 }

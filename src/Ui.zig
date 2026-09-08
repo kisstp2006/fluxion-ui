@@ -728,7 +728,7 @@ pub fn markup(self: *Ui, raw: []const u8, style: text_mod.TextStyle) void {
 fn markupChecked(self: *Ui, raw: []const u8, style: text_mod.TextStyle) Error!void {
     const start: u32 = @intCast(self.strings.items.len);
     const spans_start: u32 = @intCast(self.spans.items.len);
-    const parsed = try markup_mod.parse(&self.strings, &self.spans, self.gpa, raw);
+    const parsed = try markup_mod.parse(&self.strings, &self.spans, null, self.gpa, raw);
     try self.addRun(
         start,
         @intCast(parsed.text.len),
@@ -842,6 +842,12 @@ fn textInputChecked(self: *Ui, declaration: layout.Declaration, config: text_inp
     entry.value_ptr.live = true;
     entry.value_ptr.multiline = config.multiline;
     entry.value_ptr.max_length = config.max_length;
+    if (entry.value_ptr.markup != config.markup) {
+        // Turning it on has to build the view of the text that the cursor
+        // moves through; turning it off has to stop using it.
+        entry.value_ptr.markup = config.markup;
+        try entry.value_ptr.settle(self.gpa);
+    }
 
     // What this input will draw, worked out now while the caller's
     // placeholder is still theirs to lend. See `Element.shown_start`.
@@ -849,7 +855,7 @@ fn textInputChecked(self: *Ui, declaration: layout.Declaration, config: text_inp
     const shown = try text_input.display(
         &self.strings,
         self.gpa,
-        entry.value_ptr.text.items,
+        entry.value_ptr.shown(),
         config.placeholder,
         config.password,
     );
@@ -1514,50 +1520,80 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
             continue;
         }
 
-        // One command per stretch of the line that is drawn the same way.
-        //
-        // The pen walks along adding each piece's own width rather than
-        // measuring the prefix again, which is what Ply does too - and it
-        // means a pair of letters either side of a tag boundary is not
-        // kerned against each other. There is nowhere for that kerning to
-        // live: they are two draws.
-        var pen = x;
-        for (self.spans.items[run.spans_start..][0..run.spans_len]) |span| {
-            const from = @max(span.start, line.start);
-            const to = @min(span.end, line.start + line.len);
-            if (from >= to) continue;
+        try self.emitSpanned(
+            element,
+            run.style,
+            content,
+            line.start,
+            line.start + line.len,
+            self.spans.items[run.spans_start..][0..run.spans_len],
+            x,
+            y,
+            line_height,
+        );
+    }
+}
 
-            const piece = content[from..to];
-            const width = measurer.measure(piece, run.style).width;
-            defer pen += width;
-            if (span.hidden) continue;
+/// Draw one line in as many commands as its spans ask for.
+///
+/// Shared by a run of markup and a text input holding some, which have the
+/// same job from different directions: a stretch of text, a list of spans
+/// over the string it came from, and somewhere to put it.
+///
+/// The pen walks along adding each piece's own width rather than measuring
+/// the prefix again, which is Ply's arithmetic too - and it means a pair of
+/// letters either side of a tag boundary is not kerned against each other.
+/// There is nowhere for that kerning to live: they are two draws.
+fn emitSpanned(
+    self: *Ui,
+    element: Element,
+    style: text_mod.TextStyle,
+    content: []const u8,
+    from: usize,
+    to: usize,
+    spans: []const markup_mod.Span,
+    x: f32,
+    y: f32,
+    line_height: f32,
+) Error!void {
+    const measurer = self.measurer orelse return;
+    var pen = x;
 
-            if (span.shadow) |shadow| {
-                // The offset is in ems, so a shadow set once looks the same
-                // at every size.
-                const em: f32 = @floatFromInt(run.style.font_size);
-                try self.emitPiece(
-                    element,
-                    run.style,
-                    piece,
-                    .init(pen + shadow.offset.x * em, y + shadow.offset.y * em, width, line_height),
-                    .{
-                        .r = shadow.color.r,
-                        .g = shadow.color.g,
-                        .b = shadow.color.b,
-                        .a = std.math.clamp(shadow.color.a * span.opacity, 0, 1),
-                    },
-                );
-            }
+    for (spans) |span| {
+        const first = @max(span.start, from);
+        const last = @min(span.end, to);
+        if (first >= last) continue;
 
+        const piece = content[first..last];
+        const width = measurer.measure(piece, style).width;
+        defer pen += width;
+        if (span.hidden) continue;
+
+        if (span.shadow) |shadow| {
+            // The offset is in ems, so a shadow set once looks the same at
+            // every size.
+            const em: f32 = @floatFromInt(style.font_size);
             try self.emitPiece(
                 element,
-                run.style,
+                style,
                 piece,
-                .init(pen, y, width, line_height),
-                span.colorOver(run.style.color),
+                .init(pen + shadow.offset.x * em, y + shadow.offset.y * em, width, line_height),
+                .{
+                    .r = shadow.color.r,
+                    .g = shadow.color.g,
+                    .b = shadow.color.b,
+                    .a = std.math.clamp(shadow.color.a * span.opacity, 0, 1),
+                },
             );
         }
+
+        try self.emitPiece(
+            element,
+            style,
+            piece,
+            .init(pen, y, width, line_height),
+            span.colorOver(style.color),
+        );
     }
 }
 
@@ -1783,7 +1819,7 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
     // What is drawn is not always what is stored: the placeholder when there
     // is nothing, bullets when it is a password. Built when this element was
     // declared, so every command emitted below keeps looking at its own text.
-    const blank = edit.text.items.len == 0;
+    const blank = edit.shown().len == 0;
     const shown = self.strings.items[element.shown_start..][0..element.shown_len];
     const style = if (blank) config.placeholderStyle() else config.style();
     const step = measurer.lineHeight(config.style());
@@ -1839,7 +1875,7 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
     // Where the cursor is, in the drawn text.
     const cursor_display = if (blank) 0 else text_input.offsetOfCharacter(
         shown,
-        text_input.characters(edit.text.items[0..edit.cursor]),
+        text_input.characters(edit.shown()[0..edit.cursor]),
     );
     const spot = text_input.locate(lines, cursor_display);
     const cursor_line = lines[spot.line];
@@ -1865,9 +1901,16 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
 
     // The selection, under the text, once per line it covers.
     const highlight: ?text_input.Range = if (blank) null else if (edit.selection()) |range| .{
-        .start = text_input.offsetOfCharacter(shown, text_input.characters(edit.text.items[0..range.start])),
-        .end = text_input.offsetOfCharacter(shown, text_input.characters(edit.text.items[0..range.end])),
+        .start = text_input.offsetOfCharacter(shown, text_input.characters(edit.shown()[0..range.start])),
+        .end = text_input.offsetOfCharacter(shown, text_input.characters(edit.shown()[0..range.end])),
     } else null;
+
+    // A markup field colours what it drew. The spans are offsets into the
+    // text the reader sees, which is the same string `shown` is a copy of -
+    // unless it is a password or a placeholder, and neither of those has
+    // anything to colour.
+    const spans: []const markup_mod.Span =
+        if (config.markup and !blank and !config.password) edit.spans.items else &.{};
 
     var widest: f32 = 0;
     for (lines, 0..) |line, row| {
@@ -1895,19 +1938,27 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
         if (run.len > 0) {
             const width = measurer.measure(run, style).width;
             widest = @max(widest, width);
-            try self.output.append(self.gpa, .{
-                .bounding_box = .init(origin_x, line_y, width, step),
-                .id = element.id,
-                .z_index = element.z_index,
-                .config = .{ .text = .{
-                    .text = run,
-                    .color = style.color,
-                    .font_size = style.font_size,
-                    .letter_spacing = style.letter_spacing,
-                    .line_height = @intFromFloat(@round(step)),
-                    .font = style.font,
-                } },
-            });
+            if (spans.len == 0) {
+                try self.emitPiece(
+                    element,
+                    style,
+                    run,
+                    .init(origin_x, line_y, width, step),
+                    style.color,
+                );
+            } else {
+                try self.emitSpanned(
+                    element,
+                    style,
+                    shown,
+                    line.start,
+                    line.end,
+                    spans,
+                    origin_x,
+                    line_y,
+                    step,
+                );
+            }
         }
     }
 
@@ -2647,15 +2698,15 @@ fn textActionChecked(self: *Ui, action: text_input.Action) Error!?[]const u8 {
 
     switch (action) {
         .move => |motion| edit.move(motion),
-        .backspace => edit.backspace(),
-        .delete => edit.deleteForward(),
-        .backspace_word => edit.backspaceWord(),
-        .delete_word => edit.deleteWordForward(),
+        .backspace => try edit.backspace(self.gpa),
+        .delete => try edit.deleteForward(self.gpa),
+        .backspace_word => try edit.backspaceWord(self.gpa),
+        .delete_word => try edit.deleteWordForward(self.gpa),
         .select_all => edit.selectAll(),
         .copy => taken = try self.remember_clipboard(edit.selected()),
         .cut => {
             taken = try self.remember_clipboard(edit.selected());
-            _ = edit.deleteSelection();
+            _ = try edit.deleteSelection(self.gpa);
             edit.resetBlink();
         },
         .paste => |run| try edit.insert(self.gpa, run, edit.max_length),
