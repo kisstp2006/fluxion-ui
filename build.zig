@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: BSD-2-Clause
 
 const std = @import("std");
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: BSD-2-Clause
 
 //! What an element asks for: how big, which way round, and where its children
 //! sit.

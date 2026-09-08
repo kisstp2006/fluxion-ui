@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: BSD-2-Clause
 
 //! An application shell - title bar, sidebar, content, status bar - laid out
 //! and printed as the list of things a renderer would draw.

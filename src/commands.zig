@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: BSD-2-Clause
 
 //! What a frame comes out as: a flat list of things to draw, in the order to
 //! draw them.
