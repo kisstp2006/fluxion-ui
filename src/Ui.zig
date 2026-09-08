@@ -50,6 +50,7 @@ const color = @import("color.zig");
 const commands = @import("commands.zig");
 const geometry = @import("geometry.zig");
 const layout = @import("layout.zig");
+const text_mod = @import("text.zig");
 
 const BoundingBox = geometry.BoundingBox;
 const Color = color.Color;
@@ -113,6 +114,9 @@ const Element = struct {
     /// See `layout.SlotFit`.
     slot_fit: ?layout.SlotFit,
 
+    /// Which run of text this element draws, if it is one. Index into `runs`.
+    run: ?u32 = null,
+
     /// The size it currently believes it is. Filled by the fit pass, then
     /// adjusted by the grow and shrink passes.
     dimensions: Dimensions = .zero,
@@ -139,6 +143,28 @@ const Open = struct {
     /// after that point is one of its children - which is how `close` finds
     /// them in constant time instead of searching.
     pending_at: u32,
+};
+
+/// A run of text, and where its lines ended up.
+const TextRun = struct {
+    /// Borrowed from the caller, and valid until the next `begin`. A UI
+    /// declares its text from strings it already has - a field, a literal, a
+    /// buffer it formatted - and copying every one of them every frame would
+    /// be the largest allocation in the library by far.
+    content: []const u8,
+    style: text_mod.TextStyle,
+    element: u32,
+    lines_start: u32 = 0,
+    lines_len: u32 = 0,
+};
+
+/// One line of a wrapped run.
+const Line = struct {
+    /// Where it starts in the run, and how many bytes it is.
+    start: u32,
+    len: u32,
+    /// How wide it came out, for aligning it against the others.
+    width: f32,
 };
 
 /// One entry of the position-and-emit walk.
@@ -170,6 +196,19 @@ open_stack: std.ArrayList(Open),
 
 /// This frame's output.
 output: std.ArrayList(RenderCommand),
+
+/// The text declared this frame. One entry per `text` call.
+runs: std.ArrayList(TextRun),
+/// Every run's lines, flattened, after wrapping.
+lines: std.ArrayList(Line),
+
+/// How to find out how wide a piece of text is.
+///
+/// Null until `setMeasurer`, and a `text` call without one lays out as an
+/// element of zero size - which is wrong, but wrong in a way that shows on
+/// screen rather than one that stops the program. A UI with no text does not
+/// need one at all.
+measurer: ?text_mod.Measurer = null,
 
 /// Scratch for the walks, kept between frames so that a steady-state frame
 /// does not allocate at all.
@@ -203,6 +242,8 @@ pub fn init(gpa: Allocator) Ui {
         .pending = .empty,
         .open_stack = .empty,
         .output = .empty,
+        .runs = .empty,
+        .lines = .empty,
         .queue = .empty,
         .resizable = .empty,
         .walk = .empty,
@@ -215,6 +256,8 @@ pub fn deinit(self: *Ui) void {
     self.pending.deinit(self.gpa);
     self.open_stack.deinit(self.gpa);
     self.output.deinit(self.gpa);
+    self.runs.deinit(self.gpa);
+    self.lines.deinit(self.gpa);
     self.queue.deinit(self.gpa);
     self.resizable.deinit(self.gpa);
     self.walk.deinit(self.gpa);
@@ -235,6 +278,18 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
     self.pending.clearRetainingCapacity();
     self.open_stack.clearRetainingCapacity();
     self.output.clearRetainingCapacity();
+    self.runs.clearRetainingCapacity();
+    self.lines.clearRetainingCapacity();
+}
+
+/// Say how to measure text. See `text_mod.Measurer`.
+///
+/// Set once, before the first frame. A program using
+/// [Fluxion Font](https://github.com/kisstp2006/fluxion-font) wires its own
+/// here; a test, a terminal or a code editor can use
+/// `text_mod.Measurer.monospace`.
+pub fn setMeasurer(self: *Ui, measurer: text_mod.Measurer) void {
+    self.measurer = measurer;
 }
 
 /// Open an element. Every `open` needs a `close`, and `defer` is how.
@@ -263,6 +318,63 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
         .element = index,
         .pending_at = @intCast(self.pending.items.len),
     });
+}
+
+/// A run of text. Ply's `ui.text(text, |t| ...)`.
+///
+/// Not an `open` and a `close`: a text element has no children and its size
+/// comes from measuring rather than from summing, so it is added whole. The
+/// string is borrowed and must outlive the frame - see `TextRun.content`.
+///
+/// ```zig
+/// ui.text("Hello, Fluxion!", .{ .font_size = 32, .color = .hex(0xFFFFFF) });
+/// ```
+///
+/// The element it makes is as wide as the text would be unbroken and as
+/// narrow as its longest word - which is the whole reason the shrink pass
+/// exists. Every other kind of element has a minimum equal to its content and
+/// so cannot give way; a paragraph can.
+pub fn text(self: *Ui, content: []const u8, style: text_mod.TextStyle) void {
+    self.textChecked(content, style) catch |err| self.remember(err);
+}
+
+fn textChecked(self: *Ui, content: []const u8, style: text_mod.TextStyle) Error!void {
+    const index: u32 = @intCast(self.elements.items.len);
+
+    // Without a measurer there is nothing to measure with, and a zero-sized
+    // element is a visible mistake rather than a silent one.
+    const measured: geometry.Dimensions, const smallest: geometry.Dimensions =
+        if (self.measurer) |measurer| blk: {
+            const line_height = measurer.lineHeight(style);
+            const height = line_height * @as(f32, @floatFromInt(text_mod.hardLineCount(content)));
+            break :blk .{
+                .init(text_mod.unwrappedWidth(content, style, measurer), height),
+                .init(text_mod.widestWord(content, style, measurer), height),
+            };
+        } else .{ .zero, .zero };
+
+    try self.elements.append(self.gpa, .{
+        .id = identify(null, index),
+        .config = .{},
+        .background_color = .transparent,
+        .corner_radius = .sharp,
+        .border = null,
+        .z_index = 0,
+        .slot_fit = null,
+        .run = @intCast(self.runs.items.len),
+        .dimensions = measured,
+        .min_dimensions = smallest,
+    });
+
+    try self.runs.append(self.gpa, .{
+        .content = content,
+        .style = style,
+        .element = index,
+    });
+
+    // A text element is somebody's child, and never the root: text at the top
+    // level has nothing to be measured against.
+    if (self.open_stack.items.len > 0) try self.pending.append(self.gpa, index);
 }
 
 /// An element with no children: `open` and `close` in one call.
@@ -389,6 +501,14 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
 
     try self.sizeAlongAxis(true, 0);
     self.resolveRatios(true);
+
+    // Text wraps once the widths are settled, and only then is a paragraph's
+    // height known - so the heights it changed have to reach its ancestors
+    // before the vertical pass runs. Doing this the other way round is what
+    // makes a wrapped paragraph overflow the box drawn round it.
+    try self.wrapText();
+    self.propagateHeights();
+
     try self.sizeAlongAxis(false, 0);
     self.resolveRatios(false);
     try self.applySlotFit();
@@ -455,13 +575,26 @@ fn sizeAlongAxis(self: *Ui, x_axis: bool, from: u32) Error!void {
         if (config.direction.isMainAxisX() == x_axis) {
             try self.distributeMainAxis(parent_index, x_axis, inner);
         } else {
-            // On the cross axis every child is measured against the whole
-            // inner size on its own; there is nothing to share.
+            // On the cross axis there is nothing to share: each child is
+            // measured against the whole inner size on its own.
             for (children) |child_index| {
                 const child = &self.elements.items[child_index];
                 const wanted = child.config.sizing.onAxis(x_axis);
-                if (wanted.kind != .grow) continue;
-                setSize(child, x_axis, wanted.clamp(@max(inner, child.min_dimensions.onAxis(x_axis))));
+
+                if (wanted.kind == .grow) {
+                    setSize(child, x_axis, @min(inner, wanted.max));
+                }
+
+                // And then *every* child is held inside the parent, growing
+                // or not, but never squeezed below what its own content
+                // needs. This is the line that makes a paragraph in a column
+                // wrap to the column: without it a `fit` child keeps the
+                // width it measured, which for text is the whole run
+                // unbroken, and the wrap pass is handed a width it can never
+                // break at.
+                const smallest = child.min_dimensions.onAxis(x_axis);
+                const held = @max(smallest, @min(child.dimensions.onAxis(x_axis), inner));
+                setSize(child, x_axis, held);
             }
         }
 
@@ -705,6 +838,178 @@ fn applySlotFit(self: *Ui) Error!void {
 }
 
 // -------------------------------------------------------------------------
+// Text
+// -------------------------------------------------------------------------
+
+/// Break every run into lines that fit the width it was given, and make each
+/// text element as tall as the lines it ended up with.
+fn wrapText(self: *Ui) Error!void {
+    const measurer = self.measurer orelse return;
+    self.lines.clearRetainingCapacity();
+
+    for (self.runs.items) |*run| {
+        const width = self.elements.items[run.element].dimensions.width;
+        const line_height = measurer.lineHeight(run.style);
+
+        run.lines_start = @intCast(self.lines.items.len);
+        run.lines_len = 0;
+
+        var words: text_mod.Words = .init(run.content, run.style, measurer);
+        var start: ?u32 = null;
+        var stop: u32 = 0;
+        var line_width: f32 = 0;
+        // The space before the next word, held back because a line that ends
+        // here does not include it.
+        var gap: f32 = 0;
+
+        while (words.next()) |word| {
+            if (word.isBreak()) {
+                // The one break the text asks for itself. Honoured under
+                // every mode but `.none`, and it ends the line even when the
+                // line is empty - two newlines in a row are a blank line.
+                if (run.style.wrap != .none) {
+                    try self.lines.append(self.gpa, .{
+                        .start = start orelse word.start,
+                        .len = if (start) |from| stop - from else 0,
+                        .width = line_width,
+                    });
+                    run.lines_len += 1;
+                    start = null;
+                    stop = 0;
+                    line_width = 0;
+                    gap = 0;
+                }
+                continue;
+            }
+
+            const wraps = run.style.wrap == .words;
+            if (start != null and wraps and line_width + gap + word.width > width + 0.001) {
+                try self.lines.append(self.gpa, .{
+                    .start = start.?,
+                    .len = stop - start.?,
+                    .width = line_width,
+                });
+                run.lines_len += 1;
+                start = word.start;
+                stop = word.start + word.len;
+                line_width = word.width;
+                gap = word.space;
+                continue;
+            }
+
+            if (start == null) {
+                start = word.start;
+                line_width = word.width;
+            } else {
+                line_width += gap + word.width;
+            }
+            stop = word.start + word.len;
+            gap = word.space;
+        }
+
+        // Whatever is left, and an empty run still occupies one line - a
+        // paragraph of nothing is a paragraph the height of one line, which
+        // is what a text input with no text in it needs to be.
+        if (start != null or run.lines_len == 0) {
+            try self.lines.append(self.gpa, .{
+                .start = start orelse 0,
+                .len = if (start) |from| stop - from else 0,
+                .width = line_width,
+            });
+            run.lines_len += 1;
+        }
+
+        self.elements.items[run.element].dimensions.height =
+            line_height * @as(f32, @floatFromInt(run.lines_len));
+    }
+}
+
+/// Give every container that fits its children the height they turned out to
+/// need.
+///
+/// Only worth doing after `wrapText`, and only for the elements whose height
+/// was decided by their contents: a paragraph that wrapped to three lines
+/// where one was assumed has just made its parent taller, and its parent's
+/// parent after that.
+///
+/// Backwards through the elements, which is post-order without a stack: they
+/// were appended as the tree was declared, so a child always has a higher
+/// index than its parent and is therefore reached first.
+fn propagateHeights(self: *Ui) void {
+    var i = self.elements.items.len;
+    while (i > 0) {
+        i -= 1;
+        const element = self.elements.items[i];
+        if (element.run != null) continue;
+        if (element.config.sizing.height.kind != .fit) continue;
+        if (element.children_length == 0) continue;
+
+        const config = element.config;
+        const stacked = !config.direction.isMainAxisX();
+
+        var height: f32 = 0;
+        var smallest: f32 = 0;
+        for (self.childrenOf(element)) |child_index| {
+            const child = self.elements.items[child_index];
+            if (stacked) {
+                height += child.dimensions.height;
+                smallest += child.min_dimensions.height;
+            } else {
+                height = @max(height, child.dimensions.height);
+                smallest = @max(smallest, child.min_dimensions.height);
+            }
+        }
+
+        if (stacked and element.children_length > 1) {
+            const gaps: f32 = @floatFromInt((element.children_length - 1) * config.gap);
+            height += gaps;
+            smallest += gaps;
+        }
+
+        const padding = config.padding.onAxis(false);
+        self.elements.items[i].dimensions.height = config.sizing.height.clamp(height + padding);
+        self.elements.items[i].min_dimensions.height = config.sizing.height.clamp(smallest + padding);
+    }
+}
+
+/// Write out one command per line of a run.
+fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
+    const element = self.elements.items[index];
+    const run_index = element.run orelse return;
+    const measurer = self.measurer orelse return;
+
+    const run = self.runs.items[run_index];
+    if (run.style.color.invisible()) return;
+
+    const line_height = measurer.lineHeight(run.style);
+
+    for (0..run.lines_len) |i| {
+        const line = self.lines.items[run.lines_start + i];
+        if (line.len == 0) continue;
+
+        // Each line is aligned inside the element's width on its own, which
+        // is what makes a centred paragraph centred line by line rather than
+        // as one block.
+        const x = box.x + geometry.leadingSpaceX(box.width - line.width, run.style.alignment);
+        const y = box.y + line_height * @as(f32, @floatFromInt(i));
+
+        try self.output.append(self.gpa, .{
+            .bounding_box = .init(x, y, line.width, line_height),
+            .id = element.id,
+            .z_index = element.z_index,
+            .config = .{ .text = .{
+                .text = run.content[line.start..][0..line.len],
+                .color = run.style.color,
+                .font_size = run.style.font_size,
+                .letter_spacing = run.style.letter_spacing,
+                .line_height = @intFromFloat(@round(line_height)),
+                .font = run.style.font,
+            } },
+        });
+    }
+}
+
+// -------------------------------------------------------------------------
 // Phase three: position, and write the commands out
 // -------------------------------------------------------------------------
 
@@ -722,6 +1027,7 @@ fn positionAndEmit(self: *Ui) Error!void {
     });
     self.elements.items[0].box = .at(0, 0, self.elements.items[0].dimensions);
     try self.emitBackground(0, self.elements.items[0].box);
+    try self.emitText(0, self.elements.items[0].box);
 
     while (self.walk.items.len > 0) {
         // Read what is needed out of the top frame before anything can grow
@@ -771,6 +1077,7 @@ fn positionAndEmit(self: *Ui) Error!void {
 
         self.elements.items[child_index].box = .at(x, y, child.dimensions);
         try self.emitBackground(child_index, self.elements.items[child_index].box);
+        try self.emitText(child_index, self.elements.items[child_index].box);
 
         if (self.walk.items.len >= max_depth) return error.TooDeep;
         try self.walk.append(self.gpa, .{
@@ -863,8 +1170,8 @@ inline fn childrenOf(self: *Ui, element: Element) []const u32 {
 /// belongs once state has to survive between frames. Until then a hash from
 /// the standard library is one fewer dependency to pin.
 fn identify(name: ?[]const u8, index: u32) u32 {
-    const text = name orelse return index +% 1;
-    return @truncate(std.hash.Wyhash.hash(id_seed, text));
+    const label = name orelse return index +% 1;
+    return @truncate(std.hash.Wyhash.hash(id_seed, label));
 }
 
 /// The commands this frame produced, wrapped so they can be asked questions.
@@ -1503,4 +1810,355 @@ test "the alignment names are the ones a reader of Ply will type" {
     try testing.expectEqual(geometry.AlignY.center, @as(geometry.AlignY, .center));
     try testing.expectEqual(layout.BorderPosition.middle, @as(layout.BorderPosition, .middle));
     try testing.expectEqual(layout.BorderPosition.inside, layout.Border.all(paint, 1).position);
+}
+
+// -------------------------------------------------------------------------
+// Text
+// -------------------------------------------------------------------------
+//
+// Measured with `monospace(0.5, 1.0)`, so at a font size of 16 a character is
+// eight pixels wide and a line is sixteen tall. Every number below is that
+// arithmetic, which is the point of using it: a wrapping bug shows up as a
+// number that is wrong by a whole character rather than by a rounding.
+
+const mono: text_mod.Measurer = .monospace(0.5, 1.0);
+const sixteen: text_mod.TextStyle = .{ .font_size = 16, .color = paint };
+
+/// A `Ui` with a measurer already set.
+fn withText(gpa: std.mem.Allocator) Ui {
+    var ui: Ui = .init(gpa);
+    ui.setMeasurer(mono);
+    return ui;
+}
+
+/// Open a root that fills the whole surface.
+///
+/// The element under test goes inside it, because the root cannot choose its
+/// own size - it is the surface, whatever it asked for - and a test that
+/// measured the root would be measuring the window. Closed by hand before
+/// `end` rather than with a `defer`, which would fire after it.
+fn openRoot(ui: *Ui) void {
+    ui.open(.{ .width = .grow, .height = .grow });
+}
+
+test "text is as wide as it measures and one line tall" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fit, .height = .fit });
+        defer ui.close();
+        ui.text("Hello", sixteen);
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Five characters at eight pixels, and one sixteen-pixel line.
+    try testing.expectEqual(BoundingBox.init(0, 0, 40, 16), ui.boxOf("row").?);
+}
+
+test "a paragraph wraps to the width it was given" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        // Eighty pixels is ten characters.
+        ui.open(.{ .id = "column", .width = .fixed(80), .height = .fit });
+        defer ui.close();
+        ui.text("aaa bbb ccc ddd", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // "aaa bbb" is seven characters and fits in ten; adding " ccc" would
+    // make eleven and does not. Then "ccc ddd" fits the same way, so it is
+    // two lines and the column is two lines tall.
+    try testing.expectEqual(2, drawn.len);
+    try testing.expectEqual(@as(f32, 32), ui.boxOf("column").?.height);
+
+    try testing.expectEqualStrings("aaa bbb", drawn[0].config.text.text);
+    try testing.expectEqualStrings("ccc ddd", drawn[1].config.text.text);
+}
+
+test "a wrapped paragraph makes its parent taller" {
+    // The reason `wrapText` runs before the vertical pass and `propagateHeights`
+    // runs after it. Getting the order wrong makes a paragraph overflow the
+    // box drawn round it, which is a bug that only shows on long text.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "card", .width = .fixed(80), .height = .fit, .padding = .all(10) });
+        defer ui.close();
+        ui.text("aaa bbb ccc ddd eee", sixteen);
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Sixty pixels of text inside the padding, so the run wraps into more
+    // than one line and the card is as tall as all of them plus its padding.
+    const card = ui.boxOf("card").?;
+    const lines = (card.height - 20) / 16;
+    try testing.expect(lines >= 3);
+    try testing.expectApproxEqAbs(@round(lines), lines, 0.001);
+}
+
+test "a paragraph can be shrunk down to its longest word, and no further" {
+    // This is the test the shrink pass has been waiting for. Every other kind
+    // of element has a minimum equal to its content and so cannot give way;
+    // a paragraph can, down to the word that will not break.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(200, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .width = .fixed(200), .height = .grow });
+        defer ui.close();
+        // Wants 200 (twenty-five characters), gives way to 88 - the width of
+        // "enormously", which is eleven characters.
+        ui.open(.{ .id = "prose", .width = .fitBetween(0, 1000), .height = .fit });
+        {
+            defer ui.close();
+            ui.text("an enormously wide word", sixteen);
+        }
+        ui.empty(.{ .id = "fixed", .width = .fixed(160), .height = .grow, .background_color = paint });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    const prose = ui.boxOf("prose").?;
+    const fixed = ui.boxOf("fixed").?;
+
+    // The fixed sibling kept every pixel, and the prose gave up the rest.
+    try testing.expectEqual(@as(f32, 160), fixed.width);
+    try testing.expect(prose.width < 184);
+    // But not below its longest word - "enormously" is eighty pixels.
+    try testing.expect(prose.width >= 80);
+}
+
+test "a newline breaks a line wherever the text asks" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "block", .width = .fit, .height = .fit });
+        defer ui.close();
+        ui.text("ab\ncdef", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    try testing.expectEqual(2, drawn.len);
+    try testing.expectEqualStrings("ab", drawn[0].config.text.text);
+    try testing.expectEqualStrings("cdef", drawn[1].config.text.text);
+
+    // Two lines tall, and as wide as the widest of them.
+    try testing.expectEqual(@as(f32, 32), ui.boxOf("block").?.height);
+    try testing.expectEqual(@as(f32, 32), ui.boxOf("block").?.width);
+}
+
+test "two newlines in a row are a blank line" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "block", .width = .fit, .height = .fit });
+        defer ui.close();
+        ui.text("ab\n\ncd", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // Three lines of height, but only two of them have anything to draw.
+    try testing.expectEqual(@as(f32, 48), ui.boxOf("block").?.height);
+    try testing.expectEqual(2, drawn.len);
+}
+
+test "wrapping can be turned off, and then nothing breaks" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "chip", .width = .fixed(40), .height = .fit });
+        defer ui.close();
+        ui.text("aaa bbb ccc", .{ .font_size = 16, .color = paint, .wrap = .none });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // One line, overflowing its container - which is what a label in a
+    // fixed-width chip wants, paired with a clip.
+    try testing.expectEqual(1, drawn.len);
+    try testing.expectEqual(@as(f32, 16), ui.boxOf("chip").?.height);
+    try testing.expectEqual(@as(f32, 88), drawn[0].bounding_box.width);
+}
+
+test "a line is aligned inside the width it was given" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .width = .fixed(200), .height = .fit });
+        defer ui.close();
+        // Twenty-six characters into twenty-five: the last word wraps, and
+        // the two lines come out very different widths.
+        ui.text("aaaaa bbbbb ccccc ddddd ee", .{
+            .font_size = 16,
+            .color = paint,
+            .alignment = .center,
+        });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // Alignment is within the text element, not within its parent - so it
+    // only says anything once the lines differ. The long line fills 184 of
+    // the 200 and barely moves; the short one is sixteen wide and is pushed
+    // to the middle.
+    try testing.expectEqual(2, drawn.len);
+    try testing.expectApproxEqAbs(8, drawn[0].bounding_box.x, 0.01);
+    try testing.expectApproxEqAbs(92, drawn[1].bounding_box.x, 0.01);
+}
+
+test "the lines of a paragraph stack downwards" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .width = .fixed(80), .height = .fit, .padding = .all(4) });
+        defer ui.close();
+        ui.text("aaa bbb ccc ddd", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    try testing.expect(drawn.len >= 2);
+    // Each line sits one line height below the last, starting at the padding.
+    try testing.expectEqual(@as(f32, 4), drawn[0].bounding_box.y);
+    try testing.expectEqual(@as(f32, 20), drawn[1].bounding_box.y);
+}
+
+test "text with no colour is laid out and not drawn" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fit, .height = .fit });
+        defer ui.close();
+        ui.text("Hello", .{ .font_size = 16, .color = .transparent });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    try testing.expectEqual(0, drawn.len);
+    // It still took its room, which is what makes it useful as a spacer that
+    // is exactly as wide as some text will be.
+    try testing.expectEqual(@as(f32, 40), ui.boxOf("row").?.width);
+}
+
+test "empty text is one line tall and draws nothing" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "field", .width = .fixed(100), .height = .fit });
+        defer ui.close();
+        ui.text("", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // A text input with nothing in it is still a line tall, which is what
+    // stops an empty field collapsing.
+    try testing.expectEqual(@as(f32, 16), ui.boxOf("field").?.height);
+    try testing.expectEqual(0, drawn.len);
+}
+
+test "text without a measurer lays out as nothing rather than crashing" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fit, .height = .fit });
+        defer ui.close();
+        ui.text("Hello", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // Wrong, and wrong in a way that is visible on screen rather than one
+    // that takes the program down.
+    try testing.expectEqual(0, drawn.len);
+    try testing.expectEqual(@as(f32, 0), ui.boxOf("row").?.width);
+}
+
+test "a longer word than the container gets a line to itself" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "narrow", .width = .fixed(24), .height = .fit });
+        defer ui.close();
+        ui.text("ab enormous cd", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // The long word overflows rather than being cut in half - breaking
+    // inside a word needs hyphenation rules this library has not got.
+    try testing.expectEqual(3, drawn.len);
+    try testing.expectEqualStrings("enormous", drawn[1].config.text.text);
+    try testing.expect(drawn[1].bounding_box.width > 24);
+}
+
+test "the style carries through to the command a renderer sees" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .width = .fit, .height = .fit });
+        defer ui.close();
+        ui.text("Hi", .{
+            .font_size = 32,
+            .color = .hex(0xFF8800),
+            .letter_spacing = 1,
+            .font = 3,
+        });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    try testing.expectEqual(1, drawn.len);
+    const run = drawn[0].config.text;
+    try testing.expectEqual(32, run.font_size);
+    try testing.expectEqual(1, run.letter_spacing);
+    try testing.expectEqual(3, run.font);
+    try testing.expectEqual(Color.hex(0xFF8800), run.color);
 }

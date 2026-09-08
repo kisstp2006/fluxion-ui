@@ -8,6 +8,7 @@ A layout engine that draws nothing. For Zig 0.16.
 | `layout` | What an element asks for - sizing, padding, direction, alignment. |
 | `geometry` | Rectangles, and the numbers that place one. |
 | `color` | A colour, and the three ways people write one down. |
+| `text` | How text is styled, and how the layout finds out how wide it is. |
 | `commands` | What a frame comes out as, and the seam a renderer sits on. |
 
 ```zig
@@ -112,6 +113,8 @@ the differences are the ones Zig forces, and there are three of them.
 | `.contain(16.0/9.0)` | `.contain = 16.0 / 9.0` |
 | `.cover(16.0/9.0)` | `.cover = 16.0 / 9.0` |
 | `.id("save")` | `.id = "save"` |
+| `ui.text("Hi", \|t\| t.font_size(32))` | `ui.text("Hi", .{ .font_size = 32 })` |
+| `WrapMode::{Words, Newline, None}` | `.words`, `.newline`, `.none` |
 | `AlignX::{Left, CenterX, Right}` | `.left`, `.center`, `.right` |
 | `AlignY::{Top, CenterY, Bottom}` | `.top`, `.center`, `.bottom` |
 | `LayoutDirection::{LeftToRight, TopToBottom}` | `.left_to_right`, `.top_to_bottom` |
@@ -199,6 +202,39 @@ layout has run, so a picture is letterboxed inside the room it was given
 without moving anything beside it. That is what makes them different from
 `.ratio` sizing, which takes part in the sharing out of space.
 
+## Text
+
+A layout engine cannot measure text. How wide `Hello` is depends on a font
+file, a size, and a rasteriser's opinion about rounding - none of which
+belongs in a library that only knows about rectangles. So the layout asks, and
+a `text.Measurer` answers:
+
+```zig
+ui.setMeasurer(.monospace(0.5, 1.0));      // for a test, or a terminal
+ui.text("Hello, Fluxion!", .{ .font_size = 32, .color = .hex(0xFFFFFF) });
+```
+
+That is the same indirection Ply has - it holds a `measure_text_fn` - and it
+is worth keeping: a program measures with
+[Fluxion Font](https://github.com/kisstp2006/fluxion-font), with a bitmap
+font, or with the monospace measurer, and the layout is identical in all
+three. The adapter for a real font is fifteen lines, and
+`examples/prose.zig` is all fifteen of them.
+
+**Text is what makes the shrink pass mean anything.** Every other kind of
+element has a minimum equal to its content and so cannot give way. A paragraph
+can: it is as wide as it would be unbroken and as narrow as its longest word,
+and everything between those is a place the layout may put it. That is why the
+passes run in the order they do -
+
+1. size along x, so every paragraph knows its width,
+2. **wrap**, so every paragraph knows how many lines it is,
+3. **propagate the heights**, so the boxes round them grow,
+4. size along y.
+
+Getting steps two and three the wrong way round makes a wrapped paragraph
+overflow the card drawn round it, which is a bug that only shows on long text.
+
 ## Colour
 
 Four floats from zero to one, which is what a GPU takes. Ply keeps the same
@@ -223,6 +259,7 @@ problem.
 
 Ported and tested:
 
+- Text: styling, measuring through a `Measurer`, word wrapping, hard newlines, per-line alignment
 - Sizing: fit, grow with weights, fixed, percent, ratio, with minima and maxima
 - `contain` and `cover`, holding a box to an aspect ratio inside its slot
 - Direction, padding, gaps, and alignment on both axes
@@ -233,25 +270,22 @@ Not yet, in the order it is worth doing:
 
 | | Why it is not here |
 | --- | --- |
-| **Text** | Needs a font; a font needs a rasteriser, and the ecosystem has not got one. `commands.Text` exists so the seam does not change shape when `fluxion-font` arrives. This is the next milestone and it gates the two below it. |
 | **The RHI backend** | The seam is settled and the layout is checked; a rounded rectangle wants an SDF fragment shader and a window, which is its own piece of work. |
 | **Scroll and clipping** | `scissor_start` / `scissor_end` are in the command list already. The clip container that emits them is not. |
 | **Hit testing, hover, focus** | Every element's final box is recorded - see `Ui.boxOf` - which is the half of it that had to come first. |
 | **Floating elements, wrapping, shaders, images** | Ply has all of these. They sit above the core rather than inside it. |
 | **Accessibility, networking, audio, storage** | Deliberately out of scope. Ply's are bound to its own subsystems, and this library builds on the fluxion ones. |
 
-One consequence worth naming: the **shrink pass is ported and in place but not
-reachable from a declaration yet**. An element can only be shrunk below its own
-content when that content can reflow into a smaller box, and in Ply that means
-text that wraps or a clip container that does not pass its children's minimum
-upwards. Both are the next milestone. Until then a container too small
-overflows, which is the right answer - a silent squeeze hides the problem, and
-overflow is what a scroll container is for.
+A container too small for its fixed children still overflows rather than
+squeezing them, which is the right answer: a silent squeeze hides the problem,
+and overflow is what a scroll container is for. What *can* give way is a
+paragraph, down to its longest word - see [Text](#text).
 
 ## Examples
 
 ```bash
-zig build example       # an application shell, printed as draw commands
+zig build example         # an application shell, printed as draw commands
+zig build example-prose   # a paragraph measured with a real font and drawn
 ```
 
 ```

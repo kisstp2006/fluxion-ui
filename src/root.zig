@@ -41,6 +41,7 @@ pub const color = @import("color.zig");
 pub const commands = @import("commands.zig");
 pub const geometry = @import("geometry.zig");
 pub const layout = @import("layout.zig");
+pub const text = @import("text.zig");
 
 /// The frame: open, close, and the three passes that follow. See `Ui`.
 pub const Ui = @import("Ui.zig");
@@ -62,6 +63,10 @@ pub const SlotFit = layout.SlotFit;
 pub const AlignX = geometry.AlignX;
 pub const AlignY = geometry.AlignY;
 
+pub const TextStyle = text.TextStyle;
+pub const Measurer = text.Measurer;
+pub const WrapMode = text.WrapMode;
+
 pub const RenderCommand = commands.RenderCommand;
 pub const Config = commands.Config;
 
@@ -70,5 +75,6 @@ test {
     _ = commands;
     _ = geometry;
     _ = layout;
+    _ = text;
     _ = Ui;
 }

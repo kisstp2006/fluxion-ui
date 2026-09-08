@@ -62,20 +62,45 @@ pub fn build(b: *std.Build) void {
         name: []const u8,
         step: []const u8,
         about: []const u8,
+        /// Whether it measures text with a real font, and so needs
+        /// fluxion-font fetched.
+        needs_font: bool = false,
     }{
         .{
             .name = "shell",
             .step = "example",
             .about = "An application shell, laid out and printed as draw commands",
         },
+        .{
+            .name = "prose",
+            .step = "example-prose",
+            .about = "A paragraph measured with a real font, wrapped, and drawn as characters",
+            .needs_font = true,
+        },
     };
 
+    // On the first run after a clean checkout this comes back null and the
+    // build runner fetches it and starts again, so a null here is the first
+    // half of the fetch rather than a failure.
+    const font_dep = b.lazyDependency("fluxion_font", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     for (examples) |example| {
+        if (example.needs_font and font_dep == null) continue;
+
+        var imports: [2]std.Build.Module.Import = undefined;
+        imports[0] = .{ .name = "fluxion_ui", .module = mod };
+        if (example.needs_font) {
+            imports[1] = .{ .name = "fluxion_font", .module = font_dep.?.module("fluxion_font") };
+        }
+
         const example_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{example.name})),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "fluxion_ui", .module = mod }},
+            .imports = imports[0..if (example.needs_font) @as(usize, 2) else 1],
         });
 
         const exe = b.addExecutable(.{

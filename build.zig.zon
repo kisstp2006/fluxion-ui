@@ -13,6 +13,15 @@
             .url = "git+https://github.com/kisstp2006/fluxion-math#92afdbddbf930369265d24136402c7eb5dd8f70e",
             .hash = "fluxion_math-0.1.0-dfpZBeNUBAAwUMriLKaOTRBWGFmfY53_jyYuMUxkPYek",
         },
+
+        // What one example measures and draws text with. Lazy, and named
+        // here rather than imported by the library: a layout asks how wide a
+        // run of text is and does not care who answers - see `text.Measurer`.
+        // A path dependency until the repository is published.
+        .fluxion_font = .{
+            .path = "../fluxion-font",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
