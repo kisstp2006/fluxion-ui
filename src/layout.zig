@@ -243,6 +243,9 @@ pub const Declaration = struct {
     /// What happens to content larger than this element. See `Clip`.
     clip: Clip = .none,
 
+    /// Take it out of the flow and hang it off something. See `Floating`.
+    floating: ?Floating = null,
+
     /// Whether the pointer stops here rather than reaching what is behind.
     /// Ply's `.capture()`, and what a button inside a draggable panel wants:
     /// dragging the button must not also drag the panel.
@@ -319,6 +322,85 @@ pub const BorderWidth = extern struct {
 /// Where the line sits relative to the box. Ply's three, under Ply's names -
 /// which is why the middle one is `middle` rather than `center`.
 pub const BorderPosition = enum { outside, middle, inside };
+
+/// An element positioned against another one rather than laid out in the
+/// flow. Ply's `FloatingConfig`.
+///
+/// **It is not its parent's child for layout purposes.** Its siblings are
+/// placed as if it were not declared, it does not count towards the parent's
+/// fit size, and nothing shifts when it appears or goes away - which is the
+/// whole point. A menu, a tooltip, a dropdown and a modal are all this one
+/// feature, and every one of them has to be able to appear without the page
+/// under it moving.
+///
+/// Where it goes is two anchor points and an offset: a point on this element
+/// is put on a point of whatever it is attached to.
+///
+/// ```zig
+/// ui.open(.{
+///     .id = "menu",
+///     .width = .fixed(180),
+///     .floating = .{ .anchor = .below, .offset = .{ .x = 0, .y = 4 } },
+/// });
+/// defer ui.close();
+/// ```
+pub const Floating = struct {
+    /// What it hangs off. See `Attach`.
+    attach: Attach = .parent,
+    /// Which element, when `attach` is `.id`. Looked up once the whole tree
+    /// is laid out, so it may name something declared later - which Ply's
+    /// cannot, because it resolves as the element is declared.
+    to: ?[]const u8 = null,
+    /// Which point of this element goes on which point of the target.
+    anchor: Anchor = .{},
+    /// Moved by this much afterwards, in pixels. The gap between a button and
+    /// the menu under it.
+    offset: geometry.Vec2 = .{ .x = 0, .y = 0 },
+    /// Which floating element is drawn over which. Ties are drawn in the
+    /// order they were declared.
+    ///
+    /// Not the same as `Declaration.z_index`, which is a number carried on
+    /// every command for a renderer that wants to sort. This one decides the
+    /// order the floating elements are *emitted* in, which is what actually
+    /// puts one over another.
+    z_index: i16 = 0,
+    /// Whether to cut it off at the edge of what it is attached to. Ply's
+    /// `clip_by_parent`.
+    clip: bool = false,
+
+    pub const Attach = enum {
+        /// The element it was declared inside. The usual one.
+        parent,
+        /// The whole surface, so a modal can be declared wherever it is
+        /// convenient and still cover the window.
+        root,
+        /// The element named by `to`.
+        id,
+    };
+
+    /// Which point of the floating element is put on which point of the
+    /// target. Ply's `anchor((element_x, element_y), (parent_x, parent_y))`,
+    /// as a struct - so a caller names only the ends they care about.
+    pub const Anchor = struct {
+        element_x: geometry.AlignX = .left,
+        element_y: geometry.AlignY = .top,
+        parent_x: geometry.AlignX = .left,
+        parent_y: geometry.AlignY = .top,
+
+        /// The four that get written. Everything else is worth spelling out.
+        pub const below: Anchor = .{ .parent_y = .bottom };
+        pub const above: Anchor = .{ .element_y = .bottom };
+        pub const after: Anchor = .{ .parent_x = .right };
+        pub const before: Anchor = .{ .element_x = .right };
+        /// Middle on middle, which is where a dialog goes.
+        pub const centered: Anchor = .{
+            .element_x = .center,
+            .element_y = .center,
+            .parent_x = .center,
+            .parent_y = .center,
+        };
+    };
+};
 
 /// The bar drawn down the edge of a scroll container.
 ///

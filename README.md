@@ -122,6 +122,8 @@ the differences are the ones Zig forces, and there are three of them.
 | `pointer_over(id)` | `ui.isPointerOver("save")` |
 | `is_pressed(id)` | `ui.isElementPressed("save")` |
 | `bounding_box(id)` | `ui.boxOf("save")` |
+| `.floating(\|f\| f.anchor((Right, Top), (Right, Bottom)))` | `.floating = .{ .anchor = .{ .element_x = .right, .parent_x = .right, .parent_y = .bottom } }` |
+| `.floating(\|f\| f.attach_root())` | `.floating = .{ .attach = .root }` |
 | `.capture()` | `.capture = true` |
 | `.text_input(\|t\| t.placeholder("Name"))` | `ui.textInput(.{ ... }, .{ .placeholder = "Name" })` |
 | `{color=red\|text}` in every string | `ui.markup("{color=red\|text}", style)` |
@@ -454,6 +456,61 @@ writing is wanted more often than escaping one, and Ply buys the choice by
 giving the cursor an extra position for every closing brace - at the price of a
 right arrow that sometimes does not appear to move.
 
+## Floating
+
+```zig
+ui.open(.{ .id = "button", .width = .fit, .height = .fit });
+{
+    defer ui.close();
+    ui.text("Menu", .{ .font_size = 13 });
+
+    if (ui.isPointerOver("button") or ui.isPointerOver("menu")) {
+        ui.open(.{
+            .id = "menu",
+            .width = .fixed(170),
+            .height = .fit,
+            .floating = .{ .anchor = .below, .offset = .{ .x = 0, .y = 6 } },
+        });
+        defer ui.close();
+        // ... the items ...
+    }
+}
+```
+
+**A floating element is not its parent's child for layout purposes.** Its
+siblings are placed as though it were not declared, it adds nothing to the
+parent's fit size, and nothing moves when it appears or goes away - which is
+the whole point. A menu, a tooltip, a dropdown and a modal are all this one
+feature, and every one of them has to be able to appear without the page under
+it shifting.
+
+Where it goes is two anchor points and an offset: a point on the element is put
+on a point of whatever it is attached to. `.anchor = .below` is the element's
+top left onto the target's bottom left; `above`, `after`, `before` and
+`centered` are the others worth having a name. Anything else is spelt out:
+
+```zig
+.anchor = .{ .element_x = .right, .parent_x = .right, .parent_y = .bottom }
+```
+
+**What it attaches to** is `.parent` (the element it was declared inside),
+`.root` (the whole surface, for a modal), or `.id` with a name. A name is
+resolved once the whole tree is laid out, so it may point at something declared
+*later* - Ply resolves as the element is declared and cannot.
+
+**It grows into its target.** A floating element has no parent to grow into, so
+`.grow` fills whatever it is anchored to and `.percent(0.5)` is half of it -
+which is what makes a dropdown the width of the control it drops from.
+
+**It is drawn over the page**, in `z_index` order and in declaration order
+within one, and the pointer finds it first. Ply's `clip_by_parent` is
+`.clip = true`, which cuts it off at the target's edge.
+
+One thing worth knowing: **a floating element ends the chain the pointer walks
+up**. Standing on the menu does not count as standing on the button it hangs
+off, because on screen it is not inside it - the same reason `capture` stops
+the walk. A hover menu asks about both, as the example above does.
+
 ## Text input
 
 ```zig
@@ -629,6 +686,7 @@ than from memory.
 | **Clipping and scrolling** | per axis, with the position remembered between frames and clamped when the content shrinks |
 | **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
 | **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, and clip-aware picking |
+| **Floating** | out of the flow, anchored to a parent, an element by name, or the surface, with an offset, a z-index and optional clipping |
 | **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup |
 | **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text |
 
@@ -639,7 +697,6 @@ the order it is worth doing in.
 
 | | What it is, and what it needs |
 | --- | --- |
-| **Floating elements** | `.floating(...)`: an element positioned against another one rather than laid out in the flow, with an anchor pair, an offset, a z-index, and a choice of what to attach to. Menus, tooltips, dropdowns and dialogs are all this one feature. |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus`, `on_unfocus`. Everything but the focus pair can be had today by asking - `hovered()`, `justReleased()` - so this is about the shape of the API, not about what it can do. |
 | **Wrapping** | `.layout(\|l\| l.wrap())` and `wrap_gap`: children that run onto a second row when they do not fit. A tag list, a toolbar, a gallery. |
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |

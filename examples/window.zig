@@ -168,7 +168,74 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
         {
             defer u.close();
 
-            u.text("One draw call", .{ .font_size = 22, .color = theme.ink });
+            // A title with a menu button beside it. The menu hangs off the
+            // button and is out of the flow, so nothing in this column moves
+            // when it appears.
+            u.open(.{ .width = .grow, .height = .fit, .align_y = .center });
+            {
+                defer u.close();
+                u.text("One draw call", .{ .font_size = 22, .color = theme.ink });
+                u.empty(.{ .width = .grow, .height = .fixed(1) });
+
+                // Asked about both, because a floating element ends the chain
+                // the pointer walks up: standing on the menu does not count as
+                // standing on the button it hangs off.
+                const open = u.isPointerOver("menu-button") or u.isPointerOver("menu");
+
+                u.open(.{
+                    .id = "menu-button",
+                    .width = .fit,
+                    .height = .fit,
+                    .padding = .xy(12, 7),
+                    .corner_radius = .all(6),
+                    .background_color = if (open) theme.hover else theme.card,
+                    .border = .all(theme.line, 1),
+                });
+                defer u.close();
+                u.text("Menu", .{ .font_size = 13, .color = theme.ink });
+
+                if (open) {
+                    u.open(.{
+                        .id = "menu",
+                        .width = .fixed(170),
+                        .height = .fit,
+                        .padding = .all(6),
+                        .gap = 2,
+                        .direction = .top_to_bottom,
+                        .corner_radius = .all(8),
+                        .background_color = theme.card,
+                        .border = .all(theme.line, 1),
+                        // Its right edge on the button's right edge, below it.
+                        .floating = .{
+                            .anchor = .{ .element_x = .right, .parent_x = .right, .parent_y = .bottom },
+                            .offset = .{ .x = 0, .y = 6 },
+                            .z_index = 10,
+                        },
+                    });
+                    defer u.close();
+
+                    for ([_][2][]const u8{
+                        .{ "menu-open", "Open" },
+                        .{ "menu-save", "Save as..." },
+                        .{ "menu-close", "Close" },
+                    }) |item| {
+                        u.open(.{
+                            .id = item[0],
+                            .width = .grow,
+                            .height = .fixed(26),
+                            .padding = .xy(8, 0),
+                            .align_y = .center,
+                            .corner_radius = .all(4),
+                            .background_color = if (u.isPointerOver(item[0]))
+                                theme.hover
+                            else
+                                .transparent,
+                        });
+                        defer u.close();
+                        u.text(item[1], .{ .font_size = 13, .color = theme.ink });
+                    }
+                }
+            }
             u.text(body, .{ .font_size = 13, .color = theme.ink });
 
             // Markup: the tags come off when the run is declared, so this

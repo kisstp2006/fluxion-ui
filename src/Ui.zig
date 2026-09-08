@@ -143,6 +143,22 @@ const Element = struct {
     /// What it does with content larger than itself. See `layout.Clip`.
     clip: layout.Clip = .none,
 
+    /// Set when this element is out of the flow. See `layout.Floating`.
+    floating: ?layout.Floating = null,
+    /// What a floating element is allowed to be pointed at through, worked
+    /// out when it is placed: the thing it is clipped to, or the whole
+    /// surface. Null for everything else, which inherits from its parent.
+    float_visible: ?BoundingBox = null,
+
+    /// When this element was drawn, counting from zero.
+    ///
+    /// Declaration order and paint order are not the same once anything
+    /// floats: a menu declared halfway down the tree is drawn after all of
+    /// it. The hit test wants paint order - the last thing drawn is the thing
+    /// on top - and this is how it gets it without the elements having to be
+    /// stored in that order.
+    paint: u32 = 0,
+
     /// Where in `elements` its parent is. The root is its own parent, which
     /// is what stops the walk up the tree rather than a sentinel nobody
     /// remembers to check.
@@ -190,8 +206,14 @@ const Hit = struct {
     /// own box says otherwise - which is what stops a scrolled-away row
     /// answering a click.
     visible: BoundingBox,
+    /// When it was drawn. See `Element.paint`.
+    paint: u32,
     /// Index into `hits` of the parent's entry, or itself for the root.
     parent: u32,
+    /// Whether it is out of the flow, which ends the walk up the tree: a
+    /// floating element is not inside its declared parent on screen, so the
+    /// parent is not under the pointer when the float is.
+    floating: bool,
     capture: bool,
     preserve_focus: bool,
     /// Whether this is a text input, which a press has more to do about.
@@ -281,6 +303,14 @@ const Bar = struct {
     /// ratio a drag is converted through.
     max_scroll: f32,
     thumb_travel: f32,
+};
+
+/// One element that is out of the flow.
+const Float = struct {
+    /// Where it is in `elements`.
+    element: u32,
+    /// The element it was declared inside, which is who `.parent` means.
+    declared_in: u32,
 };
 
 /// A press on a text input, waiting for the layout to say where it landed.
@@ -384,6 +414,16 @@ over: std.ArrayList(u32),
 held: std.ArrayList(u32),
 /// Which element has the keyboard, or zero for none.
 focus: u32 = 0,
+
+/// The elements that are out of the flow, in the order they were declared.
+///
+/// Each is a layout root of its own: sized on its own after the flow is
+/// sized, placed on its own after the flow is placed, and drawn after all of
+/// it. Ply calls these its tree roots and keeps the main tree as the first
+/// one; here the main tree is element zero and these are beside it.
+floats: std.ArrayList(Float),
+/// Counts the elements as they are drawn, for `Element.paint`.
+painted: u32 = 0,
 
 /// What each text input holds, kept between frames.
 ///
@@ -493,6 +533,7 @@ pub fn init(gpa: Allocator) Ui {
         .open_stack = .empty,
         .output = .empty,
         .hits = .empty,
+        .floats = .empty,
         .edits = .empty,
         .clipboard = .empty,
         .field_lines = .empty,
@@ -518,6 +559,7 @@ pub fn deinit(self: *Ui) void {
     self.open_stack.deinit(self.gpa);
     self.output.deinit(self.gpa);
     self.hits.deinit(self.gpa);
+    self.floats.deinit(self.gpa);
     var typed = self.edits.valueIterator();
     while (typed.next()) |edit| edit.deinit(self.gpa);
     self.edits.deinit(self.gpa);
@@ -548,6 +590,7 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
     self.deferred = null;
 
     self.elements.clearRetainingCapacity();
+    self.floats.clearRetainingCapacity();
     self.children.clearRetainingCapacity();
     self.pending.clearRetainingCapacity();
     self.open_stack.clearRetainingCapacity();
@@ -666,10 +709,19 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
         .parent = self.innermost(),
         .capture = declaration.capture,
         .preserve_focus = declaration.preserve_focus,
+        .floating = declaration.floating,
     });
 
-    // The new element is a child of whatever is open, unless it is the root.
-    if (self.open_stack.items.len > 0) try self.pending.append(self.gpa, index);
+    // The new element is a child of whatever is open, unless it is the root -
+    // or unless it floats, in which case it is nobody's child. That one line
+    // is most of what floating means: its siblings are placed as though it
+    // were not declared, it adds nothing to the parent's fit size, and
+    // nothing moves when it appears.
+    if (declaration.floating) |_| {
+        try self.floats.append(self.gpa, .{ .element = index, .declared_in = self.innermost() });
+    } else if (self.open_stack.items.len > 0) {
+        try self.pending.append(self.gpa, index);
+    }
 
     try self.open_stack.append(self.gpa, .{
         .element = index,
@@ -993,6 +1045,7 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
     self.elements.items[0].dimensions = self.surface;
 
     try self.sizeAlongAxis(true, 0);
+    try self.sizeFloats(true);
     self.resolveRatios(true);
 
     // Text wraps once the widths are settled, and only then is a paragraph's
@@ -1003,10 +1056,14 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
     self.propagateHeights();
 
     try self.sizeAlongAxis(false, 0);
+    try self.sizeFloats(false);
     self.resolveRatios(false);
     try self.applySlotFit();
 
-    try self.positionAndEmit();
+    self.painted = 0;
+    self.bars.clearRetainingCapacity();
+    try self.positionAndEmit(0, .zero);
+    try self.placeFloats();
     try self.measureScroll();
     try self.recordHits();
     try self.sweepFields();
@@ -1630,20 +1687,21 @@ fn emitPiece(
 /// Depth first with children in order is what puts the list in back-to-front
 /// order without anything having to sort it: a parent's background is written
 /// before its children are visited, and its border after they are done.
-fn positionAndEmit(self: *Ui) Error!void {
+fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
     self.walk.clearRetainingCapacity();
-    self.bars.clearRetainingCapacity();
     try self.walk.append(self.gpa, .{
-        .element = 0,
-        .position = .zero,
-        .next_child = self.startOffset(self.elements.items[0]),
+        .element = root,
+        .position = at,
+        .next_child = self.startOffset(self.elements.items[root]),
     });
-    self.elements.items[0].box = .at(0, 0, self.elements.items[0].dimensions);
-    try self.emitBackground(0, self.elements.items[0].box);
-    try self.emitText(0, self.elements.items[0].box);
-    try self.emitField(0, self.elements.items[0].box);
-    if (self.elements.items[0].clip.clips()) {
-        try self.emitScissor(.scissor_start, self.elements.items[0].box);
+    self.elements.items[root].box = .at(at.x, at.y, self.elements.items[root].dimensions);
+    self.elements.items[root].paint = self.painted;
+    self.painted += 1;
+    try self.emitBackground(root, self.elements.items[root].box);
+    try self.emitText(root, self.elements.items[root].box);
+    try self.emitField(root, self.elements.items[root].box);
+    if (self.elements.items[root].clip.clips()) {
+        try self.emitScissor(.scissor_start, self.elements.items[root].box);
     }
 
     while (self.walk.items.len > 0) {
@@ -1698,6 +1756,8 @@ fn positionAndEmit(self: *Ui) Error!void {
         self.walk.items[depth].placed += 1;
 
         self.elements.items[child_index].box = .at(x, y, child.dimensions);
+        self.elements.items[child_index].paint = self.painted;
+        self.painted += 1;
         try self.emitBackground(child_index, self.elements.items[child_index].box);
         try self.emitText(child_index, self.elements.items[child_index].box);
         try self.emitField(child_index, self.elements.items[child_index].box);
@@ -2002,6 +2062,101 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
     }
 }
 
+/// Give each floating element a size on one axis, then size its subtree.
+///
+/// A floating element has no parent to grow into, so it is grown into
+/// whatever it is attached to instead - which is what makes a dropdown as
+/// wide as the button it hangs off, and a modal `.grow` cover the window.
+/// Ply sizes its floating roots at the same point and for the same reason.
+///
+/// The target has already been sized on this axis: it is in the flow, and the
+/// flow was sized a moment ago. A float attached to another float declared
+/// later has not been, and falls back to its own fit size rather than to a
+/// number that is not there yet.
+fn sizeFloats(self: *Ui, x_axis: bool) Error!void {
+    for (self.floats.items) |float| {
+        const target = self.floatTarget(float);
+        const room = if (target) |index|
+            self.elements.items[index].dimensions.onAxis(x_axis)
+        else
+            self.surface.onAxis(x_axis);
+
+        const element = &self.elements.items[float.element];
+        const wanted = element.config.sizing.onAxis(x_axis);
+        const size = switch (wanted.kind) {
+            .grow => room,
+            .percent => room * wanted.fraction,
+            // `fit` was worked out when it closed, and `fixed` is fixed.
+            else => element.dimensions.onAxis(x_axis),
+        };
+
+        const held = std.math.clamp(size, wanted.min, if (wanted.max > 0) wanted.max else size);
+        if (x_axis) element.dimensions.width = held else element.dimensions.height = held;
+
+        try self.sizeAlongAxis(x_axis, float.element);
+    }
+}
+
+/// Which element a float hangs off, or null for the surface.
+fn floatTarget(self: *Ui, float: Float) ?u32 {
+    const config = self.elements.items[float.element].floating orelse return null;
+    return switch (config.attach) {
+        .parent => if (float.element == 0) null else float.declared_in,
+        .root => null,
+        .id => blk: {
+            const name = config.to orelse break :blk null;
+            const wanted = identify(name, 0);
+            for (self.elements.items, 0..) |element, i| {
+                if (element.id == wanted) break :blk @intCast(i);
+            }
+            break :blk null;
+        },
+    };
+}
+
+/// Put each floating element where its anchor says, and draw it.
+///
+/// After the whole flow has been placed, because that is when the boxes it
+/// anchors against exist. In `z_index` order, and in declaration order within
+/// one - the later of two menus at the same depth is the one on top.
+fn placeFloats(self: *Ui) Error!void {
+    // Stable, so ties keep the order they were declared in. Ply bubble-sorts
+    // its roots, which is stable too.
+    std.sort.insertion(Float, self.floats.items, self, lowerFloat);
+
+    for (self.floats.items) |float| {
+        const config = self.elements.items[float.element].floating orelse continue;
+        const target = self.floatTarget(float);
+        const against: BoundingBox = if (target) |index|
+            self.elements.items[index].box
+        else
+            .init(0, 0, self.surface.width, self.surface.height);
+
+        const size = self.elements.items[float.element].dimensions;
+        const at: Point = .{
+            .x = against.x + geometry.leadingSpaceX(against.width, config.anchor.parent_x) -
+                geometry.leadingSpaceX(size.width, config.anchor.element_x) + config.offset.x,
+            .y = against.y + geometry.leadingSpaceY(against.height, config.anchor.parent_y) -
+                geometry.leadingSpaceY(size.height, config.anchor.element_y) + config.offset.y,
+        };
+
+        // What it can be seen and pointed at through. A float is not inside
+        // its declared parent on screen, so it does not inherit whatever that
+        // parent clips - unless it asked to be clipped to it.
+        self.elements.items[float.element].float_visible = if (config.clip) against else null;
+
+        if (config.clip) try self.emitScissor(.scissor_start, against);
+        try self.positionAndEmit(float.element, at);
+        if (config.clip) try self.emitScissor(.scissor_end, against);
+    }
+}
+
+fn lowerFloat(self: *Ui, a: Float, b: Float) bool {
+    const first = if (self.elements.items[a.element].floating) |config| config.z_index else 0;
+    const second = if (self.elements.items[b.element].floating) |config| config.z_index else 0;
+    return first < second;
+}
+
 /// Where one scrollbar goes, and what a drag of it is worth.
 const BarGeometry = struct {
     track: BoundingBox,
@@ -2253,6 +2408,10 @@ fn recordHits(self: *Ui) Error!void {
         // is bounded by the surface, which is also its own box.
         const visible: BoundingBox = if (i == 0)
             element.box
+        else if (element.float_visible) |box|
+            box
+        else if (element.floating != null)
+            .init(0, 0, self.surface.width, self.surface.height)
         else block: {
             const outer = self.hits.items[parent];
             const from_parent = if (self.elements.items[parent].clip.clips())
@@ -2266,7 +2425,9 @@ fn recordHits(self: *Ui) Error!void {
             .id = element.id,
             .box = element.box,
             .visible = visible,
+            .paint = element.paint,
             .parent = parent,
+            .floating = element.floating != null,
             .capture = element.capture,
             .preserve_focus = element.preserve_focus,
             .field = element.field != null,
@@ -2502,14 +2663,15 @@ pub fn draggingScrollbar(self: *Ui) bool {
 fn chainUnder(self: *Ui, point: geometry.Vec2) Error!void {
     if (self.hits.items.len == 0) return;
 
+    // The one drawn last, which is not the one stored last once anything
+    // floats: a menu declared halfway down the tree is drawn after all of it.
     var topmost: ?u32 = null;
-    var i = self.hits.items.len;
-    while (i > 0) {
-        i -= 1;
-        const hit = self.hits.items[i];
-        if (hit.box.contains(point) and hit.visible.contains(point)) {
+    var latest: u32 = 0;
+    for (self.hits.items, 0..) |hit, i| {
+        if (!hit.box.contains(point) or !hit.visible.contains(point)) continue;
+        if (topmost == null or hit.paint > latest) {
             topmost = @intCast(i);
-            break;
+            latest = hit.paint;
         }
     }
 
@@ -2524,7 +2686,9 @@ fn chainUnder(self: *Ui, point: geometry.Vec2) Error!void {
     while (depth < chain.len) {
         chain[depth] = at;
         depth += 1;
-        if (self.hits.items[at].capture) break;
+        // A float ends the chain for the same reason `capture` does: what is
+        // above it in the tree is not what is under it on the screen.
+        if (self.hits.items[at].capture or self.hits.items[at].floating) break;
         const parent = self.hits.items[at].parent;
         if (parent == at) break;
         at = parent;
@@ -5929,4 +6093,363 @@ test "the text a caller handed over is copied, tags and all" {
     const pieces = drawnPieces(drawn, &out);
     try testing.expectEqualStrings("n = 1 and ", pieces[0].config.text.text);
     try testing.expectEqualStrings("2", pieces[1].config.text.text);
+}
+
+// -------------------------------------------------------------------------
+// Floating
+// -------------------------------------------------------------------------
+
+// A hundred by forty button at the top left of the surface, with something
+// hanging off it. Every number below is against that box, so the arithmetic
+// can be read without keeping the whole tree in mind.
+
+/// A row with a button in it, and a floating element declared inside the
+/// button. `after` is whatever else the row should hold.
+fn withMenu(u: *Ui, float: layout.Floating, size: layout.Sizing) ![]const commands.RenderCommand {
+    u.begin(.init(400, 300));
+    openRoot(u);
+    {
+        u.open(.{ .id = "button", .width = .fixed(100), .height = .fixed(40), .background_color = paint });
+        defer u.close();
+
+        u.open(.{
+            .id = "menu",
+            .width = size,
+            .height = .fixed(60),
+            .background_color = paint,
+            .floating = float,
+        });
+        u.close();
+    }
+    u.close();
+    return try u.end();
+}
+
+test "a floating element is placed where its anchor says" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Its top left onto the button's bottom left: a dropdown.
+    _ = try withMenu(&ui, .{ .anchor = .below }, .fixed(80));
+    try testing.expectEqual(BoundingBox.init(0, 40, 80, 60), ui.boxOf("menu").?);
+
+    // Its bottom left onto the button's top left: a tooltip above.
+    _ = try withMenu(&ui, .{ .anchor = .above }, .fixed(80));
+    try testing.expectEqual(BoundingBox.init(0, -60, 80, 60), ui.boxOf("menu").?);
+
+    // Beside it, on either side.
+    _ = try withMenu(&ui, .{ .anchor = .after }, .fixed(80));
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("menu").?.x);
+    _ = try withMenu(&ui, .{ .anchor = .before }, .fixed(80));
+    try testing.expectEqual(@as(f32, -80), ui.boxOf("menu").?.x);
+
+    // Middle on middle: eighty wide centred on a hundred is ten in, sixty
+    // tall centred on forty is ten *out*.
+    _ = try withMenu(&ui, .{ .anchor = .centered }, .fixed(80));
+    try testing.expectEqual(BoundingBox.init(10, -10, 80, 60), ui.boxOf("menu").?);
+}
+
+test "an offset moves it after the anchor has decided" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try withMenu(&ui, .{ .anchor = .below, .offset = .{ .x = 6, .y = 4 } }, .fixed(80));
+    try testing.expectEqual(BoundingBox.init(6, 44, 80, 60), ui.boxOf("menu").?);
+}
+
+test "nothing in the flow moves because something floats" {
+    // The whole point. A menu appearing must not push the page about.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const row = struct {
+        fn run(u: *Ui, menu: bool) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{ .id = "row", .width = .fit, .height = .fit, .gap = 8 });
+                defer u.close();
+
+                leaf(u, "first", .{ .width = .fixed(50), .height = .fixed(20) });
+                if (menu) {
+                    u.open(.{
+                        .id = "menu",
+                        .width = .fixed(200),
+                        .height = .fixed(200),
+                        .floating = .{ .anchor = .below },
+                    });
+                    u.close();
+                }
+                leaf(u, "second", .{ .width = .fixed(50), .height = .fixed(20) });
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try row(&ui, false);
+    const without = ui.boxOf("second").?;
+    const row_without = ui.boxOf("row").?;
+
+    try row(&ui, true);
+    try testing.expectEqual(without, ui.boxOf("second").?);
+    // And the row did not grow to hold two hundred pixels of menu.
+    try testing.expectEqual(row_without, ui.boxOf("row").?);
+}
+
+test "a floating element grows into what it is attached to" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // No parent to grow into, so it grows into the button - which is what
+    // makes a dropdown the width of the control it drops from.
+    _ = try withMenu(&ui, .{ .anchor = .below }, .grow);
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("menu").?.width);
+
+    _ = try withMenu(&ui, .{ .anchor = .below }, .percent(0.5));
+    try testing.expectEqual(@as(f32, 50), ui.boxOf("menu").?.width);
+}
+
+test "attaching to the root measures against the surface" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try withMenu(&ui, .{ .attach = .root, .anchor = .centered }, .grow);
+
+    // Four hundred wide, and centred on a three hundred tall surface.
+    const box = ui.boxOf("menu").?;
+    try testing.expectEqual(@as(f32, 400), box.width);
+    try testing.expectEqual(@as(f32, 0), box.x);
+    try testing.expectEqual(@as(f32, 120), box.y);
+}
+
+test "attaching by name finds an element declared later" {
+    // Ply resolves the name as the element is declared, so it can only name
+    // something already seen. This resolves once the tree is laid out, so the
+    // order does not matter.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "tip",
+            .width = .fixed(30),
+            .height = .fixed(10),
+            .floating = .{ .attach = .id, .to = "later", .anchor = .below },
+        });
+        ui.close();
+
+        leaf(&ui, "spacer", .{ .width = .fixed(70), .height = .fixed(25) });
+        leaf(&ui, "later", .{ .width = .fixed(50), .height = .fixed(25) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // "later" sits after the spacer, and the tip hangs off its bottom left.
+    try testing.expectEqual(BoundingBox.init(70, 25, 30, 10), ui.boxOf("tip").?);
+}
+
+test "a floating element is drawn over the page, whatever order it was declared in" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "under", .width = .fixed(100), .height = .fixed(40), .background_color = paint });
+        defer ui.close();
+        ui.open(.{
+            .id = "over",
+            .width = .fixed(100),
+            .height = .fixed(40),
+            .background_color = paint,
+            .floating = .{},
+        });
+        ui.close();
+    }
+    // Declared before the float, drawn after it if paint order were
+    // declaration order.
+    leaf(&ui, "sibling", .{ .width = .fixed(400), .height = .fixed(300) });
+    ui.close();
+    const drawn = try ui.end();
+
+    // The float's rectangle is the last one out.
+    var last: u32 = 0;
+    for (drawn) |command| {
+        if (std.meta.activeTag(command.config) == .rectangle) last = command.id;
+    }
+    try testing.expectEqual(identify("over", 0), last);
+}
+
+test "the pointer finds a floating element before what is under it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{ .id = "page", .width = .grow, .height = .grow, .background_color = paint });
+                defer u.close();
+                u.open(.{
+                    .id = "menu",
+                    .width = .fixed(100),
+                    .height = .fixed(50),
+                    .background_color = paint,
+                    .floating = .{ .attach = .root },
+                });
+                u.close();
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+    ui.setPointer(50, 25, false);
+    try frame(&ui);
+
+    try testing.expect(ui.isPointerOver("menu"));
+    // And the page beneath it is not, because a float is not inside what it
+    // was declared in - it only remembers who to hang off.
+    try testing.expect(!ui.isPointerOver("page"));
+
+    // Beside the menu, the page is found as usual.
+    ui.setPointer(300, 200, false);
+    try frame(&ui);
+    try testing.expect(ui.isPointerOver("page"));
+    try testing.expect(!ui.isPointerOver("menu"));
+}
+
+test "z_index decides which float is on top, and ties keep their order" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const two = struct {
+        fn run(u: *Ui, first: i16, second: i16) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            u.open(.{
+                .id = "low",
+                .width = .fixed(100),
+                .height = .fixed(100),
+                .background_color = paint,
+                .floating = .{ .attach = .root, .z_index = first },
+            });
+            u.close();
+            u.open(.{
+                .id = "high",
+                .width = .fixed(100),
+                .height = .fixed(100),
+                .background_color = paint,
+                .floating = .{ .attach = .root, .z_index = second },
+            });
+            u.close();
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    // Same z: the later one wins, which is declaration order.
+    try two(&ui, 0, 0);
+    ui.setPointer(50, 50, false);
+    try two(&ui, 0, 0);
+    try testing.expect(ui.isPointerOver("high"));
+
+    // A higher z on the first one turns it round.
+    try two(&ui, 5, 0);
+    ui.setPointer(50, 50, false);
+    try two(&ui, 5, 0);
+    try testing.expect(ui.isPointerOver("low"));
+}
+
+test "a float is not clipped by what it was declared in, unless it asks" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui, clip: bool) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                // A small clipping box with something hanging well outside it.
+                u.open(.{
+                    .id = "window",
+                    .width = .fixed(60),
+                    .height = .fixed(60),
+                    .clip = .both,
+                    .background_color = paint,
+                });
+                defer u.close();
+                u.open(.{
+                    .id = "tip",
+                    .width = .fixed(100),
+                    .height = .fixed(30),
+                    .background_color = paint,
+                    .floating = .{ .anchor = .below, .clip = clip },
+                });
+                u.close();
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    // Hanging below the window, outside it entirely.
+    try frame(&ui, false);
+    ui.setPointer(50, 70, false);
+    try frame(&ui, false);
+    try testing.expect(ui.isPointerOver("tip"));
+
+    // Clipped to it, the same point is outside what is showing.
+    try frame(&ui, true);
+    ui.setPointer(50, 70, false);
+    try frame(&ui, true);
+    try testing.expect(!ui.isPointerOver("tip"));
+}
+
+test "clipping a float to its parent emits a balanced scissor" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const drawn = try withMenu(&ui, .{ .anchor = .below, .clip = true }, .fixed(80));
+    const emitted: commands.List = .{ .items = drawn };
+    try testing.expect(emitted.scissorsBalanced());
+    try testing.expectEqual(@as(usize, 1), emitted.count(.scissor_start));
+}
+
+test "a float can hold a whole tree of its own" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "button", .width = .fixed(120), .height = .fixed(30) });
+        defer ui.close();
+
+        ui.open(.{
+            .id = "menu",
+            .width = .grow,
+            .height = .fit,
+            .padding = .all(4),
+            .gap = 2,
+            .direction = .top_to_bottom,
+            .floating = .{ .anchor = .below },
+        });
+        defer ui.close();
+        leaf(&ui, "one", .{ .width = .grow, .height = .fixed(20) });
+        leaf(&ui, "two", .{ .width = .grow, .height = .fixed(20) });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // The float grew to the button, fitted its two rows, and laid them out
+    // inside its own padding - the same solver, on a root of its own.
+    try testing.expectEqual(BoundingBox.init(0, 30, 120, 50), ui.boxOf("menu").?);
+    try testing.expectEqual(BoundingBox.init(4, 34, 112, 20), ui.boxOf("one").?);
+    try testing.expectEqual(BoundingBox.init(4, 56, 112, 20), ui.boxOf("two").?);
 }
