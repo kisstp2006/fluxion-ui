@@ -128,6 +128,7 @@ the differences are the ones Zig forces, and there are three of them.
 | `.image(asset)` | `.image = .{ .texture = 0 }` |
 | `.rotate_visual(\|r\| r.degrees(30))` | `.rotate = .degrees(30)` |
 | `.rotate_shape(\|r\| r.degrees(30))` | `.rotate_shape = .degrees(30)` |
+| `.on_press(\|\| ...)` | `.on_press = .{ .context = &state, .call = pressed }` |
 | `.capture()` | `.capture = true` |
 | `.text_input(\|t\| t.placeholder("Name"))` | `ui.textInput(.{ ... }, .{ .placeholder = "Name" })` |
 | `{color=red\|text}` in every string | `ui.markup("{color=red\|text}", style)` |
@@ -661,6 +662,44 @@ up**. Standing on the menu does not count as standing on the button it hangs
 off, because on screen it is not inside it - the same reason `capture` stops
 the walk. A hover menu asks about both, as the example above does.
 
+## Callbacks
+
+```zig
+fn pressed(context: ?*anyopaque, event: ui.Callback.Event) void {
+    const count: *u32 = @ptrCast(@alignCast(context.?));
+    count.* += 1;
+    _ = event;
+}
+
+ui.empty(.{ .id = "button", .on_press = .{ .context = &count, .call = pressed } });
+```
+
+Ply's five, under Ply's names: `on_hover`, `on_press`, `on_release`,
+`on_focus` and `on_unfocus`. Ply writes `.on_press(|| count += 1)` and Rust
+captures `count`; Zig has no closures, so what would have been captured is
+passed as the context and the callback casts it back - the same shape
+`Measurer` already has.
+
+**They are called when the frame is over**, from `end`, after the commands are
+built. That is where Ply calls its own and it is the only point that can be
+right: a callback changes the program's state for the *next* frame rather than
+for the one being handed over. What a callback must not do is declare
+elements, because the frame it would declare them into has already gone.
+
+`on_hover` fires every frame the pointer is over, not the frame it arrives -
+Ply's meaning of the word, and the one [`hovered()`](#pointing-at-things)
+answers. `on_release` is told whether the pointer was still on the element
+when the button came up, which is the difference between a click and a change
+of mind. A press walks the chain, so a card wrapping a label hears about a
+press on the label unless it `capture`s.
+
+**Asking is usually the better shape.** `hovered()`, `pressed()` and
+`justReleased()` answer in the branch that drew the button, where the state
+they are about already is. Callbacks are for the times that is not where the
+decision lives - a widget whose *owner* wires up the behaviour rather than
+whatever draws it - and for the focus pair, which polling cannot answer at
+all: nothing else can tell you the frame an element *lost* the keyboard.
+
 ## Text input
 
 ```zig
@@ -839,6 +878,7 @@ than from memory.
 | **Clipping and scrolling** | per axis, with the position remembered between frames and clamped when the content shrinks |
 | **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
 | **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, and clip-aware picking |
+| **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus` and `on_unfocus`, called when the frame is over |
 | **Floating** | out of the flow, anchored to a parent, an element by name, or the surface, with an offset, a z-index and optional clipping |
 | **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup |
 | **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text |
@@ -850,7 +890,6 @@ the order it is worth doing in.
 
 | | What it is, and what it needs |
 | --- | --- |
-| **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus`, `on_unfocus`. Everything but the focus pair can be had today by asking - `hovered()`, `justReleased()` - so this is about the shape of the API, not about what it can do. |
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
 | **TinyVG** | Ply can hand a vector image straight to `.image(...)` and rasterise it. Here a picture is a texture, and turning TinyVG into one is somebody else's pass. |
 | **Shaders and effects** | `.effect(...)` and `.shader(...)`: a fragment shader per element, with Ply's own build step behind it. This renderer is one pipeline and one draw call by design, and a shader per element is a pipeline per element - so this is not a missing feature so much as a different renderer. A program that wants it can consume the command list itself. |

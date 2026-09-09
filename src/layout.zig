@@ -37,6 +37,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const geometry = @import("geometry.zig");
+const input = @import("input.zig");
 
 const AlignX = geometry.AlignX;
 const AlignY = geometry.AlignY;
@@ -277,6 +278,18 @@ pub const Declaration = struct {
     /// Take it out of the flow and hang it off something. See `Floating`.
     floating: ?Floating = null,
 
+    /// Called every frame the pointer is over this element - on *hover*, not
+    /// on entering it, which is Ply's meaning too. See `Callback`.
+    on_hover: ?Callback = null,
+    /// Called once, on the frame the button goes down on this element.
+    on_press: ?Callback = null,
+    /// Called once, on the frame it comes up, with `on_target` saying whether
+    /// it came up on the element it went down on.
+    on_release: ?Callback = null,
+    /// Called when this element takes the keyboard, and when it loses it.
+    on_focus: ?Callback = null,
+    on_unfocus: ?Callback = null,
+
     /// A picture drawn in this element's box, instead of a plain fill. See
     /// `Image`.
     image: ?Image = null,
@@ -366,6 +379,56 @@ pub const BorderWidth = extern struct {
 /// Where the line sits relative to the box. Ply's three, under Ply's names -
 /// which is why the middle one is `middle` rather than `center`.
 pub const BorderPosition = enum { outside, middle, inside };
+
+/// Something to call when an element is pointed at or focused. Ply's
+/// `on_hover` and its four siblings.
+///
+/// A context pointer and a function, which is what a closure is once the
+/// sugar is taken away - and the same shape `text.Measurer` already has. Ply
+/// writes `.on_press(|| count += 1)` and Rust captures `count`; Zig has no
+/// closures, so the thing being captured is passed as the context and the
+/// callback casts it back:
+///
+/// ```zig
+/// fn pressed(context: ?*anyopaque, event: Callback.Event) void {
+///     const count: *u32 = @ptrCast(@alignCast(context.?));
+///     count.* += 1;
+///     _ = event;
+/// }
+///
+/// ui.empty(.{ .id = "button", .on_press = .{ .context = &count, .call = pressed } });
+/// ```
+///
+/// **They are called when the frame is over**, from `Ui.end`, after the
+/// commands are built - which is where Ply calls its own. A callback may look
+/// at anything and change the program's own state; what it must not do is
+/// declare elements, because the frame it would declare them into has already
+/// been handed over.
+///
+/// Everything but the focus pair can be had by asking instead - `hovered()`,
+/// `justReleased()` - and asking is usually the better shape in an
+/// immediate-mode interface, because the answer is right there in the branch
+/// that drew the button. These are for the times it is not: a callback can be
+/// registered by whatever *owns* the button rather than by whatever draws it.
+pub const Callback = struct {
+    /// Passed back untouched. Whatever the callback needs to reach.
+    context: ?*anyopaque = null,
+    call: *const fn (context: ?*anyopaque, event: Event) void,
+
+    /// What happened. One shape for all five, where Ply has three - the
+    /// fields that do not apply are simply the ones nobody reads.
+    pub const Event = struct {
+        /// Which element, as `Ui.identify` of its name.
+        id: u32,
+        /// Where the pointer was and what its button was doing. The state a
+        /// focus change was noticed in, for those two.
+        pointer: input.Pointer,
+        /// For a release: whether the pointer was still on the element when
+        /// the button came up, which is the difference between a click and a
+        /// drag away. False for everything else. Ply passes the same flag.
+        on_target: bool = false,
+    };
+};
 
 /// A turn, and which way round. Ply's `VisualRotationConfig` and its shape
 /// twin, which differ only in what they turn.

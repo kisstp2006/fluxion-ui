@@ -334,6 +334,26 @@ const Bar = struct {
     thumb_travel: f32,
 };
 
+/// One element that asked to be told about something, and what to tell it.
+///
+/// Kept in a list of their own rather than on the element, because almost no
+/// element has any: a page of two hundred boxes with one button in it walks a
+/// list of one when the frame ends.
+const Listener = struct {
+    id: u32,
+    on_hover: ?layout.Callback,
+    on_press: ?layout.Callback,
+    on_release: ?layout.Callback,
+    on_focus: ?layout.Callback,
+    on_unfocus: ?layout.Callback,
+
+    fn any(declaration: layout.Declaration) bool {
+        return declaration.on_hover != null or declaration.on_press != null or
+            declaration.on_release != null or declaration.on_focus != null or
+            declaration.on_unfocus != null;
+    }
+};
+
 /// One element that is out of the flow.
 const Float = struct {
     /// Where it is in `elements`.
@@ -466,6 +486,16 @@ focus: u32 = 0,
 /// it. Ply calls these its tree roots and keeps the main tree as the first
 /// one; here the main tree is element zero and these are beside it.
 floats: std.ArrayList(Float),
+
+/// What to call when the frame ends. See `Listener`.
+listeners: std.ArrayList(Listener),
+/// The focus as the callbacks last saw it.
+///
+/// Not the same as `focus`, and the difference is the point: a change is
+/// noticed by comparing them when the frame ends, so a focus moved by a
+/// click, by `setFocus`, or by nothing at all is all the same to whoever
+/// asked to be told about it.
+focus_reported: u32 = 0,
 /// Counts the elements as they are drawn, for `Element.paint`.
 painted: u32 = 0,
 /// What the element being drawn is turned by, stamped onto every command it
@@ -586,6 +616,7 @@ pub fn init(gpa: Allocator) Ui {
         .output = .empty,
         .hits = .empty,
         .floats = .empty,
+        .listeners = .empty,
         .edits = .empty,
         .clipboard = .empty,
         .field_lines = .empty,
@@ -613,6 +644,7 @@ pub fn deinit(self: *Ui) void {
     self.output.deinit(self.gpa);
     self.hits.deinit(self.gpa);
     self.floats.deinit(self.gpa);
+    self.listeners.deinit(self.gpa);
     var typed = self.edits.valueIterator();
     while (typed.next()) |edit| edit.deinit(self.gpa);
     self.edits.deinit(self.gpa);
@@ -645,6 +677,7 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
 
     self.elements.clearRetainingCapacity();
     self.floats.clearRetainingCapacity();
+    self.listeners.clearRetainingCapacity();
     self.children.clearRetainingCapacity();
     self.pending.clearRetainingCapacity();
     self.open_stack.clearRetainingCapacity();
@@ -775,6 +808,17 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
     // is most of what floating means: its siblings are placed as though it
     // were not declared, it adds nothing to the parent's fit size, and
     // nothing moves when it appears.
+    if (Listener.any(declaration)) {
+        try self.listeners.append(self.gpa, .{
+            .id = self.elements.items[index].id,
+            .on_hover = declaration.on_hover,
+            .on_press = declaration.on_press,
+            .on_release = declaration.on_release,
+            .on_focus = declaration.on_focus,
+            .on_unfocus = declaration.on_unfocus,
+        });
+    }
+
     if (declaration.floating) |_| {
         try self.floats.append(self.gpa, .{ .element = index, .declared_in = self.innermost() });
     } else if (self.open_stack.items.len > 0) {
@@ -1139,6 +1183,7 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
     try self.measureScroll();
     try self.recordHits();
     try self.sweepFields();
+    self.notify();
     return self.output.items;
 }
 
@@ -2706,6 +2751,71 @@ fn measureScroll(self: *Ui) Error!void {
         }
     }
     for (stale[0..count]) |key| _ = self.scrolls.remove(key);
+}
+
+// -------------------------------------------------------------------------
+// Telling the program what happened
+// -------------------------------------------------------------------------
+
+/// Call everything that asked to be told, now the frame is over.
+///
+/// The last thing `end` does, which is where Ply calls its own and is the
+/// only point at which it is safe: the commands are built, so a callback that
+/// changes the program's state changes it for the *next* frame rather than
+/// for the one being handed over. Declaring elements from in here would
+/// declare them into a frame that has already gone.
+///
+/// The order is Ply's: focus first, then hover, then press, then release.
+fn notify(self: *Ui) void {
+    if (self.listeners.items.len == 0) {
+        // Nobody is listening, so nothing can be missed by not looking - but
+        // the focus still has to be caught up, or the first listener ever
+        // registered would be told about every focus change since the start.
+        self.focus_reported = self.focus;
+        return;
+    }
+
+    if (self.focus != self.focus_reported) {
+        const left = self.focus_reported;
+        const taken = self.focus;
+        self.focus_reported = taken;
+        if (left != 0) self.tell(left, .unfocus, false);
+        if (taken != 0) self.tell(taken, .focus, false);
+    }
+
+    // Hover is every frame the pointer is over, not the frame it arrived -
+    // which is Ply's meaning of the word and what `hovered()` answers.
+    for (self.over.items) |id| self.tell(id, .hover, false);
+
+    if (self.pointer.justPressed()) {
+        for (self.held.items) |id| self.tell(id, .press, false);
+    }
+
+    if (self.pointer.justReleased()) {
+        for (self.held.items) |id| self.tell(id, .release, self.isOver(id));
+    }
+}
+
+const Told = enum { hover, press, release, focus, unfocus };
+
+fn tell(self: *Ui, id: u32, what: Told, on_target: bool) void {
+    for (self.listeners.items) |listener| {
+        if (listener.id != id) continue;
+        const callback = switch (what) {
+            .hover => listener.on_hover,
+            .press => listener.on_press,
+            .release => listener.on_release,
+            .focus => listener.on_focus,
+            .unfocus => listener.on_unfocus,
+        } orelse return;
+
+        callback.call(callback.context, .{
+            .id = id,
+            .pointer = self.pointer,
+            .on_target = on_target,
+        });
+        return;
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -7493,4 +7603,320 @@ test "text inside a turned element is turned with it" {
         return;
     }
     try testing.expect(false);
+}
+
+// -------------------------------------------------------------------------
+// Callbacks
+// -------------------------------------------------------------------------
+
+// Every one of these runs two frames for the same reason the hit tests do:
+// what is under the pointer is known only once a frame has been laid out, so
+// the callbacks a frame registers are called about the frame before it.
+
+/// What the callbacks below write into, instead of the variables a closure
+/// in Ply would have captured.
+const Tally = struct {
+    hover: u32 = 0,
+    press: u32 = 0,
+    release: u32 = 0,
+    focus: u32 = 0,
+    unfocus: u32 = 0,
+    /// The last release's answer to "did it come up where it went down".
+    on_target: bool = false,
+    /// The id the last call was about, to prove it is the right element.
+    last: u32 = 0,
+
+    fn onHover(context: ?*anyopaque, event: layout.Callback.Event) void {
+        const self: *Tally = @ptrCast(@alignCast(context.?));
+        self.hover += 1;
+        self.last = event.id;
+    }
+
+    fn onPress(context: ?*anyopaque, event: layout.Callback.Event) void {
+        const self: *Tally = @ptrCast(@alignCast(context.?));
+        self.press += 1;
+        self.last = event.id;
+    }
+
+    fn onRelease(context: ?*anyopaque, event: layout.Callback.Event) void {
+        const self: *Tally = @ptrCast(@alignCast(context.?));
+        self.release += 1;
+        self.on_target = event.on_target;
+        self.last = event.id;
+    }
+
+    fn onFocus(context: ?*anyopaque, event: layout.Callback.Event) void {
+        const self: *Tally = @ptrCast(@alignCast(context.?));
+        self.focus += 1;
+        self.last = event.id;
+    }
+
+    fn onUnfocus(context: ?*anyopaque, event: layout.Callback.Event) void {
+        const self: *Tally = @ptrCast(@alignCast(context.?));
+        self.unfocus += 1;
+        self.last = event.id;
+    }
+
+    /// A declaration with all five wired to this tally.
+    fn watched(self: *Tally, name: []const u8) layout.Declaration {
+        return .{
+            .id = name,
+            .width = .fixed(100),
+            .height = .fixed(40),
+            .background_color = paint,
+            .on_hover = .{ .context = self, .call = onHover },
+            .on_press = .{ .context = self, .call = onPress },
+            .on_release = .{ .context = self, .call = onRelease },
+            .on_focus = .{ .context = self, .call = onFocus },
+            .on_unfocus = .{ .context = self, .call = onUnfocus },
+        };
+    }
+};
+
+/// One watched button at the top left, and nothing else.
+fn watchedButton(u: *Ui, tally: *Tally) !void {
+    u.begin(.init(400, 300));
+    openRoot(u);
+    u.empty(tally.watched("button"));
+    u.close();
+    _ = try u.end();
+}
+
+test "a press and a release reach the element that was pressed" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var tally: Tally = .{};
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 0), tally.press);
+
+    // Down on the button.
+    ui.setPointer(50, 20, true);
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.press);
+    try testing.expectEqual(identify("button", 0), tally.last);
+
+    // Held: pressed does not fire again, which is what "once" means.
+    ui.setPointer(50, 20, true);
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.press);
+    try testing.expectEqual(@as(u32, 0), tally.release);
+
+    // Up on it: released, and it came up where it went down.
+    ui.setPointer(50, 20, false);
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.release);
+    try testing.expect(tally.on_target);
+}
+
+test "a release away from the button says so" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var tally: Tally = .{};
+    try watchedButton(&ui, &tally);
+
+    ui.setPointer(50, 20, true);
+    try watchedButton(&ui, &tally);
+    // Dragged off and let go. The element still hears about it - it is what
+    // went down - but it is told the pointer had left, which is the
+    // difference between a click and a change of mind.
+    ui.setPointer(300, 200, false);
+    try watchedButton(&ui, &tally);
+
+    try testing.expectEqual(@as(u32, 1), tally.release);
+    try testing.expect(!tally.on_target);
+}
+
+test "hover is every frame the pointer is over, not the frame it arrived" {
+    // Ply's meaning of the word, and the same one `hovered()` answers.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var tally: Tally = .{};
+    try watchedButton(&ui, &tally);
+
+    ui.setPointer(50, 20, false);
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.hover);
+
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 2), tally.hover);
+
+    // Off it, and it stops.
+    ui.setPointer(300, 200, false);
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 2), tally.hover);
+}
+
+test "focus and unfocus fire once each, however the focus moved" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var tally: Tally = .{};
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 0), tally.focus);
+
+    // Given the keyboard by the program rather than by a click, which is the
+    // case `hovered()` and its siblings cannot answer at all.
+    ui.setFocus("button");
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.focus);
+    try testing.expectEqual(@as(u32, 0), tally.unfocus);
+
+    // Still focused: not told again.
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.focus);
+
+    ui.clearFocus();
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.unfocus);
+}
+
+test "a click both focuses and presses, in that order" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var tally: Tally = .{};
+    try watchedButton(&ui, &tally);
+
+    ui.setPointer(50, 20, true);
+    try watchedButton(&ui, &tally);
+
+    try testing.expectEqual(@as(u32, 1), tally.focus);
+    try testing.expectEqual(@as(u32, 1), tally.press);
+}
+
+test "a callback is only called about its own element" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var mine: Tally = .{};
+    var theirs: Tally = .{};
+
+    const two = struct {
+        fn run(u: *Ui, a: *Tally, b: *Tally) !void {
+            u.begin(.init(400, 300));
+            {
+                u.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+                defer u.close();
+                u.empty(a.watched("first"));
+                u.empty(b.watched("second"));
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try two(&ui, &mine, &theirs);
+    // On the second button, which sits below the first.
+    ui.setPointer(50, 60, true);
+    try two(&ui, &mine, &theirs);
+
+    try testing.expectEqual(@as(u32, 0), mine.press);
+    try testing.expectEqual(@as(u32, 1), theirs.press);
+    try testing.expectEqual(identify("second", 0), theirs.last);
+}
+
+test "an element with no callbacks costs nothing to walk past" {
+    // The list only holds the elements that asked for something, so a page of
+    // boxes with one button in it walks a list of one.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var tally: Tally = .{};
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    for (0..20) |i| {
+        var name: [8]u8 = undefined;
+        const id = std.fmt.bufPrint(&name, "b{d}", .{i}) catch "b";
+        leaf(&ui, id, .{ .width = .fixed(10), .height = .fixed(10) });
+    }
+    ui.empty(tally.watched("button"));
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(@as(usize, 1), ui.listeners.items.len);
+}
+
+test "the parent of a pressed element hears about it too" {
+    // A press walks the chain, so a card wrapping a label is pressed when the
+    // label is - the same rule `pressed()` follows, and the reason `capture`
+    // exists to stop it.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var outer: Tally = .{};
+    var inner: Tally = .{};
+
+    const nested = struct {
+        fn run(u: *Ui, a: *Tally, b: *Tally) !void {
+            u.begin(.init(400, 300));
+            {
+                var card = a.watched("card");
+                card.width = .fixed(200);
+                card.height = .fixed(100);
+                u.open(card);
+                defer u.close();
+
+                var label = b.watched("label");
+                label.width = .fixed(50);
+                label.height = .fixed(20);
+                u.empty(label);
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try nested(&ui, &outer, &inner);
+    ui.setPointer(20, 10, true);
+    try nested(&ui, &outer, &inner);
+
+    try testing.expectEqual(@as(u32, 1), inner.press);
+    try testing.expectEqual(@as(u32, 1), outer.press);
+}
+
+test "a callback may change what the next frame draws" {
+    // What they are for. The callback runs after the commands are built, so
+    // what it changes is the frame after - which is the only order that can
+    // be right, and is why declaring elements from inside one is not allowed.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const Counter = struct {
+        count: u32 = 0,
+
+        fn bump(context: ?*anyopaque, event: layout.Callback.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.count += 1;
+            _ = event;
+        }
+    };
+    var counter: Counter = .{};
+
+    const frame = struct {
+        fn run(u: *Ui, c: *Counter) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            u.empty(.{
+                .id = "button",
+                .width = .fixed(100),
+                .height = .fixed(40),
+                .background_color = paint,
+                .on_press = .{ .context = c, .call = Counter.bump },
+            });
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui, &counter);
+    ui.setPointer(50, 20, true);
+    try frame(&ui, &counter);
+    try testing.expectEqual(@as(u32, 1), counter.count);
+
+    ui.setPointer(50, 20, false);
+    try frame(&ui, &counter);
+    ui.setPointer(50, 20, true);
+    try frame(&ui, &counter);
+    try testing.expectEqual(@as(u32, 2), counter.count);
 }

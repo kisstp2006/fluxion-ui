@@ -62,6 +62,7 @@ pub const Border = layout.Border;
 pub const BorderWidth = layout.BorderWidth;
 pub const BorderPosition = layout.BorderPosition;
 pub const SlotFit = layout.SlotFit;
+pub const Callback = layout.Callback;
 pub const Clip = layout.Clip;
 pub const Scrollbar = layout.Scrollbar;
 
