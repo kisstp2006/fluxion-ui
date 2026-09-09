@@ -37,10 +37,13 @@ const Allocator = std.mem.Allocator;
 const rhi = @import("fluxion_rhi");
 const font = @import("fluxion_font");
 const ui = @import("fluxion_ui");
+// Named with a suffix because `shader` below is the handle the device gives
+// back, and one of the two had to give way.
+const shader_mod = @import("fluxion_shader");
 
 const Atlas = @import("Atlas.zig");
 
-pub const Error = rhi.types.Error || Atlas.Error;
+pub const Error = rhi.types.Error || Atlas.Error || shader_mod.Error;
 
 /// One quad's worth of per-instance data.
 ///
@@ -170,9 +173,24 @@ pub const Renderer = struct {
         const sampler = try device.createSampler(.linear);
         errdefer device.destroySampler(sampler);
 
+        // One source, both languages. Compiling it here rather than
+        // shipping two hand-written translations is what stops the same
+        // shader existing twice in this repository and drifting apart.
+        var log: std.Io.Writer.Allocating = .init(gpa);
+        defer log.deinit();
+
+        var module = shader_mod.compile(gpa, shader_source, &log.writer) catch |err| {
+            // Printed rather than swallowed: the alternative to a message
+            // with a line and a caret under it is a blank window, and a
+            // blank window is the hardest thing in graphics to look at.
+            std.debug.print("fluxion-ui shader:\n{s}\n", .{log.written()});
+            return err;
+        };
+        defer module.deinit();
+
         const shader = try device.createShader(.{
-            .glsl = .{ .vertex = glsl_vertex, .fragment = glsl_fragment },
-            .hlsl = .{ .vertex = hlsl_vertex, .fragment = hlsl_fragment },
+            .glsl = .{ .vertex = module.glsl.vertex, .fragment = module.glsl.fragment },
+            .hlsl = .{ .vertex = module.hlsl.vertex, .fragment = module.hlsl.fragment },
             .label = "fluxion-ui",
         });
         errdefer device.destroyShader(shader);
@@ -749,17 +767,13 @@ fn intersect(current: ?rhi.types.Rect, box: ui.BoundingBox, size: ui.Dimensions)
 // Shaders
 // -------------------------------------------------------------------------
 
-/// The signed distance to a rounded box, and the whole reason one pipeline
-/// can draw every shape a UI has.
+/// The one shader, in the one language, that both backends are compiled from.
 ///
-/// Negative inside, positive outside, and the value is the distance in
-/// pixels - so `0.5 - d` clamped to zero and one is a one-pixel antialiased
-/// edge that needs no multisampling and no extra geometry. Iñigo Quílez's,
-/// with the four corners split out.
-const glsl_vertex = @embedFile("shaders/ui.vert.glsl");
-const glsl_fragment = @embedFile("shaders/ui.frag.glsl");
-const hlsl_vertex = @embedFile("shaders/ui.vert.hlsl");
-const hlsl_fragment = @embedFile("shaders/ui.frag.hlsl");
+/// What it draws is a signed distance to a rounded box - negative inside,
+/// positive outside, and the value in pixels, so `0.5 - d` clamped to zero
+/// and one is a one-pixel antialiased edge that needs no multisampling and no
+/// extra geometry. Iñigo Quílez's, with the four corners split out.
+const shader_source = @embedFile("shaders/ui.fxs");
 
 // -------------------------------------------------------------------------
 // Tests
