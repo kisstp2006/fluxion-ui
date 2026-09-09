@@ -1046,7 +1046,7 @@ fn addRun(
             const height = line_height * @as(f32, @floatFromInt(text_mod.hardLineCount(content)));
             break :blk .{
                 .init(text_mod.unwrappedWidth(content, style, measurer), height),
-                .init(text_mod.widestWord(content, style, measurer), height),
+                .init(text_mod.narrowest(content, style, measurer), height),
             };
         } else .{ .zero, .zero };
 
@@ -1834,8 +1834,17 @@ fn wrapText(self: *Ui) Error!void {
             run.lines_len += 1;
         }
 
-        self.elements.items[run.element].dimensions.height =
-            line_height * @as(f32, @floatFromInt(run.lines_len));
+        // Both, and the minimum is the point. **A paragraph cannot give any
+        // height back once its width is settled**: taking a line's worth off
+        // its box does not remove the line, it draws it over whatever comes
+        // next. Ply leaves the minimum at the one line it was measured as
+        // before wrapping, and a column too short for its text there ends up
+        // with its paragraphs overlapping each other. Here the shrink pass is
+        // told the truth and the container overflows instead - which is what
+        // it already does for a fixed child that will not fit.
+        const wrapped = line_height * @as(f32, @floatFromInt(run.lines_len));
+        self.elements.items[run.element].dimensions.height = wrapped;
+        self.elements.items[run.element].min_dimensions.height = wrapped;
     }
 }
 
@@ -1856,20 +1865,54 @@ fn propagateHeights(self: *Ui) void {
         i -= 1;
         const element = self.elements.items[i];
         if (element.run != null) continue;
-        if (element.config.sizing.height.kind != .fit) continue;
         if (element.children_length == 0) continue;
+
+        // **Ply asks more than the containers that fit their content**, and
+        // it is right to. A column that *grows* still has a paragraph in it
+        // that has just turned out to be three lines rather than one, and it
+        // is still sitting at the one-line size the fit pass gave it - so
+        // both the size the vertical pass grows from and the size it may be
+        // squeezed back to are a line out. Left alone, the shrink pass takes
+        // the column down to one line and the paragraph draws its other two
+        // over whatever comes next.
+        switch (element.config.sizing.height.kind) {
+            // Decided by what is inside it, which has just changed.
+            .fit => {},
+            // Still at its fit size until the vertical pass runs, so what is
+            // inside it says where that starts and how far back it may be
+            // pushed. The root is the exception: its height is the surface,
+            // whatever it asked for, and `end` has already put it there.
+            .grow => if (i == 0) continue,
+            // A percentage is a share of a parent that has not been sized
+            // yet, a ratio was settled from the width a moment ago, and a
+            // fixed height is not negotiable and is never shrunk. None of the
+            // three is anybody's content.
+            .percent, .ratio, .fixed => continue,
+        }
 
         const config = element.config;
         const stacked = !config.direction.isMainAxisX();
+        const padding = config.padding.onAxis(false);
+
+        // The fit pass's rule one, said again here: **a clipped axis takes
+        // nothing from its children's minimum**, so a list of two hundred
+        // rows does not make the box round it two hundred rows tall at its
+        // smallest. Its *size* still counts them - that is the content a
+        // scroll position moves through - and only the floor the vertical
+        // pass may push it back to is different. Forget this and a scrolling
+        // list cannot be squeezed back to the room it was given, which is to
+        // say it stops scrolling.
+        const clips = element.clip.onAxis(false);
 
         // A wrapping row is as tall as its lines stacked up, not as tall as
         // its tallest child. The width is settled by now, which is what makes
         // the lines knowable here at all.
         if (config.wrap and !stacked) {
             const inner = @max(0, element.dimensions.width - config.padding.onAxis(true));
-            const stack = self.wrapCross(element, true, inner) + config.padding.onAxis(false);
+            const stack = self.wrapCross(element, true, inner) + padding;
             self.elements.items[i].dimensions.height = config.sizing.height.clamp(stack);
-            self.elements.items[i].min_dimensions.height = config.sizing.height.clamp(stack);
+            self.elements.items[i].min_dimensions.height =
+                config.sizing.height.clamp(if (clips) padding else stack);
             continue;
         }
 
@@ -1879,20 +1922,19 @@ fn propagateHeights(self: *Ui) void {
             const child = self.elements.items[child_index];
             if (stacked) {
                 height += child.dimensions.height;
-                smallest += child.min_dimensions.height;
+                if (!clips) smallest += child.min_dimensions.height;
             } else {
                 height = @max(height, child.dimensions.height);
-                smallest = @max(smallest, child.min_dimensions.height);
+                if (!clips) smallest = @max(smallest, child.min_dimensions.height);
             }
         }
 
         if (stacked and element.children_length > 1) {
             const gaps: f32 = @floatFromInt((element.children_length - 1) * config.gap);
             height += gaps;
-            smallest += gaps;
+            if (!clips) smallest += gaps;
         }
 
-        const padding = config.padding.onAxis(false);
         self.elements.items[i].dimensions.height = config.sizing.height.clamp(height + padding);
         self.elements.items[i].min_dimensions.height = config.sizing.height.clamp(smallest + padding);
     }
@@ -9436,4 +9478,145 @@ test "a scale and a safe area are arithmetic at the top, and compose" {
     try testing.expectEqual(@as(f32, 200), box.width);
     try testing.expectEqual(@as(f32, 48), box.x);
     try testing.expectEqual(@as(f32, 48), box.y);
+}
+
+// -------------------------------------------------------------------------
+// When there is not enough room
+// -------------------------------------------------------------------------
+
+/// The bottom of the lowest piece of text drawn.
+fn lowestText(drawn: []const commands.RenderCommand) f32 {
+    var bottom: f32 = 0;
+    for (drawn) |command| {
+        if (std.meta.activeTag(command.config) != .text) continue;
+        bottom = @max(bottom, command.bounding_box.y + command.bounding_box.height);
+    }
+    return bottom;
+}
+
+test "a paragraph that has wrapped is not squeezed under what follows it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Eighty wide is ten characters, so this wraps to three lines and wants
+    // forty-eight; the column has room for forty and something else under it.
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "column",
+            .width = .fixed(80),
+            .height = .fixed(40),
+            .direction = .top_to_bottom,
+        });
+        defer ui.close();
+        ui.text("one two three four five six", sixteen);
+        leaf(&ui, "under", .{ .width = .fixed(80), .height = .fixed(10) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // Text is the one thing that draws outside its box: taking height off a
+    // paragraph does not remove a line, it hides one under whatever comes
+    // next. So the thing under it has to start below the last line, and the
+    // column overflows instead.
+    try testing.expectEqual(@as(f32, 48), lowestText(drawn));
+    try testing.expect(ui.boxOf("under").?.y >= 48 - epsilon);
+}
+
+test "a growing column is not squeezed under what follows it either" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // The same shape one level up: the paragraph is inside a column that
+    // grows, so the column is what gets squeezed and the paragraph draws out
+    // through the bottom of it.
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "outer", .width = .fixed(80), .height = .fixed(40), .direction = .top_to_bottom });
+        defer ui.close();
+        {
+            ui.open(.{ .id = "column", .width = .grow, .height = .grow, .direction = .top_to_bottom });
+            defer ui.close();
+            ui.text("one two three four five six", sixteen);
+        }
+        leaf(&ui, "under", .{ .width = .fixed(80), .height = .fixed(10) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    try testing.expectEqual(@as(f32, 48), lowestText(drawn));
+    try testing.expect(ui.boxOf("under").?.y >= 48 - epsilon);
+}
+
+test "a run that only breaks where it says to is not squeezed over its neighbour" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // `.newline` breaks nowhere but at a newline, so the narrowest this run
+    // can be drawn is its widest line - not its widest word, which is what a
+    // run that breaks between words can give.
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fixed(100), .height = .fit });
+        defer ui.close();
+        ui.text("hello world", .{ .font_size = 16, .color = paint, .wrap = .newline });
+        leaf(&ui, "beside", .{ .width = .fixed(60), .height = .fixed(10) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    var widest: f32 = 0;
+    for (drawn) |command| {
+        if (std.meta.activeTag(command.config) != .text) continue;
+        widest = @max(widest, command.bounding_box.right());
+    }
+    try testing.expectEqual(@as(f32, 88), widest);
+    try testing.expect(ui.boxOf("beside").?.x >= 88 - epsilon);
+}
+
+test "a scrolling list keeps the room it was given, not the size of its content" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // The shape every sidebar has: something at the top, and a list under it
+    // taking what is left. The list holds four hundred pixels of rows.
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{
+            .id = "sidebar",
+            .width = .fixed(100),
+            .height = .fixed(120),
+            .direction = .top_to_bottom,
+        });
+        defer ui.close();
+        leaf(&ui, "header", .{ .width = .grow, .height = .fixed(20) });
+        {
+            ui.open(.{
+                .id = "list",
+                .width = .grow,
+                .height = .grow,
+                .direction = .top_to_bottom,
+                .clip = .scrollY,
+            });
+            defer ui.close();
+            for (0..10) |row| {
+                var name: [8]u8 = undefined;
+                const id = std.fmt.bufPrint(&name, "r{d}", .{row}) catch "r";
+                leaf(&ui, id, .{ .width = .grow, .height = .fixed(40) });
+            }
+        }
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // A hundred tall, which is the sidebar less its header - and three
+    // hundred of rows past the bottom of it, which is what the wheel moves
+    // through. A list that had taken its content's height would have no
+    // overflow at all, and nothing to scroll.
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("list").?.height);
+    try testing.expectEqual(@as(f32, 300), ui.scrollOf("list").?.limit().y);
 }

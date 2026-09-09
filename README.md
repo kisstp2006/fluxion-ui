@@ -112,6 +112,11 @@ sizes, or the corner radii, or the one panel somebody else wrote. It is one
 multiplication at the top of `open` and one at the top of `text`, and nothing
 downstream of either knows there is a scale at all.
 
+**A scale past what the window can hold overflows**, the same way any other
+interface with too much in it does - it runs off the edge rather than piling
+up on itself. See [what happens when there is not enough
+room](#what-is-here-and-what-is-not).
+
 **`safe_area` insets the root**, in the same pixels as `size` and *not*
 multiplied by the scale - a television's overscan and a phone's notch are
 facts about the display, and `size` is measured with the same ruler. Anything
@@ -1088,6 +1093,24 @@ A container too small for its fixed children still overflows rather than
 squeezing them, which is the right answer: a silent squeeze hides the problem,
 and overflow is what a scroll container is for. What *can* give way is a
 paragraph, down to its longest word - see [Text](#text).
+
+**And no further, and never in height.** This is another place where this
+parts company with Ply, and the one where Ply has a bug. A paragraph is the
+one thing that draws outside its box: shrink it and the text does not get
+smaller, the box does - so a line that no longer fits is drawn over whatever
+comes next. Ply gives a
+text element a minimum of one line and its longest word, keeps that minimum
+after wrapping, and lets the vertical pass squeeze a three-line paragraph back
+to one - which is why an interface with too little room for its text in Ply
+overlaps rather than overflows. Here a paragraph's minimum height becomes its
+wrapped height the moment the wrap is known, a run that breaks only at its own
+newlines is as narrow as its widest line rather than its widest word, and a
+container that grows is asked again for both after wrapping rather than only
+the ones that fit their content. The interface runs off the edge instead,
+which is the same answer every other overflow gets.
+
+It is the failure mode a `scale` makes easy to reach - twice the interface in
+the same window - so it is worth knowing which of the two you are looking at.
 
 ## Examples
 

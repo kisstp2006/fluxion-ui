@@ -230,15 +230,21 @@ pub const Words = struct {
     }
 };
 
-/// How wide the widest single word is, in pixels.
+/// The narrowest this run can be drawn, in pixels. A text element's
+/// `min_dimensions.width`.
 ///
-/// The smallest a paragraph can be squeezed without a word being broken in
-/// half, and therefore the `min_dimensions` of a text element. **This is the
-/// number that makes the shrink pass mean anything**: every other kind of
-/// element has a minimum equal to its content, so nothing could ever give way.
-/// A paragraph can, down to its longest word.
-pub fn widestWord(run: []const u8, style: TextStyle, measurer: Measurer) f32 {
-    if (style.wrap == .none) return measurer.measure(run, style).width;
+/// **This is the number that makes the shrink pass mean anything**: every
+/// other kind of element has a minimum equal to its content, so nothing could
+/// ever give way. A paragraph can, down to its longest word.
+///
+/// Which is only true of a paragraph that breaks between words. The other two
+/// modes give nothing: `.newline` breaks where the text says to and nowhere
+/// else, so it is as narrow as its widest line, and `.none` breaks nowhere at
+/// all. **A run squeezed below this draws over whatever is beside it** - the
+/// box gets smaller and the line does not - so getting it wrong for a mode
+/// that cannot break is worse than not shrinking at all.
+pub fn narrowest(run: []const u8, style: TextStyle, measurer: Measurer) f32 {
+    if (style.wrap != .words) return unwrappedWidth(run, style, measurer);
 
     var widest: f32 = 0;
     var words: Words = .init(run, style, measurer);
@@ -338,15 +344,20 @@ test "the widest word is what a paragraph can be squeezed to" {
     // This is the number that makes shrinking possible at all: every other
     // element's minimum is its content, so nothing gives way. A paragraph
     // gives way down to its longest word.
-    try testing.expectEqual(@as(f32, 40), widestWord("a bb Hello cc", plain, mono));
+    try testing.expectEqual(@as(f32, 40), narrowest("a bb Hello cc", plain, mono));
 
     // With wrapping off there is nothing to give: the minimum is the whole
     // run.
     const unbroken: TextStyle = .{ .font_size = 16, .wrap = .none };
     try testing.expectEqual(
         mono.measure("a bb Hello cc", unbroken).width,
-        widestWord("a bb Hello cc", unbroken, mono),
+        narrowest("a bb Hello cc", unbroken, mono),
     );
+
+    // And a run that breaks only where it says to is as narrow as its widest
+    // line. Its longest word would be a minimum it cannot draw inside.
+    const hard: TextStyle = .{ .font_size = 16, .wrap = .newline };
+    try testing.expectEqual(@as(f32, 48), narrowest("ab cde\nHello", hard, mono));
 }
 
 test "the unwrapped width of a run with newlines is its widest line" {
@@ -363,6 +374,6 @@ test "hard lines are counted from the breaks the text asks for" {
 
 test "an empty run measures as nothing and has one line" {
     try testing.expectEqual(@as(f32, 0), unwrappedWidth("", plain, mono));
-    try testing.expectEqual(@as(f32, 0), widestWord("", plain, mono));
+    try testing.expectEqual(@as(f32, 0), narrowest("", plain, mono));
     try testing.expectEqual(1, hardLineCount(""));
 }
