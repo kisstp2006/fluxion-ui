@@ -116,11 +116,11 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                 // A bar down the right, in the theme's own ink rather than
                 // the grey the defaults give. It shows itself while the list
                 // is moving and fades out a couple of seconds after it
-                // stops, which is what `hide_after_frames` counts - in
-                // frames, because a layout library is never told the rate.
+                // stops, which is what `hide_after_seconds` counts - out of
+                // the frame times handed to `tick` below.
                 .clip = ui.layout.Clip.scrollY.bar(.{
                     .thumb_color = .hexa(0x6E7681B0),
-                    .hide_after_frames = 120,
+                    .hide_after_seconds = 2,
                 }),
             });
             defer u.close();
@@ -207,6 +207,11 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                     .corner_radius = .all(6),
                     .background_color = if (open) theme.hover else theme.card,
                     .border = .all(theme.line, 1),
+                    // Said here rather than worked out: a hand over anything
+                    // clickable is the web's habit, not a desktop's, so the
+                    // library leaves it to the element. The text fields
+                    // further down ask for nothing and get a caret anyway.
+                    .cursor = .pointing_hand,
                 });
                 defer u.close();
                 u.text("Menu", .{ .font_size = 13, .color = theme.ink });
@@ -375,7 +380,7 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                 .placeholder_color = .hex(0x6E7681),
                 .cursor_color = theme.accent,
                 .drag_select = true,
-                .scrollbar = .{ .thumb_color = .hexa(0x6E7681B0), .hide_after_frames = 120 },
+                .scrollbar = .{ .thumb_color = .hexa(0x6E7681B0), .hide_after_seconds = 2 },
             });
         }
     }
@@ -498,6 +503,11 @@ const Window = struct {
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     down: bool = false,
+    /// What shape the system has been told to draw. Kept so it is told only
+    /// when the answer changes: the interface works one out every frame, and
+    /// setting the same one sixty times a second is a system call for
+    /// nothing.
+    shape: platform.CursorShape = .arrow,
 
     /// What the keyboard has done since the last frame, and what was held
     /// down while it did it.
@@ -635,6 +645,18 @@ const Window = struct {
         return self.down;
     }
 
+    /// Draw the pointer as this, if it is not already.
+    ///
+    /// Failing is not worth stopping for: some shapes are not on every
+    /// system, and a window that kept the arrow is a fine outcome. What must
+    /// not happen is recording a shape that was never set - the next frame
+    /// would see no change and never try again.
+    fn setShape(self: *Window, wanted: platform.CursorShape) void {
+        if (wanted == self.shape) return;
+        self.inner.win.setCursorShape(wanted) catch return;
+        self.shape = wanted;
+    }
+
     /// The platform's own handle - an `HWND` on Windows - which is what the
     /// Direct3D backend makes a swapchain from.
     fn nativeHandle(self: Window) usize {
@@ -753,18 +775,19 @@ pub fn main(init: std.process.Init) !void {
     while (window.pump()) {
         const size = window.size();
 
-        // The wheel moves the list, and the layout clamps it at either end
-        // when the frame finishes. A program with a pointer under the cursor
-        // would ask which container is under it; this one has only the one.
-        const wheel = window.takeWheel();
-        if (wheel != 0) layout.scrollBy("list", 0, wheel);
-
         // Before `begin`, once a frame. It advances the button through its
         // four states and works out what is under the cursor from where
         // things were when the last frame finished.
-        const cursor = window.cursor();
+        const at = window.cursor();
         layout.setShift(window.shiftHeld());
-        layout.setPointer(cursor.x, cursor.y, window.buttonDown());
+        layout.setPointer(at.x, at.y, window.buttonDown());
+
+        // And then the wheel, to whatever that turned out to be under. The
+        // layout clamps it at either end when the frame finishes. `scrollBy`
+        // would want a name, and this window has two lists in it - the one in
+        // the sidebar and the notes field's own.
+        const wheel = window.takeWheel();
+        if (wheel != 0) _ = layout.scrollHovered(0, wheel);
 
         // The keyboard, in the order it arrived. Which key means which action
         // is the program's business - this library never sees a key, only
@@ -799,6 +822,23 @@ pub fn main(init: std.process.Init) !void {
         layout.begin(size);
         shell(&layout, size);
         const commands = try layout.end();
+
+        // What the interface decided the pointer should look like. The two
+        // enumerations carry the same names on purpose, so this is a switch
+        // and not a table - and one that stops compiling if either side
+        // grows a shape the other has not heard of.
+        window.setShape(switch (layout.cursor()) {
+            .arrow => .arrow,
+            .ibeam => .ibeam,
+            .crosshair => .crosshair,
+            .pointing_hand => .pointing_hand,
+            .resize_ew => .resize_ew,
+            .resize_ns => .resize_ns,
+            .resize_nwse => .resize_nwse,
+            .resize_nesw => .resize_nesw,
+            .resize_all => .resize_all,
+            .not_allowed => .not_allowed,
+        });
 
         try renderer.draw(.{ .surface = surface }, size, commands, theme.window);
         try device.present(surface);

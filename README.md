@@ -307,6 +307,53 @@ draggable panel wants it, so dragging the knob does not also drag the panel.
 `.preserve_focus = true` leaves the keyboard where it is, for a toolbar button
 that should not take the caret out of the field beside it.
 
+### What the pointer looks like
+
+```zig
+ui.open(.{ .id = "edge", .cursor = .resize_ew, ... });   // per element
+ui.setCursor(.resize_ew);                                // for this frame
+const shape = ui.cursor();                               // after `end`
+```
+
+The interface is the half that knows the pointer is over a text field; the
+window is the half that can draw a cursor. So this works out a shape and hands
+it over, and setting it is the program's one line - `examples/window.zig` is
+that line. The ten names are
+[Fluxion Platform](https://github.com/kisstp2006/fluxion-platform)'s, so the
+switch between them is a switch and not a table.
+
+**The innermost element under the pointer that named a shape wins**, so a
+resize handle inside a panel is not overruled by the panel. **A text input
+asks for `.ibeam` without being told to**, and a declaration that names
+something else still beats it. Everything else is an arrow: a hand over
+anything clickable is the web's convention rather than a desktop's, so an
+element that wants one says `.pointing_hand`.
+
+`setCursor` beats the lot for the rest of the frame, which is what a drag
+needs - a window edge being pulled keeps its shape while the pointer is
+halfway across the screen, with no element under it to say so. Ply's version
+persists until it is set again; this one lasts a frame, because a shape that
+outlived its frame could never be taken back by a tree that works its own out.
+
+### A clock
+
+```zig
+ui.tick(dt);                     // once a frame, in seconds, before `begin`
+```
+
+Four things need to know how long a frame took, and none of them can find out
+for itself: the caret blinks, a second click becomes a double click, a list
+let go of carries on coasting, and a scrollbar told to hide itself waits. All
+four are in **seconds**, which is where this parts company with Ply. Ply
+counts frames, so the same fade is half as long at a hundred and twenty frames
+a second as at sixty, and twice as long on a machine having a bad time; a game
+already knows its frame time and handing it over once a frame settles all four
+at once.
+
+A program that never calls it gets a solid caret, no double clicks, no
+momentum and bars that never fade. All four are the same good failure: a
+library with no clock does not invent one.
+
 ## Clipping and scrolling
 
 ```zig
@@ -374,6 +421,21 @@ takes the speed with it.
 one that actually overflows takes hold at all - otherwise every press on a
 short list would arm a drag that can never do anything.
 
+The wheel has the same question and the same answer:
+
+```zig
+if (!ui.scrollHovered(0, notches * -40)) camera.zoom(notches);
+```
+
+`scrollBy` needs a name, so a program with two lists has to work out which one
+is under the pointer - which is the hit test it already asked for. This is
+that answered here, innermost first and **one axis at a time**, so a page that
+holds a strip scrolling sideways splits a trackpad swipe between the two. It
+returns whether anything moved, so a game can have the wheel the interface did
+not want. A list at the end of its travel keeps the wheel rather than handing
+what is left to its parent; browsers hand it on, and a page that lurches when
+a list reaches its bottom is the worse of the two surprises.
+
 **`no_drag_scroll` is about the mouse.** Ply's flag turns dragging off for a
 pointer and leaves it on for a finger, because on a touch screen there is
 nothing else; `setTouch` is what tells the two apart, and a program that never
@@ -421,13 +483,15 @@ says whether that is happening, for a program that has its own idea of what a
 press means.
 
 ```zig
-.bar(.{ .hide_after_frames = 120 })
+.bar(.{ .hide_after_seconds = 2 })
 ```
 
-Fades the bar out after that many still frames and brings it straight back
-when anything moves - in frames rather than seconds, because a layout library
-is never told the frame rate. Ply's curve exactly: it holds for the whole
-count, then fades over a quarter as many frames again.
+Fades the bar out after that long without moving and brings it straight back
+when anything does. Ply's curve exactly - it holds for the whole time, then
+fades over a quarter as long again - but in **seconds where Ply counts
+frames**, so a fade tuned on one machine is the same fade on a faster one.
+The clock comes from [`tick`](#a-clock); a program that never calls it keeps
+its bars.
 
 ## Markup
 
@@ -949,9 +1013,9 @@ than from memory.
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
 | **Animated text** | all nine of Ply's: `wave`, `pulse`, `swing`, `jitter`, `transform`, `gradient`, `type`, `fade` and `scale` |
-| **Clipping and scrolling** | per axis, by wheel, by dragging the content, and by the bar, with momentum and with the position remembered between frames |
+| **Clipping and scrolling** | per axis, by wheel - by name or by whatever is under the pointer - by dragging the content, and by the bar, with momentum and with the position remembered between frames |
 | **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
-| **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, clip-aware picking, and `wantsPointer` for a program that has its own use for a click |
+| **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, clip-aware picking, `wantsPointer` for a program that has its own use for a click, and a cursor shape to hand the window |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus` and `on_unfocus`, called when the frame is over |
 | **Floating** | out of the flow, anchored to a parent, an element by name, or the surface, with an offset, a z-index and optional clipping |
 | **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup |
@@ -970,7 +1034,6 @@ the order it is worth doing in.
 | **Smooth scrolling** | Ply also animates *towards* a target over a duration, so a wheel notch glides rather than jumps. A flick coasts here; a notch still arrives at once. |
 | **`between_children` borders** | A line drawn between one child and the next, without an element per separator. |
 | **Easing and lerp** | Ply's `easing.rs` and `lerp.rs`: a curve library and a "move this towards that" helper, for animating anything. |
-| **The mouse cursor** | `set_cursor` / `get_cursor`, so hovering a text input gives an I-beam. A layout library can say *which* cursor; putting it on the screen is the window layer's. |
 | **A debug view** | `set_debug_mode`: Ply draws the tree beside the interface with every box and its numbers. |
 | **Culling** | `set_culling`: dropping commands that fall outside the surface before they reach the renderer. |
 | **A measure cache** | Ply remembers the width of words it has measured. This measures every time, which is the same answer more slowly. |

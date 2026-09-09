@@ -656,11 +656,11 @@ pub const TextEdit = struct {
     /// Whether the element was declared in the frame just finished. One that
     /// was not is dropped, exactly as a scroll position is.
     live: bool = false,
-    /// How many frames since the text or the cursor last moved, and whether
-    /// either did this frame. What a scrollbar told to hide itself counts -
-    /// the same pair a scroll container keeps, and folded in at the same
-    /// point in the frame.
-    idle: u32 = 0,
+    /// How long since the text or the cursor last moved, in seconds, and
+    /// whether either did this frame. What a scrollbar told to hide itself
+    /// reads - the same pair a scroll container keeps, advanced by the same
+    /// `Ui.tick`.
+    idle: f32 = 0,
     active: bool = false,
 
     pub const empty: TextEdit = .{};

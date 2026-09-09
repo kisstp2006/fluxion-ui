@@ -177,6 +177,8 @@ const Element = struct {
     /// Whether a press here leaves the focus where it is. See
     /// `layout.Declaration.preserve_focus`.
     preserve_focus: bool = false,
+    /// What the pointer looks like over it. See `Ui.cursor`.
+    cursor: ?layout.CursorShape = null,
 
     /// The size it currently believes it is. Filled by the fit pass, then
     /// adjusted by the grow and shrink passes.
@@ -236,6 +238,8 @@ const Hit = struct {
     /// because something is drawn under the pointer or because the element
     /// asked to be clicked. See `Ui.wantsPointer`.
     solid: bool,
+    /// What it asked the pointer to look like, if anything. See `Ui.cursor`.
+    cursor: ?layout.CursorShape,
 
     /// Whether a point is on this element.
     ///
@@ -283,11 +287,10 @@ pub const Scroll = struct {
     /// remembering where it was scrolled to.
     live: bool = false,
 
-    /// How many frames since anything moved this container. What
-    /// `layout.Scrollbar.hide_after_frames` counts, and it counts frames
-    /// rather than seconds because that is what Ply does and because a
-    /// library that has never been told the frame rate cannot count seconds.
-    idle: u32 = 0,
+    /// How long since anything moved this container, in seconds. What
+    /// `layout.Scrollbar.hide_after_seconds` counts. `Ui.tick` adds to it and
+    /// `Ui.begin` puts it back to zero on anything that moved.
+    idle: f32 = 0,
     /// Set by anything that moves the container, and folded into `idle` at
     /// the top of the next frame. See `Ui.begin`.
     active: bool = false,
@@ -582,6 +585,9 @@ touch: bool = false,
 /// How long the last frame was, from `tick`. What momentum is measured
 /// against, and zero until somebody says otherwise.
 dt: f32 = 0,
+/// A shape the program asked for this frame, which beats anything the tree
+/// worked out for itself. Cleared by `begin`. See `setCursor`.
+requested_cursor: ?layout.CursorShape = null,
 
 /// What each scroll container was scrolled to, kept between frames.
 ///
@@ -717,6 +723,7 @@ pub fn deinit(self: *Ui) void {
 pub fn begin(self: *Ui, surface: Dimensions) void {
     self.surface = surface;
     self.deferred = null;
+    self.requested_cursor = null;
 
     self.elements.clearRetainingCapacity();
     self.floats.clearRetainingCapacity();
@@ -734,15 +741,15 @@ pub fn begin(self: *Ui, surface: Dimensions) void {
     // Nothing has been declared yet, so nothing is live. Whatever is still
     // not live when the frame ends was not on the page and is forgotten.
     //
-    // The idle counter is folded in here rather than at the end of the frame
+    // The idle clock is cleared here rather than at the end of the frame
     // because everything that moves a container - the wheel, a thumb drag,
-    // `scrollTo` - happens between one frame and the next. Counting here
+    // `scrollTo` - happens between one frame and the next. Clearing here
     // means a bar that hides itself comes back on the frame the wheel turned
-    // rather than the one after.
+    // rather than the one after. `tick` is what makes it count up again.
     var seen = self.scrolls.valueIterator();
     while (seen.next()) |scroll| {
         scroll.live = false;
-        if (scroll.active) scroll.idle = 0 else scroll.idle +|= 1;
+        if (scroll.active) scroll.idle = 0;
         scroll.active = false;
     }
 
@@ -791,8 +798,64 @@ pub fn scrollOf(self: *Ui, name: []const u8) ?Scroll {
 /// rather than scrolling into nothing. Nudging an element that does not
 /// scroll, or does not exist, does nothing.
 pub fn scrollBy(self: *Ui, name: []const u8, dx: f32, dy: f32) void {
-    const key = identify(name, 0);
-    const scroll = self.scrolls.getPtr(key) orelse return;
+    const scroll = self.scrolls.getPtr(identify(name, 0)) orelse return;
+    nudge(scroll, dx, dy);
+}
+
+/// Move whatever the pointer is over. What a wheel event actually wants.
+///
+/// `scrollBy` needs a name, so a program with two lists has to work out which
+/// one the wheel is over before it can move it - and working that out is the
+/// hit test this library already did. This is that question answered here.
+///
+/// **The innermost container under the pointer wins, one axis at a time**,
+/// and only one with somewhere to go on that axis counts. So a list inside a
+/// scrolling page takes the wheel while the page stays put, and a page that
+/// holds a strip scrolling sideways splits a trackpad swipe between the two.
+///
+/// Returns whether anything moved, so a game can zoom its camera with the
+/// wheel the interface did not want - the same shape of answer as
+/// `wantsPointer`, and true for the same kind of reason.
+///
+/// A container at the end of its travel is not "somewhere to go" for this: it
+/// still takes the wheel and stays where it is, rather than handing what is
+/// left to its parent. Browsers hand it on; a game interface has one list
+/// deep far more often than two, and a page that lurches when a list reaches
+/// its bottom is the worse surprise of the two.
+pub fn scrollHovered(self: *Ui, dx: f32, dy: f32) bool {
+    var moved = false;
+    if (dx != 0) {
+        if (self.innermostScrolling(true)) |scroll| {
+            nudge(scroll, dx, 0);
+            moved = true;
+        }
+    }
+    if (dy != 0) {
+        if (self.innermostScrolling(false)) |scroll| {
+            nudge(scroll, 0, dy);
+            moved = true;
+        }
+    }
+    return moved;
+}
+
+/// The innermost container under the pointer that overflows on this axis.
+/// `over` is outermost first, so this reads it backwards - the same walk
+/// `grabContent` does, and for the same reason.
+fn innermostScrolling(self: *Ui, x_axis: bool) ?*Scroll {
+    var i = self.over.items.len;
+    while (i > 0) {
+        i -= 1;
+        const scroll = self.scrolls.getPtr(self.over.items[i]) orelse continue;
+        if (if (x_axis) scroll.overflowsX() else scroll.overflowsY()) return scroll;
+    }
+    return null;
+}
+
+/// Move a container and stop it coasting. What every mover but a drag does:
+/// a wheel turned mid-coast means "not there, here", and a list that carried
+/// on afterwards would be arguing with the hand.
+fn nudge(scroll: *Scroll, dx: f32, dy: f32) void {
     scroll.position.x += dx;
     scroll.position.y += dy;
     scroll.position = scroll.clamped();
@@ -842,6 +905,7 @@ fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
         .parent = self.innermost(),
         .capture = declaration.capture,
         .preserve_focus = declaration.preserve_focus,
+        .cursor = declaration.cursor,
         .floating = declaration.floating,
         .image = declaration.image,
         .rotate = declaration.rotate,
@@ -1035,6 +1099,11 @@ pub fn textInput(self: *Ui, declaration: layout.Declaration, config: text_input.
 fn textInputChecked(self: *Ui, declaration: layout.Declaration, config: text_input.Config) Error!void {
     try self.openChecked(declaration);
     const index = self.innermost();
+
+    // The one shape the layout knows without being told. A declaration that
+    // says otherwise still wins - a read-only field showing an arrow is a
+    // reasonable thing to want.
+    if (declaration.cursor == null) self.elements.items[index].cursor = .ibeam;
 
     const entry = try self.edits.getOrPut(self.gpa, self.elements.items[index].id);
     if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -2627,18 +2696,19 @@ fn barGeometry(
 
 /// How visible a bar is, given how long its container has been still.
 ///
-/// Ply's `scrollbar_visibility_alpha`, fade curve and all: it holds at full
-/// for `hide_after_frames`, then fades over a quarter as many frames again -
-/// so a bar told to hide after eighty frames spends twenty fading. A zero
-/// hides it always, which is how a caller turns the bar off without giving up
-/// the configuration.
-fn visibility(config: layout.Scrollbar, idle: u32) f32 {
-    const hide = config.hide_after_frames orelse return 1;
-    if (hide == 0) return 0;
+/// Ply's `scrollbar_visibility_alpha` curve, in seconds: full for
+/// `hide_after_seconds`, then a fade lasting a quarter as long again - so a
+/// bar told to hide after two seconds spends half a second fading. Ply's
+/// quarter and Ply's shape; only the clock is different.
+///
+/// A zero hides it always, which is how a caller turns the bar off without
+/// giving up the configuration.
+fn visibility(config: layout.Scrollbar, idle: f32) f32 {
+    const hide = config.hide_after_seconds orelse return 1;
+    if (hide <= 0) return 0;
     if (idle <= hide) return 1;
 
-    const fade = @max(1, @ceil(@as(f32, @floatFromInt(hide)) * 0.25));
-    const through = @as(f32, @floatFromInt(idle - hide)) / fade;
+    const through = (idle - hide) / (hide * 0.25);
     return std.math.clamp(1 - through, 0, 1);
 }
 
@@ -2910,23 +2980,42 @@ fn recordHits(self: *Ui) Error!void {
             .field = element.field != null,
             .drag_select = if (element.field) |config| config.drag_select else false,
             .solid = self.solidToPointer(element),
+            .cursor = element.cursor,
         });
     }
 }
 
 /// Move time along, in seconds.
 ///
-/// **Call it once a frame, before `begin`.** Two things need a clock and
-/// neither can have one of its own: the cursor blinks on it, and it is what
-/// tells a second click from a double click. A program that never calls this
-/// gets a solid cursor and no double clicks, which is a good failure - not a
-/// wrong one.
+/// **Call it once a frame, before `begin`.** Four things need a clock and
+/// none of them can have one of its own: the cursor blinks on it, a second
+/// click is told from a double click by it, a list that has been let go of
+/// coasts on it, and a scrollbar told to hide itself waits on it.
+///
+/// Everything timed here is in seconds, which is the one place this parts
+/// company with Ply: Ply counts frames, and a fade tuned at sixty frames a
+/// second is half as long at a hundred and twenty. A game already knows its
+/// frame time - the engine calls it `Time.delta` - and handing it over once a
+/// frame is cheaper than being wrong on every machine but one.
+///
+/// A program that never calls this gets a solid cursor, no double clicks, no
+/// momentum and a scrollbar that never fades. All four are the same good
+/// failure: a library with no clock does not guess at one.
 pub fn tick(self: *Ui, dt: f32) void {
     self.now += dt;
     self.dt = dt;
 
     var typed = self.edits.valueIterator();
-    while (typed.next()) |edit| edit.blink += dt;
+    while (typed.next()) |edit| {
+        edit.blink += dt;
+        edit.idle += dt;
+    }
+
+    // Anything that moved has its clock put back to zero where the frame is
+    // folded - `begin` for a container, `sweepFields` for an input - so all
+    // this has to do is let time pass.
+    var seen = self.scrolls.valueIterator();
+    while (seen.next()) |scroll| scroll.idle += dt;
 
     self.coast(dt);
 }
@@ -3480,11 +3569,67 @@ pub fn isElementReleased(self: *Ui, name: []const u8) bool {
 /// and before its own input runs.
 pub fn wantsPointer(self: *Ui) bool {
     for (self.over.items) |id| {
-        for (self.hits.items) |hit| {
-            if (hit.id == id and hit.solid) return true;
-        }
+        const hit = self.hitOf(id) orelse continue;
+        if (hit.solid) return true;
     }
     return false;
+}
+
+/// What the pointer over this element was recorded as, or null if it was not
+/// on the page when the last frame finished.
+fn hitOf(self: *Ui, id: u32) ?Hit {
+    for (self.hits.items) |hit| {
+        if (hit.id == id) return hit;
+    }
+    return null;
+}
+
+/// What the pointer should look like, for the program to hand to its window.
+///
+/// Ply keeps a shape and hands it back; this works one out as well, because
+/// the interface is the half that knows the pointer is over a text field and
+/// the game is the half that has a window to set it on.
+///
+/// In order: a shape the program asked for with `setCursor` this frame, then
+/// the **innermost** element under the pointer that named one - a text input
+/// naming `.ibeam` without being asked - and an arrow when nothing does.
+///
+/// ```zig
+/// try window.setCursorShape(switch (ui.cursor()) {
+///     .arrow => .arrow,
+///     .ibeam => .ibeam,
+///     // ... the names are the same on both sides
+/// });
+/// ```
+///
+/// One frame old, like every other pointer question here.
+pub fn cursor(self: *Ui) layout.CursorShape {
+    if (self.requested_cursor) |shape| return shape;
+
+    // Backwards: `over` runs outermost first, and the shape a handle asks for
+    // must not be overruled by the panel it sits in.
+    var i = self.over.items.len;
+    while (i > 0) {
+        i -= 1;
+        const hit = self.hitOf(self.over.items[i]) orelse continue;
+        if (hit.cursor) |shape| return shape;
+    }
+    return .arrow;
+}
+
+/// Ask for a shape for the rest of this frame, whatever is under the pointer.
+///
+/// Ply's `set_cursor`, with one difference: **Ply's persists until it is set
+/// again, and this lasts until the next `begin`.** A shape that outlived its
+/// frame could never be taken back by a tree that works its own out, and
+/// saying it every frame is how everything else here is written. Pass null to
+/// drop it again within a frame.
+///
+/// What it is for is the drag that has left what started it: a window edge
+/// being pulled should keep the resize cursor while the pointer is halfway
+/// across the screen, and no element is under it to say so.
+pub fn setCursor(self: *Ui, shape: ?layout.CursorShape) void {
+    self.requested_cursor = shape;
 }
 
 /// Whether the interface wants the keys.
@@ -3657,15 +3802,15 @@ pub fn editOf(self: *Ui, name: []const u8) ?*text_input.TextEdit {
 
 /// Forget the inputs that were not declared this frame.
 ///
-/// The mirror of the sweep `measureScroll` does, and it counts the idle
-/// frames a hiding scrollbar needs while it is there.
+/// The mirror of the sweep `measureScroll` does, and it clears the idle clock
+/// a hiding scrollbar reads while it is there.
 fn sweepFields(self: *Ui) Error!void {
     var stale: [64]u32 = undefined;
     var count: usize = 0;
 
     var seen = self.edits.iterator();
     while (seen.next()) |entry| {
-        if (entry.value_ptr.active) entry.value_ptr.idle = 0 else entry.value_ptr.idle +|= 1;
+        if (entry.value_ptr.active) entry.value_ptr.idle = 0;
         entry.value_ptr.active = false;
 
         if (entry.value_ptr.live) continue;
@@ -6002,38 +6147,81 @@ test "a bar told to hide fades out when nothing moves, and comes straight back" 
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
-    const config: layout.Scrollbar = .{ .hide_after_frames = 2 };
+    const config: layout.Scrollbar = .{ .hide_after_seconds = 1 };
+    const frame = 1.0 / 60.0;
 
     // Shown on the very first frame, before anything is stored about it.
     _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
     try testing.expect(barIn(&ui, "scroll", true) != null);
 
-    // Two idle frames are still within the hold.
-    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
-    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+    // Half a second of stillness is well inside the hold.
+    for (0..30) |_| {
+        ui.tick(frame);
+        _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+    }
     try testing.expect(barIn(&ui, "scroll", true) != null);
 
-    // A quarter of two, rounded up, is one frame of fade - and then it is
-    // gone, and cannot be grabbed either.
-    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+    // A second of hold and a quarter of a second of fade, and it is gone -
+    // and cannot be grabbed either.
+    for (0..50) |_| {
+        ui.tick(frame);
+        _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+    }
     try testing.expect(barIn(&ui, "scroll", true) == null);
     ui.setPointer(97, 20, true);
     try testing.expect(!ui.draggingScrollbar());
     ui.setPointer(97, 20, false);
 
     // Scrolling brings it back on the next frame rather than the one after,
-    // which is the whole point of counting the idle frames at the top of the
-    // frame instead of the bottom.
+    // which is the whole point of clearing the clock at the top of the frame
+    // instead of the bottom.
     ui.scrollTo("scroll", 0, 40);
     _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
     try testing.expect(barIn(&ui, "scroll", true) != null);
 }
 
-test "hide_after_frames of zero is a bar that is never drawn" {
+test "the fade takes the same time however fast the frames go" {
+    // The whole reason this counts seconds. Ply counts frames, so the same
+    // configuration is four times as quick to hide on a machine running four
+    // times as smoothly - and every one of these three would disagree.
+    const config: layout.Scrollbar = .{ .hide_after_seconds = 1 };
+
+    for ([_]f32{ 1.0 / 30.0, 1.0 / 60.0, 1.0 / 144.0 }) |frame| {
+        var ui = withText(testing.allocator);
+        defer ui.deinit();
+        _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+
+        var elapsed: f32 = 0;
+        while (elapsed < 0.99) : (elapsed += frame) {
+            ui.tick(frame);
+            _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+        }
+        try testing.expect(barIn(&ui, "scroll", true) != null);
+
+        while (elapsed < 1.3) : (elapsed += frame) {
+            ui.tick(frame);
+            _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(config));
+        }
+        try testing.expect(barIn(&ui, "scroll", true) == null);
+    }
+}
+
+test "a program with no clock keeps its bars" {
+    // The failure this is allowed to have. Nothing calls `tick`, so no time
+    // passes, so a bar told to hide after a second never does - which is the
+    // safer of the two ways for a library with no clock to be wrong.
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
-    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{ .hide_after_frames = 0 }));
+    for (0..600) |_| _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{ .hide_after_seconds = 1 }));
+    try testing.expect(barIn(&ui, "scroll", true) != null);
+}
+
+test "hiding after zero seconds is a bar that is never drawn" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try scrollFixture(&ui, layout.Clip.scrollY.bar(.{ .hide_after_seconds = 0 }));
     try testing.expectEqual(@as(usize, 0), ui.bars.items.len);
 }
 
@@ -6068,17 +6256,18 @@ test "a padded container's bar runs its whole height" {
 }
 
 test "the fade curve is Ply's" {
-    // Held for the whole hold, then a quarter as many frames of fade.
-    const config: layout.Scrollbar = .{ .hide_after_frames = 80 };
+    // Held for the whole hold, then a fade a quarter as long again. Ply's
+    // eighty frames and twenty of fade, at the frame rate it was written for.
+    const config: layout.Scrollbar = .{ .hide_after_seconds = 2 };
     try testing.expectEqual(@as(f32, 1), visibility(config, 0));
-    try testing.expectEqual(@as(f32, 1), visibility(config, 80));
-    try testing.expectEqual(@as(f32, 0.75), visibility(config, 85));
-    try testing.expectEqual(@as(f32, 0.5), visibility(config, 90));
+    try testing.expectEqual(@as(f32, 1), visibility(config, 2));
+    try testing.expectEqual(@as(f32, 0.75), visibility(config, 2.125));
+    try testing.expectEqual(@as(f32, 0.5), visibility(config, 2.25));
+    try testing.expectEqual(@as(f32, 0), visibility(config, 2.5));
     try testing.expectEqual(@as(f32, 0), visibility(config, 100));
-    try testing.expectEqual(@as(f32, 0), visibility(config, 4000));
 
     // No hold at all means always shown, which is the default.
-    try testing.expectEqual(@as(f32, 1), visibility(.{}, 4000));
+    try testing.expectEqual(@as(f32, 1), visibility(.{}, 100));
 }
 
 // -------------------------------------------------------------------------
@@ -6223,12 +6412,12 @@ test "the cursor is drawn where the text ends, and only while focused" {
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
-    const cursor: Color = .hex(0xFF0000);
+    const caret: Color = .hex(0xFF0000);
     ui.setTextValue("name", "abc");
 
     // Not focused: no cursor at all, however solid the blink says it is.
-    const unfocused = try oneField(&ui, .{ .cursor_color = cursor });
-    try testing.expect(rectangleIn(unfocused, cursor) == null);
+    const unfocused = try oneField(&ui, .{ .cursor_color = caret });
+    try testing.expect(rectangleIn(unfocused, caret) == null);
 
     // Setting the value from the program leaves the cursor where it was,
     // only clamping it - which is Ply's rule and is why this types instead.
@@ -6236,10 +6425,10 @@ test "the cursor is drawn where the text ends, and only while focused" {
 
     ui.setFocus("name");
     ui.typeText("abc");
-    const with_keyboard = try oneField(&ui, .{ .cursor_color = cursor });
+    const with_keyboard = try oneField(&ui, .{ .cursor_color = caret });
 
     // Three characters at eight pixels, and two pixels wide.
-    const drawn_at = rectangleIn(with_keyboard, cursor).?;
+    const drawn_at = rectangleIn(with_keyboard, caret).?;
     try testing.expectEqual(@as(f32, 24), drawn_at.x);
     try testing.expectEqual(@as(f32, 2), drawn_at.width);
 }
@@ -8495,6 +8684,127 @@ test "dragging a scrollbar is not dragging the content" {
 }
 
 // -------------------------------------------------------------------------
+// The wheel, without a name
+// -------------------------------------------------------------------------
+
+/// Two lists side by side, each a hundred wide and a hundred tall, with three
+/// hundred of content in them. The left one starts at x 0, the right at 100.
+fn twoLists(u: *Ui) !void {
+    u.begin(.init(400, 300));
+    openRoot(u);
+    for ([_][]const u8{ "left", "right" }) |name| {
+        u.open(.{
+            .id = name,
+            .width = .fixed(100),
+            .height = .fixed(100),
+            .clip = .scrollY,
+            .background_color = paint,
+        });
+        defer u.close();
+        leaf(u, "rows", .{ .width = .fixed(100), .height = .fixed(300) });
+    }
+    u.close();
+    _ = try u.end();
+}
+
+test "the wheel goes to the list under the pointer" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try twoLists(&ui);
+    ui.setPointer(150, 50, false);
+    try twoLists(&ui);
+
+    try testing.expect(ui.scrollHovered(0, 40));
+    try testing.expectEqual(@as(f32, 40), ui.scrollOf("right").?.position.y);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("left").?.position.y);
+
+    // And follows the pointer to the other one, which is the whole reason
+    // this exists rather than the caller working out the name itself.
+    ui.setPointer(50, 50, false);
+    try twoLists(&ui);
+    _ = ui.scrollHovered(0, 25);
+    try testing.expectEqual(@as(f32, 25), ui.scrollOf("left").?.position.y);
+    try testing.expectEqual(@as(f32, 40), ui.scrollOf("right").?.position.y);
+}
+
+test "a wheel over nothing that scrolls moves nothing, and says so" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try twoLists(&ui);
+    // Below both lists, on the root.
+    ui.setPointer(200, 250, false);
+    try twoLists(&ui);
+
+    try testing.expect(!ui.scrollHovered(0, 40));
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("left").?.position.y);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("right").?.position.y);
+}
+
+test "the innermost list takes the wheel, one axis at a time" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // A page that scrolls both ways, holding a strip that only scrolls down.
+    const nested = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{
+                    .id = "page",
+                    .width = .fixed(200),
+                    .height = .fixed(200),
+                    .clip = .scroll,
+                    .background_color = paint,
+                });
+                defer u.close();
+                {
+                    u.open(.{
+                        .id = "strip",
+                        .width = .fixed(100),
+                        .height = .fixed(100),
+                        .clip = .scrollY,
+                        .background_color = paint,
+                    });
+                    defer u.close();
+                    leaf(u, "rows", .{ .width = .fixed(100), .height = .fixed(300) });
+                }
+                leaf(u, "wide", .{ .width = .fixed(600), .height = .fixed(600) });
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try nested(&ui);
+    ui.setPointer(50, 50, false);
+    try nested(&ui);
+
+    // One swipe, both ways. Down is the strip's, because it is innermost and
+    // has somewhere to go; sideways is the page's, because the strip has not.
+    try testing.expect(ui.scrollHovered(30, 40));
+    try testing.expectEqual(@as(f32, 40), ui.scrollOf("strip").?.position.y);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("strip").?.position.x);
+    try testing.expectEqual(@as(f32, 30), ui.scrollOf("page").?.position.x);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("page").?.position.y);
+}
+
+test "the wheel stops a coast" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try twoLists(&ui);
+    ui.setPointer(50, 50, false);
+    try twoLists(&ui);
+    ui.scrolls.getPtr(identify("left", 0)).?.momentum.y = 500;
+
+    _ = ui.scrollHovered(0, 10);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("left").?.momentum.y);
+}
+
+// -------------------------------------------------------------------------
 // Does the interface want this?
 // -------------------------------------------------------------------------
 
@@ -8657,4 +8967,130 @@ test "only a text field takes the keyboard" {
     ui.clearFocus();
     try both(&ui);
     try testing.expect(!ui.wantsKeyboard());
+}
+
+// -------------------------------------------------------------------------
+// What the pointer looks like
+// -------------------------------------------------------------------------
+
+/// A panel that wants a crosshair, with a resize handle down its right edge
+/// that wants something else, and a text field under both.
+fn withHandles(u: *Ui) !void {
+    u.begin(.init(400, 300));
+    {
+        u.open(.{
+            .id = "panel",
+            .width = .grow,
+            .height = .grow,
+            .cursor = .crosshair,
+            .background_color = paint,
+        });
+        defer u.close();
+        u.empty(.{
+            .id = "handle",
+            .width = .fixed(8),
+            .height = .fixed(100),
+            .cursor = .resize_ew,
+            .background_color = paint,
+        });
+        u.textInput(
+            .{ .id = "name", .width = .fixed(200), .height = .fixed(30) },
+            .{},
+        );
+    }
+    _ = try u.end();
+}
+
+test "an element says what the pointer looks like over it, innermost first" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try withHandles(&ui);
+
+    // Over the handle, which is eight wide at the panel's top left.
+    ui.setPointer(4, 40, false);
+    try withHandles(&ui);
+    try testing.expectEqual(layout.CursorShape.resize_ew, ui.cursor());
+
+    // Over the panel and nothing else. The handle's shape must not leak out
+    // of it, and the panel's must not overrule the handle's.
+    ui.setPointer(300, 250, false);
+    try withHandles(&ui);
+    try testing.expectEqual(layout.CursorShape.crosshair, ui.cursor());
+}
+
+test "a text input asks for the caret without being told to" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try withHandles(&ui);
+
+    // The field sits beside the handle, so anywhere past the first eight
+    // pixels of that row is over it.
+    ui.setPointer(100, 15, false);
+    try withHandles(&ui);
+    try testing.expectEqual(layout.CursorShape.ibeam, ui.cursor());
+}
+
+test "a declaration still wins over the caret an input asks for" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const arrowed = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            u.textInput(
+                .{ .id = "name", .width = .fixed(200), .height = .fixed(30), .cursor = .arrow },
+                .{},
+            );
+            _ = try u.end();
+        }
+    }.run;
+
+    try arrowed(&ui);
+    ui.setPointer(100, 15, false);
+    try arrowed(&ui);
+    try testing.expectEqual(layout.CursorShape.arrow, ui.cursor());
+}
+
+test "nothing under the pointer is an arrow" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const plain = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            u.empty(.{ .id = "panel", .width = .grow, .height = .grow, .background_color = paint });
+            _ = try u.end();
+        }
+    }.run;
+
+    try plain(&ui);
+    ui.setPointer(200, 150, false);
+    try plain(&ui);
+    try testing.expectEqual(layout.CursorShape.arrow, ui.cursor());
+}
+
+test "asking for a shape beats the tree, and only for the frame that asked" {
+    // What a drag needs: the pointer has left the handle it grabbed, and the
+    // shape has to stay until the button comes up.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try withHandles(&ui);
+    ui.setPointer(100, 15, false);
+
+    // Over the text field, which would be a caret on its own.
+    try withHandles(&ui);
+    try testing.expectEqual(layout.CursorShape.ibeam, ui.cursor());
+
+    ui.begin(.init(400, 300));
+    ui.setCursor(.resize_ew);
+    _ = try ui.end();
+    try testing.expectEqual(layout.CursorShape.resize_ew, ui.cursor());
+
+    // And gone with the frame that asked for it, rather than persisting the
+    // way Ply's does - or nothing could ever put it back.
+    try withHandles(&ui);
+    try testing.expectEqual(layout.CursorShape.ibeam, ui.cursor());
 }

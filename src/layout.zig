@@ -275,6 +275,14 @@ pub const Declaration = struct {
     /// What happens to content larger than this element. See `Clip`.
     clip: Clip = .none,
 
+    /// What the pointer looks like over this element, or null to leave it to
+    /// whatever is underneath. See `CursorShape` and `Ui.cursor`.
+    ///
+    /// A resize handle says `.resize_ew`, a map says `.crosshair`, a link
+    /// says `.pointing_hand`. A text input says `.ibeam` on its own and does
+    /// not need telling.
+    cursor: ?CursorShape = null,
+
     /// Take it out of the flow and hang it off something. See `Floating`.
     floating: ?Floating = null,
 
@@ -379,6 +387,45 @@ pub const BorderWidth = extern struct {
 /// Where the line sits relative to the box. Ply's three, under Ply's names -
 /// which is why the middle one is `middle` rather than `center`.
 pub const BorderPosition = enum { outside, middle, inside };
+
+/// What the pointer should look like over an element.
+///
+/// The ten shapes every desktop already has, under
+/// [Fluxion Platform](https://github.com/kisstp2006/fluxion-platform)'s names
+/// so that a program passing one to the other can switch on the tag and be
+/// done. Named rather than drawn, because the system's own arrow is the one
+/// that matches the theme, the size and the display's scale.
+///
+/// This is a *request*: nothing here draws a cursor or asks a window for one.
+/// The layout says what the pointer is over and `Ui.cursor` reads it back;
+/// setting it on the window is the program's line of code, once a frame.
+pub const CursorShape = enum {
+    /// The ordinary pointer, and what everything is when nothing says
+    /// otherwise.
+    arrow,
+    /// The text caret. A text input asks for this without being told to.
+    ibeam,
+    /// Precise selection.
+    crosshair,
+    /// The hand, for a link.
+    ///
+    /// **Not something this works out for itself.** A hand over anything
+    /// clickable is the web's convention and not a desktop's - native buttons
+    /// keep the arrow - so an interface that wants it says so, per element.
+    pointing_hand,
+    /// Horizontal resize, as on a left or right edge.
+    resize_ew,
+    /// Vertical resize.
+    resize_ns,
+    /// The diagonal from top left to bottom right.
+    resize_nwse,
+    /// The other diagonal.
+    resize_nesw,
+    /// Move, or resize in every direction at once.
+    resize_all,
+    /// The circle-and-bar: not somewhere this can be dropped.
+    not_allowed,
+};
 
 /// Something to call when an element is pointed at or focused. Ply's
 /// `on_hover` and its four siblings.
@@ -610,9 +657,20 @@ pub const Scrollbar = struct {
     /// How short the thumb may get. Without a floor, a long enough document
     /// gives a thumb of half a pixel that nobody can grab.
     min_thumb_size: f32 = 20,
-    /// Fade the bar out after this many still frames, or null to leave it
+    /// Fade the bar out after this many still seconds, or null to leave it
     /// showing. See `Ui.visibility` for the fade itself.
-    hide_after_frames: ?u32 = null,
+    ///
+    /// **Seconds, where Ply counts frames**, and it is the one number here
+    /// whose units differ from Ply's. A bar tuned to disappear after two
+    /// seconds at sixty frames disappears after one at a hundred and twenty
+    /// and after four on a machine having a bad time - so Ply's version is
+    /// right at exactly one frame rate and wrong at every other. A game knows
+    /// its frame time; the layout is told it once, by `Ui.tick`.
+    ///
+    /// Nothing fades in a program that never calls `Ui.tick`: no clock, no
+    /// seconds, and a bar that stays is the safer of the two ways to be
+    /// wrong.
+    hide_after_seconds: ?f32 = null,
 };
 
 /// What happens to content larger than the element holding it.
