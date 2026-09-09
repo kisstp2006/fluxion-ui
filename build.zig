@@ -109,6 +109,13 @@ pub fn build(b: *std.Build) void {
         needs_window: bool = false,
     }{
         .{
+            .name = "counter",
+            .step = "example-counter",
+            .about = "A number and two buttons, in a window, clicked with the mouse",
+            .needs_font = true,
+            .needs_window = true,
+        },
+        .{
             .name = "shell",
             .step = "example",
             .about = "An application shell, laid out and printed as draw commands",
