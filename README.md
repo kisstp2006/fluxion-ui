@@ -697,6 +697,45 @@ up**. Standing on the menu does not count as standing on the button it hangs
 off, because on screen it is not inside it - the same reason `capture` stops
 the walk. A hover menu asks about both, as the example above does.
 
+## Over a game
+
+Two things a program needs when the interface is not the only thing on the
+screen.
+
+**Draw on top of what is there.** `Renderer.draw` takes `?Color`, and `null`
+means load rather than clear - so a game can draw its scene, then its
+interface, into one surface. A `Color` still coerces on its own, so a program
+that only ever draws an interface says nothing new.
+
+```zig
+try renderer.draw(target, size, scene_commands, .black);   // clears
+try renderer.draw(target, size, ui_commands, null);        // draws on top
+```
+
+**Ask whether the interface wanted that.** Dear ImGui calls these
+`WantCaptureMouse` and `WantCaptureKeyboard`, and every program that puts an
+interface over a world needs both: when a button is under the cursor, exactly
+one of "press the button" and "fire the gun" should happen.
+
+```zig
+if (ui.wantsPointer()) return;    // the interface is having this click
+if (ui.wantsKeyboard()) return;   // somebody is typing, so W means W
+```
+
+`wantsPointer` is true where the interface either **drew** something - a fill,
+a border, a picture - or **asked** to be clicked: a callback, a text field, a
+`capture`, a list that scrolls. A transparent root over a game does not count,
+which is the whole point, because a heads-up display is mostly nothing. An
+application whose root has a background wants the pointer everywhere, which is
+also right.
+
+`wantsKeyboard` is true only when a **text input** has the focus. A focused
+button does not take W away from the game.
+
+Both answer from where things were when the last frame finished, like every
+other pointer question here - so a game asks them after the interface's frame
+and before its own input runs.
+
 ## Callbacks
 
 ```zig
@@ -912,11 +951,11 @@ than from memory.
 | **Animated text** | all nine of Ply's: `wave`, `pulse`, `swing`, `jitter`, `transform`, `gradient`, `type`, `fade` and `scale` |
 | **Clipping and scrolling** | per axis, by wheel, by dragging the content, and by the bar, with momentum and with the position remembered between frames |
 | **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
-| **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, and clip-aware picking |
+| **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, clip-aware picking, and `wantsPointer` for a program that has its own use for a click |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus` and `on_unfocus`, called when the frame is over |
 | **Floating** | out of the flow, anchored to a parent, an element by name, or the surface, with an offset, a z-index and optional clipping |
 | **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup |
-| **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text |
+| **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text, and a pass that can draw over a scene rather than instead of it |
 
 ### Only in Ply
 

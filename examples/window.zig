@@ -1267,3 +1267,69 @@ test "a turned box reaches the pixels turned" {
     try testing.expect(channel(pixels, 10, 64, 0) < 50);
     try testing.expect(channel(pixels, 118, 64, 0) < 50);
 }
+
+test "an interface can be drawn on top of a frame rather than instead of it" {
+    // The one that lets an interface be the third layer of a game rather than
+    // the only one. A pass that cleared would wipe the scene behind it, and
+    // no test of anything above this would mean much.
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    var window = Window.open(64, 64, false, true) catch |err|
+        if (Window.isAbsent(err)) return error.SkipZigTest else return err;
+    defer window.close();
+
+    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .gl = window.hooks() }) catch
+        return error.SkipZigTest;
+    defer device.deinit();
+
+    const target = try device.createTexture(.{
+        .width = 128,
+        .height = 128,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    var measured: Measured = .{ .face = try .init(bytes) };
+    var renderer: render.Renderer = try .init(testing.allocator, &device, &measured.face);
+    defer renderer.deinit();
+
+    const size: ui.Dimensions = .init(128, 128);
+
+    var layout: Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(measured.measurer());
+
+    // Stand in for the game: orange over the whole target.
+    layout.begin(size);
+    layout.empty(.{ .width = .grow, .height = .grow, .background_color = .hex(0xFF8000) });
+    try renderer.draw(.{ .texture = target }, size, try layout.end(), .black);
+
+    // Then the interface, which asks for nothing to be cleared: a small blue
+    // box in the corner.
+    layout.begin(size);
+    {
+        layout.open(.{ .width = .grow, .height = .grow });
+        defer layout.close();
+        layout.empty(.{ .width = .fixed(32), .height = .fixed(32), .background_color = .hex(0x0000FF) });
+    }
+    try renderer.draw(.{ .texture = target }, size, try layout.end(), null);
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+
+    const channel = struct {
+        fn at(data: []const u8, x: usize, y: usize, index: usize) u8 {
+            return data[(y * 128 + x) * 4 + index];
+        }
+    }.at;
+
+    // Blue where the interface drew...
+    try testing.expect(channel(pixels, 16, 16, 2) > 200);
+    try testing.expect(channel(pixels, 16, 16, 0) < 50);
+
+    // ...and the scene still there everywhere else, which it would not be if
+    // the second pass had cleared.
+    try testing.expect(channel(pixels, 100, 100, 0) > 200);
+    try testing.expectApproxEqAbs(128, @as(f32, @floatFromInt(channel(pixels, 100, 100, 1))), 12);
+}

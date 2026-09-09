@@ -315,7 +315,15 @@ pub const Renderer = struct {
         target: rhi.types.RenderTarget,
         size: ui.Dimensions,
         commands: []const ui.RenderCommand,
-        clear: ui.Color,
+        /// What to fill the target with first, or **null to draw on top of
+        /// what is already there**.
+        ///
+        /// An interface is not always the first thing in a target. A game
+        /// draws its scene and then its interface into one surface, and a
+        /// pass that cleared would wipe the scene - so the third layer could
+        /// not exist at all. A `Color` still coerces to this on its own, so
+        /// nothing that only ever draws an interface has to say anything.
+        clear: ?ui.Color,
     ) Error!void {
         try self.build(commands, size);
 
@@ -339,7 +347,8 @@ pub const Renderer = struct {
         const list = self.device.begin();
         try list.beginPass(.{ .color = .{
             .target = target,
-            .clear_color = clear.array(),
+            .load = if (clear == null) .load else .clear,
+            .clear_color = if (clear) |colour| colour.array() else .{ 0, 0, 0, 1 },
         } });
         try list.setViewport(.{ .width = size.width, .height = size.height });
         try list.setPipeline(self.pipeline);

@@ -232,6 +232,10 @@ const Hit = struct {
     field: bool,
     /// Whether dragging in it selects text.
     drag_select: bool,
+    /// Whether the interface would do something with a click here - either
+    /// because something is drawn under the pointer or because the element
+    /// asked to be clicked. See `Ui.wantsPointer`.
+    solid: bool,
 
     /// Whether a point is on this element.
     ///
@@ -2905,6 +2909,7 @@ fn recordHits(self: *Ui) Error!void {
             .preserve_focus = element.preserve_focus,
             .field = element.field != null,
             .drag_select = if (element.field) |config| config.drag_select else false,
+            .solid = self.solidToPointer(element),
         });
     }
 }
@@ -2994,6 +2999,38 @@ const scroll_becomes_drag: f32 = 6;
 /// library already decided, as a `text_input.Action`.
 pub fn setShift(self: *Ui, held: bool) void {
     self.shift = held;
+}
+
+/// Whether a click landing on this element is the interface's business.
+///
+/// Two ways to qualify, and a game needs both. Something is **drawn** here -
+/// a fill, a border, a picture - so the interface is covering this pixel and
+/// a click through it into the world would be wrong. Or the element **asked**
+/// to be clicked: a callback, a text field, a capture, a list that scrolls.
+///
+/// An element that lays out and paints nothing does not qualify, which is
+/// what keeps a transparent root from swallowing the whole screen - and a
+/// game's interface is mostly transparent root.
+fn solidToPointer(self: *Ui, element: Element) bool {
+    // A callback lives in `listeners` rather than on the element, so this is
+    // the one part that has to be looked up. Only the three pointer ones
+    // count: an element that asked to be told about the *keyboard* has not
+    // asked to swallow a click.
+    for (self.listeners.items) |listener| {
+        if (listener.id != element.id) continue;
+        if (listener.on_hover != null or listener.on_press != null or
+            listener.on_release != null) return true;
+    }
+
+    if (!element.background_color.invisible()) return true;
+    if (element.image != null) return true;
+    if (element.border) |line| {
+        if (!line.color.invisible() and !line.width.isNone()) return true;
+    }
+    if (element.field != null) return true;
+    if (element.capture) return true;
+    if (element.clip.scrolls()) return true;
+    return false;
 }
 
 /// Say where the pointer is and whether its button is down.
@@ -3425,6 +3462,40 @@ pub fn isElementPressed(self: *Ui, name: []const u8) bool {
 pub fn isElementReleased(self: *Ui, name: []const u8) bool {
     const id = identify(name, 0);
     return self.pointer.justReleased() and self.isHeld(id) and self.isOver(id);
+}
+
+/// Whether the interface wants this click.
+///
+/// The one question a game asks before it shoots. Dear ImGui calls it
+/// `WantCaptureMouse`, and every program that puts an interface over a world
+/// needs it: when a button is under the cursor, exactly one of "press the
+/// button" and "fire the gun" should happen.
+///
+/// True when the pointer is over something the interface either drew or asked
+/// to be clicked - see `solidToPointer`. A transparent root over a game does
+/// not count, which is the whole point: a heads-up display is mostly nothing.
+///
+/// Answered from where things were when the last frame finished, like every
+/// other pointer question here, so a game asks it after the interface's frame
+/// and before its own input runs.
+pub fn wantsPointer(self: *Ui) bool {
+    for (self.over.items) |id| {
+        for (self.hits.items) |hit| {
+            if (hit.id == id and hit.solid) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether the interface wants the keys.
+///
+/// True only when a **text input** has the focus, which is the case that
+/// matters: W means "walk" until somebody is typing a name into a box, and
+/// then it means W. A focused button does not take the keyboard - a game
+/// still wants its own bindings while one is highlighted.
+pub fn wantsKeyboard(self: *Ui) bool {
+    if (self.focus == 0) return false;
+    return self.edits.contains(self.focus);
 }
 
 /// The elements under the pointer, outermost first. Ply's
@@ -8421,4 +8492,169 @@ test "dragging a scrollbar is not dragging the content" {
     ui.setPointer(97, 10, true);
     try testing.expect(ui.draggingScrollbar());
     try testing.expect(!ui.draggingContent());
+}
+
+// -------------------------------------------------------------------------
+// Does the interface want this?
+// -------------------------------------------------------------------------
+
+// The two questions a game asks between the interface's frame and its own
+// input. Both run two frames, like every other pointer question: what is
+// under the cursor is known once a frame has been laid out.
+
+/// A transparent root - a heads-up display - with one panel in the corner.
+fn overlay(u: *Ui) !void {
+    u.begin(.init(400, 300));
+    {
+        // No background: the game is behind this, not the interface.
+        u.open(.{ .id = "hud", .width = .grow, .height = .grow });
+        defer u.close();
+        u.empty(.{
+            .id = "panel",
+            .width = .fixed(100),
+            .height = .fixed(50),
+            .background_color = paint,
+        });
+    }
+    _ = try u.end();
+}
+
+test "a transparent overlay does not want the whole screen" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try overlay(&ui);
+
+    // Over the panel: the interface drew here, so a click is its business.
+    ui.setPointer(50, 25, false);
+    try overlay(&ui);
+    try testing.expect(ui.wantsPointer());
+
+    // Anywhere else the root is under the pointer and paints nothing, so the
+    // click belongs to whatever is behind - which is the whole point of
+    // asking. A rule that counted "is anything under the cursor" would say
+    // yes here, because the root always is.
+    ui.setPointer(300, 200, false);
+    try overlay(&ui);
+    try testing.expect(!ui.wantsPointer());
+}
+
+test "an element that asked to be clicked counts even when it paints nothing" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const invisible = struct {
+        fn nothing(context: ?*anyopaque, event: layout.Callback.Event) void {
+            _ = context;
+            _ = event;
+        }
+
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            {
+                u.open(.{ .id = "hud", .width = .grow, .height = .grow });
+                defer u.close();
+                // No fill, no border, no picture - but a callback, so a click
+                // here is meant for it.
+                u.empty(.{
+                    .id = "hotspot",
+                    .width = .fixed(100),
+                    .height = .fixed(50),
+                    .on_press = .{ .call = nothing },
+                });
+            }
+            _ = try u.end();
+        }
+    };
+
+    try invisible.run(&ui);
+    ui.setPointer(50, 25, false);
+    try invisible.run(&ui);
+    try testing.expect(ui.wantsPointer());
+}
+
+test "a whole-window application wants the pointer everywhere" {
+    // The other end of the same rule: an application's root has a background,
+    // so all of it is interface and every click is the interface's.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const application = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            u.empty(.{ .id = "window", .width = .grow, .height = .grow, .background_color = paint });
+            _ = try u.end();
+        }
+    }.run;
+
+    try application(&ui);
+    ui.setPointer(200, 150, false);
+    try application(&ui);
+    try testing.expect(ui.wantsPointer());
+}
+
+test "a scrolling list wants the pointer even where it is empty" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const scrolling = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            {
+                u.open(.{ .id = "hud", .width = .grow, .height = .grow });
+                defer u.close();
+                {
+                    // No fill, but it scrolls - so a drag here is a scroll and
+                    // not a swing of the camera.
+                    u.open(.{ .id = "list", .width = .fixed(100), .height = .fixed(100), .clip = .scrollY });
+                    defer u.close();
+                    leaf(u, "rows", .{ .width = .fixed(100), .height = .fixed(300) });
+                }
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try scrolling(&ui);
+    ui.setPointer(50, 50, false);
+    try scrolling(&ui);
+    try testing.expect(ui.wantsPointer());
+}
+
+test "only a text field takes the keyboard" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const both = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            {
+                u.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+                defer u.close();
+                u.empty(.{ .id = "button", .width = .fixed(100), .height = .fixed(40), .background_color = paint });
+                u.textInput(
+                    .{ .id = "name", .width = .fixed(200), .height = .fixed(30) },
+                    .{ .placeholder = "Your name" },
+                );
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try both(&ui);
+    try testing.expect(!ui.wantsKeyboard());
+
+    // A focused button does not take W away from the game.
+    ui.setFocus("button");
+    try both(&ui);
+    try testing.expect(!ui.wantsKeyboard());
+
+    // A focused text field does, which is the whole case this exists for.
+    ui.setFocus("name");
+    try both(&ui);
+    try testing.expect(ui.wantsKeyboard());
+
+    ui.clearFocus();
+    try both(&ui);
+    try testing.expect(!ui.wantsKeyboard());
 }
