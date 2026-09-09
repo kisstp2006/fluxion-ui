@@ -37,12 +37,13 @@ pub fn build(b: *std.Build) void {
     // for programs that want one ready-made. Consumers do:
     //   const render = @import("fluxion_ui_rhi");
     //
-    // Both its dependencies are lazy, so a program that only lays out - or
-    // that brings its own renderer - fetches neither.
+    // All three of its dependencies are lazy, so a program that only lays out
+    // - or that brings its own renderer - fetches none of them.
     const rhi_dep = b.lazyDependency("fluxion_rhi", .{ .target = target, .optimize = optimize });
     const font_for_render = b.lazyDependency("fluxion_font", .{ .target = target, .optimize = optimize });
+    const shader_dep = b.lazyDependency("fluxion_shader", .{ .target = target, .optimize = optimize });
 
-    const render_mod: ?*std.Build.Module = if (rhi_dep != null and font_for_render != null)
+    const render_mod: ?*std.Build.Module = if (rhi_dep != null and font_for_render != null and shader_dep != null)
         b.addModule("fluxion_ui_rhi", .{
             .root_source_file = b.path("src/render/rhi.zig"),
             .target = target,
@@ -51,6 +52,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "fluxion_ui", .module = mod },
                 .{ .name = "fluxion_rhi", .module = rhi_dep.?.module("fluxion_rhi") },
                 .{ .name = "fluxion_font", .module = font_for_render.?.module("fluxion_font") },
+                .{ .name = "fluxion_shader", .module = shader_dep.?.module("fluxion_shader") },
             },
         })
     else

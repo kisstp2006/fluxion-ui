@@ -31,6 +31,15 @@
             .lazy = true,
         },
 
+        // What that module writes its shader in: one source, and both
+        // backends' languages come out of it. Lazy with the renderer, and
+        // for the same reason. Without it the same shader would be in this
+        // repository twice, in two languages, drifting apart.
+        .fluxion_shader = .{
+            .path = "../fluxion-shader",
+            .lazy = true,
+        },
+
         // The window one example opens. Lazy, and the library imports it
         // nowhere: a layout engine has no business opening windows.
         .fluxion_platform = .{

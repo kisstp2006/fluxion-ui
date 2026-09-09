@@ -1,0 +1,63 @@
+attribute vec2 a_corner : 0;
+attribute vec4 a_rect : 1;
+attribute vec4 a_color : 2;
+attribute vec4 a_radii : 3;
+attribute vec4 a_uv : 4;
+attribute vec4 a_params : 5;
+attribute vec4 a_motion : 6;
+
+varying vec2 v_local;
+varying vec2 v_half;
+varying vec4 v_color;
+varying vec4 v_radii;
+varying vec2 v_uv;
+varying float v_border;
+varying float v_textured;
+
+uniform Frame : 0 {
+    vec4 u_viewport;
+}
+
+texture2d u_atlas : 0;
+
+float roundedBox(vec2 p, vec2 b, vec4 r) {
+    float radius = (p.x > 0.0) ? ((p.y < 0.0) ? r.y : r.z)
+                               : ((p.y < 0.0) ? r.x : r.w);
+    vec2 q = abs(p) - b + radius;
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
+}
+
+vertex {
+    vec2 pixel = a_rect.xy + a_corner * a_rect.zw;
+    pixel = vec2(a_motion.x * pixel.x + a_motion.z * pixel.y,
+                 a_motion.y * pixel.x + a_motion.w * pixel.y) + a_params.zw;
+    v_local = (a_corner - 0.5) * a_rect.zw;
+    v_half = a_rect.zw * 0.5;
+    v_color = a_color;
+    v_radii = a_radii;
+    v_uv = mix(a_uv.xy, a_uv.zw, a_corner);
+    v_border = a_params.x;
+    v_textured = a_params.y;
+    position = vec4(pixel.x / u_viewport.x * 2.0 - 1.0,
+                    1.0 - pixel.y / u_viewport.y * 2.0, 0.0, 1.0);
+}
+
+fragment {
+    if (v_textured > 0.5 && v_textured < 1.5) {
+        target = vec4(v_color.rgb, v_color.a * sample(u_atlas, v_uv).r);
+    } else {
+        float outer = roundedBox(v_local, v_half, v_radii);
+        float alpha = clamp(0.5 - outer, 0.0, 1.0);
+        if (v_textured > 1.5) {
+            vec4 texel = sample(u_atlas, v_uv);
+            target = vec4(texel.rgb * v_color.rgb, texel.a * v_color.a * alpha);
+        } else {
+            if (v_border > 0.0) {
+                vec4 inner_radii = max(v_radii - v_border, vec4(0.0));
+                float inner = roundedBox(v_local, max(v_half - v_border, vec2(0.0)), inner_radii);
+                alpha *= clamp(0.5 + inner, 0.0, 1.0);
+            }
+            target = vec4(v_color.rgb, v_color.a * alpha);
+        }
+    }
+}
