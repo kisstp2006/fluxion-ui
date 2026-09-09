@@ -232,6 +232,26 @@ pub const BoundingBox = extern struct {
 };
 
 /// Space inside an element, before its children start.
+/// One whole-pixel number, multiplied by an interface scale.
+///
+/// Padding, gaps, border widths and font sizes are whole pixels, so scaling
+/// one is a multiplication, a rounding, and a clamp - a `u16` that is already
+/// large has nowhere to go, and a padding that wrapped round to nothing would
+/// be a very strange bug to look for. See `layout.Surface.scale`.
+pub inline fn scaleWhole(value: u16, by: f32) u16 {
+    const wanted = @round(@as(f32, @floatFromInt(value)) * by);
+    return @intFromFloat(std.math.clamp(wanted, 0, std.math.maxInt(u16)));
+}
+
+/// One length, multiplied by an interface scale.
+///
+/// Infinity stays infinity: `Sizing.max` defaults to the largest `f32` there
+/// is, and doubling that is not a bigger maximum - it is a maximum that has
+/// stopped being a number.
+pub inline fn scaleLength(value: f32, by: f32) f32 {
+    return if (std.math.isFinite(value)) value * by else value;
+}
+
 pub const Padding = extern struct {
     left: u16 = 0,
     right: u16 = 0,
@@ -239,6 +259,16 @@ pub const Padding = extern struct {
     bottom: u16 = 0,
 
     pub const none: Padding = .{};
+
+    /// Every side multiplied by an interface scale. See `layout.Surface`.
+    pub inline fn scaled(self: Padding, by: f32) Padding {
+        return .{
+            .left = scaleWhole(self.left, by),
+            .right = scaleWhole(self.right, by),
+            .top = scaleWhole(self.top, by),
+            .bottom = scaleWhole(self.bottom, by),
+        };
+    }
 
     /// The same on all four sides, which is what most of them are.
     pub inline fn all(amount: u16) Padding {
@@ -289,6 +319,17 @@ pub const CornerRadius = extern struct {
     bottom_left: f32 = 0,
 
     pub const sharp: CornerRadius = .{};
+
+    /// Every corner multiplied by an interface scale. A radius that did not
+    /// scale with its box would be a hairline on a card at twice the size.
+    pub inline fn scaled(self: CornerRadius, by: f32) CornerRadius {
+        return .{
+            .top_left = self.top_left * by,
+            .top_right = self.top_right * by,
+            .bottom_right = self.bottom_right * by,
+            .bottom_left = self.bottom_left * by,
+        };
+    }
 
     pub inline fn all(radius: f32) CornerRadius {
         return .{

@@ -113,6 +113,16 @@ pub const Config = struct {
         out.color = self.placeholder_color;
         return out;
     }
+
+    /// The lengths in it multiplied by an interface scale. See
+    /// `layout.Surface.scale`.
+    pub inline fn scaled(self: Config, by: f32) Config {
+        var out = self;
+        out.font_size = geometry.scaleWhole(self.font_size, by);
+        out.line_height = geometry.scaleWhole(self.line_height, by);
+        if (self.scrollbar) |configured| out.scrollbar = configured.scaled(by);
+        return out;
+    }
 };
 
 // -------------------------------------------------------------------------

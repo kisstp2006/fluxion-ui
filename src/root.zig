@@ -56,6 +56,7 @@ pub const Padding = geometry.Padding;
 pub const CornerRadius = geometry.CornerRadius;
 
 pub const Declaration = layout.Declaration;
+pub const Surface = layout.Surface;
 pub const Sizing = layout.Sizing;
 pub const Direction = layout.Direction;
 pub const Border = layout.Border;

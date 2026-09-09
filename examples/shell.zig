@@ -227,7 +227,7 @@ test "the window resizing moves everything and breaks nothing" {
     defer ui.deinit();
 
     for ([_]ui_lib.Dimensions{ .init(1280, 720), .init(640, 480), .init(3840, 2160) }) |size| {
-        ui.begin(size);
+        ui.begin(.{ .size = size });
         shell(&ui, 3);
         _ = try ui.end();
 

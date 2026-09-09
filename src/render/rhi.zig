@@ -1062,7 +1062,7 @@ test "the whole thing runs end to end against a device that draws nothing" {
     defer layout.deinit();
     layout.setMeasurer(.monospace(0.5, 1.0));
 
-    layout.begin(page);
+    layout.begin(.{ .size = page });
     {
         layout.open(.{
             .width = .grow,
@@ -1161,7 +1161,7 @@ test "the Direct3D shaders compile and the frame reaches the pixels" {
     defer layout.deinit();
     layout.setMeasurer(.monospace(0.5, 1.0));
 
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     {
         layout.open(.{ .width = .grow, .height = .grow, .padding = .all(24) });
         defer layout.close();
@@ -1225,7 +1225,7 @@ test "the Direct3D shader turns a box too" {
     defer layout.deinit();
     layout.setMeasurer(.monospace(0.5, 1.0));
 
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     {
         layout.open(.{ .width = .grow, .height = .grow, .align_y = .center });
         defer layout.close();
@@ -1297,7 +1297,7 @@ test "the Direct3D shader draws a picture too" {
     defer layout.deinit();
     layout.setMeasurer(.monospace(0.5, 1.0));
 
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     layout.empty(.{
         .width = .grow,
         .height = .grow,

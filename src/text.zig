@@ -57,6 +57,21 @@ pub const TextStyle = struct {
     /// Which font, as an index into whatever table the measurer was built
     /// with. Zero is the default one.
     font: u16 = 0,
+
+    /// The three lengths multiplied by an interface scale.
+    ///
+    /// The font size above all: a game that scaled its boxes and forgot its
+    /// text ends up with the same words in a box twice the size, which looks
+    /// worse than not having scaled at all. A `line_height` of zero stays
+    /// zero, and goes on meaning "whatever the font says". See
+    /// `layout.Surface.scale`.
+    pub inline fn scaled(self: TextStyle, by: f32) TextStyle {
+        var out = self;
+        out.font_size = geometry.scaleWhole(self.font_size, by);
+        out.letter_spacing = geometry.scaleWhole(self.letter_spacing, by);
+        out.line_height = geometry.scaleWhole(self.line_height, by);
+        return out;
+    }
 };
 
 /// How wide and tall a run of text is, in pixels.

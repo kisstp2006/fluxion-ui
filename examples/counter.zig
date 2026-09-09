@@ -210,7 +210,7 @@ pub fn main(init: std.process.Init) !void {
         const size: ui_lib.Dimensions = .init(@floatFromInt(size_fb[0]), @floatFromInt(size_fb[1]));
         ui.setPointer(mouse_x, mouse_y, mouse_down);
         ui.tick(1.0 / 60.0);
-        ui.begin(size);
+        ui.begin(.{ .size = size });
         count += counter(&ui, count);
         const commands = try ui.end();
 

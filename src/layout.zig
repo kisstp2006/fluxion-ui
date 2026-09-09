@@ -82,6 +82,18 @@ pub const Sizing = struct {
 
     pub const Kind = enum { fit, grow, fixed, percent, ratio };
 
+    /// The lengths multiplied by an interface scale, and nothing else.
+    ///
+    /// `fraction` is a share of a parent that has already been scaled, and a
+    /// `weight` is a share of what is spare - so both mean the same thing at
+    /// any size. Only `min` and `max` are pixels. See `Surface.scale`.
+    pub inline fn scaled(self: Sizing, by: f32) Sizing {
+        var out = self;
+        out.min = geometry.scaleLength(self.min, by);
+        out.max = geometry.scaleLength(self.max, by);
+        return out;
+    }
+
     /// As small as the children allow. The default, and the right answer far
     /// more often than people expect.
     pub const fit: Sizing = .{ .kind = .fit };
@@ -212,6 +224,20 @@ pub const LayoutConfig = struct {
     wrap_gap: u16 = 0,
 
     pub const default: LayoutConfig = .{};
+
+    /// Every length in it multiplied by an interface scale. See
+    /// `Surface.scale`.
+    pub fn scaled(self: LayoutConfig, by: f32) LayoutConfig {
+        var out = self;
+        out.sizing = .{
+            .width = self.sizing.width.scaled(by),
+            .height = self.sizing.height.scaled(by),
+        };
+        out.padding = self.padding.scaled(by);
+        out.gap = geometry.scaleWhole(self.gap, by);
+        out.wrap_gap = geometry.scaleWhole(self.wrap_gap, by);
+        return out;
+    }
 };
 
 /// What `Ui.open` takes: everything an element is, in one literal.
@@ -343,6 +369,93 @@ pub const Declaration = struct {
         if (self.cover) |ratio| return .{ .ratio = ratio, .mode = .cover };
         return null;
     }
+
+    /// This declaration with every length multiplied by an interface scale.
+    ///
+    /// **Every field here that means pixels, and none of the ones that mean
+    /// fractions.** `contain` and `cover` are aspect ratios, a `percent`
+    /// width is a share of a parent that has already been scaled, a grow
+    /// weight is a share of what is spare, and a rotation's pivot is a
+    /// fraction of a box - all four mean the same thing at any size, and
+    /// multiplying them would be a bug rather than a scale.
+    ///
+    /// The one list, so that a new length is one line here rather than a
+    /// thing every game gets wrong on its own. See `Surface.scale`.
+    pub fn scaled(self: Declaration, by: f32) Declaration {
+        if (by == 1) return self;
+
+        var out = self;
+        out.width = self.width.scaled(by);
+        out.height = self.height.scaled(by);
+        out.padding = self.padding.scaled(by);
+        out.gap = geometry.scaleWhole(self.gap, by);
+        out.wrap_gap = geometry.scaleWhole(self.wrap_gap, by);
+        out.corner_radius = self.corner_radius.scaled(by);
+        out.clip = self.clip.scaled(by);
+        if (self.border) |line| out.border = line.scaled(by);
+        if (self.floating) |float| out.floating = float.scaled(by);
+        return out;
+    }
+};
+
+/// What `Ui.begin` is given: how big the surface is, and the two numbers that
+/// turn one interface into an interface for *that* surface.
+///
+/// ```zig
+/// ui.begin(.init(width, height));                     // the ordinary case
+/// ui.begin(.{
+///     .size = .init(3840, 2160),
+///     .scale = 2,
+///     .safe_area = .all(48),
+/// });
+/// ```
+pub const Surface = struct {
+    /// How big it is, in real pixels. What the root is laid out in, and what
+    /// the commands come out measured in.
+    size: geometry.Dimensions,
+
+    /// What to multiply every length in every declaration by.
+    ///
+    /// A game at 3840 by 2160 wants an interface twice the size, not twice as
+    /// much of it. Everything a declaration says in pixels is multiplied -
+    /// fixed sizes, minima and maxima, padding, gaps, corner radii, border
+    /// widths, floating offsets, scrollbar thicknesses, font sizes, letter
+    /// spacing and line heights - and everything that says a fraction is left
+    /// alone. See `Declaration.scaled`.
+    ///
+    /// **Doing it here rather than in the game** is the whole of why it
+    /// exists. A game that multiplies its own numbers gets the ones it
+    /// remembers, and forgets the font sizes, or the corner radii, or the one
+    /// panel somebody else wrote.
+    ///
+    /// A zero or a negative is taken as one: an interface scaled to nothing
+    /// is not something anybody meant to ask for.
+    scale: f32 = 1,
+
+    /// How far in from each edge the interface must keep, in the same pixels
+    /// as `size`.
+    ///
+    /// A television overscans, a phone has a notch and a home indicator, and
+    /// a handheld has rounded corners. The root is laid out inside this, and
+    /// anything floating against the surface is placed inside it too, so an
+    /// interface written for a rectangle becomes an interface for the part of
+    /// one that can be seen.
+    ///
+    /// **It moves things; it does not cut them.** Nothing is clipped to it -
+    /// a background asked to `.grow` fills the whole surface as before, which
+    /// is what a full-bleed backdrop behind a safe interface wants.
+    ///
+    /// **Not multiplied by `scale`**, because it does not come from the
+    /// design. `size` is what the display is and this is which part of it can
+    /// be seen; the two are measured with the same ruler.
+    safe_area: geometry.Padding = .none,
+
+    /// A surface this big, at scale one, with no safe area. What
+    /// `ui.begin(.init(w, h))` means, and why every program written before
+    /// any of this existed still compiles.
+    pub inline fn init(width: f32, height: f32) Surface {
+        return .{ .size = .init(width, height) };
+    }
 };
 
 const Color = @import("color.zig").Color;
@@ -364,6 +477,14 @@ pub const Border = struct {
     pub inline fn all(color: Color, width: u16) Border {
         return .{ .color = color, .width = .all(width) };
     }
+
+    /// The line's thickness multiplied by an interface scale. See
+    /// `Surface.scale`.
+    pub inline fn scaled(self: Border, by: f32) Border {
+        var out = self;
+        out.width = self.width.scaled(by);
+        return out;
+    }
 };
 
 /// How thick the line is on each side.
@@ -374,6 +495,16 @@ pub const BorderWidth = extern struct {
     bottom: u16 = 0,
 
     pub const none: BorderWidth = .{};
+
+    /// Every side multiplied by an interface scale. See `Surface.scale`.
+    pub inline fn scaled(self: BorderWidth, by: f32) BorderWidth {
+        return .{
+            .left = geometry.scaleWhole(self.left, by),
+            .right = geometry.scaleWhole(self.right, by),
+            .top = geometry.scaleWhole(self.top, by),
+            .bottom = geometry.scaleWhole(self.bottom, by),
+        };
+    }
 
     pub inline fn all(width: u16) BorderWidth {
         return .{ .left = width, .right = width, .top = width, .bottom = width };
@@ -634,6 +765,15 @@ pub const Floating = struct {
             .parent_y = .center,
         };
     };
+
+    /// The nudge off the anchor multiplied by an interface scale. The anchor
+    /// itself is a pair of alignments and means the same at any size. See
+    /// `Surface.scale`.
+    pub inline fn scaled(self: Floating, by: f32) Floating {
+        var out = self;
+        out.offset = .{ .x = self.offset.x * by, .y = self.offset.y * by };
+        return out;
+    }
 };
 
 /// The bar drawn down the edge of a scroll container.
@@ -671,6 +811,16 @@ pub const Scrollbar = struct {
     /// seconds, and a bar that stays is the safer of the two ways to be
     /// wrong.
     hide_after_seconds: ?f32 = null,
+
+    /// Its three lengths multiplied by an interface scale. The hold is a time
+    /// and stays as it is. See `Surface.scale`.
+    pub inline fn scaled(self: Scrollbar, by: f32) Scrollbar {
+        var out = self;
+        out.width = self.width * by;
+        out.corner_radius = self.corner_radius * by;
+        out.min_thumb_size = self.min_thumb_size * by;
+        return out;
+    }
 };
 
 /// What happens to content larger than the element holding it.
@@ -748,6 +898,17 @@ pub const Clip = struct {
         .scroll_x = true,
         .scroll_y = true,
     };
+
+    /// The bar's lengths multiplied by an interface scale.
+    ///
+    /// `offset` is not touched: it is where the container is scrolled to,
+    /// which is already in the pixels the last frame put it in. See
+    /// `Surface.scale`.
+    pub inline fn scaled(self: Clip, by: f32) Clip {
+        var out = self;
+        if (self.scrollbar) |configured| out.scrollbar = configured.scaled(by);
+        return out;
+    }
 
     /// Whether this element cuts anything off at all.
     pub inline fn clips(self: Clip) bool {

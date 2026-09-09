@@ -86,6 +86,44 @@ A grow pass cannot run before its parent has a size, and a parent that fits
 its children cannot have one before they do. That is the whole ordering
 argument.
 
+## The surface
+
+```zig
+ui.begin(.init(1280, 720));                    // the ordinary case
+ui.begin(.{
+    .size = .init(3840, 2160),
+    .scale = 2,                                // twice the size
+    .safe_area = .all(48),                     // and keep off the edges
+});
+```
+
+**`scale` multiplies every length in every declaration** - fixed sizes, minima
+and maxima, padding, gaps, corner radii, border widths, floating offsets,
+scrollbar thicknesses, font sizes, letter spacing and line heights - and
+leaves everything that means a fraction alone. A `percent` width is a share of
+a parent that has already been scaled; a `grow` weight is a share of what is
+spare; `contain` and `cover` are aspect ratios; a rotation pivot is a fraction
+of a box. Multiplying any of those would be a bug rather than a scale.
+
+A game at 3840 by 2160 wants an interface twice the size, not twice as much of
+it. Doing that here rather than in the game is the entire point: a game that
+multiplies its own numbers gets the ones it remembers and misses the font
+sizes, or the corner radii, or the one panel somebody else wrote. It is one
+multiplication at the top of `open` and one at the top of `text`, and nothing
+downstream of either knows there is a scale at all.
+
+**`safe_area` insets the root**, in the same pixels as `size` and *not*
+multiplied by the scale - a television's overscan and a phone's notch are
+facts about the display, and `size` is measured with the same ruler. Anything
+floating against the surface is placed inside it too, so a menu anchored to
+the right edge is anchored to the right edge of what can actually be seen.
+
+**It moves things; it does not cut them.** Nothing is clipped to the inset, so
+a backdrop told to cover the surface still reaches the corners of the screen -
+which is what a backdrop is for. The commands still come out in real pixels
+and so does the pointer: the safe area is an inset, not a second coordinate
+system.
+
 ## Ply, line by line
 
 The aim is that somebody who knows Ply can read this and type it without
@@ -1007,6 +1045,7 @@ than from memory.
 | --- | --- |
 | **Sizing** | `fit`, `grow` with weights, `fixed`, `percent`, `ratio`, with minima and maxima |
 | **Layout** | direction, padding, gaps, alignment on both axes, `contain` and `cover`, wrapping |
+| **The surface** | a scale that multiplies every length in the tree, and a safe area that keeps the root off the edges of a television |
 | **Painting** | background colours, corner radii, borders on any side with three positions, z-index |
 | **Images** | a texture number, a source rectangle for sheets, a tint, and the same rounded box a rectangle gets |
 | **Rotation** | of an element and its children or of its own box alone, with a pivot and flips, nesting, and a hit test that follows |

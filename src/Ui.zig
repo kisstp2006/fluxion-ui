@@ -639,6 +639,12 @@ walk: std.ArrayList(Frame),
 
 /// How big the surface is.
 surface: Dimensions = .zero,
+/// What every length in a declaration is multiplied by. See
+/// `layout.Surface.scale`.
+scale: f32 = 1,
+/// How far in from each edge of the surface the interface keeps. See
+/// `layout.Surface.safe_area`.
+safe_area: geometry.Padding = .none,
 
 /// The first error `open` or `close` ran into, kept until `end`.
 ///
@@ -720,8 +726,13 @@ pub fn deinit(self: *Ui) void {
 /// Everything from the previous frame is dropped, including the command list
 /// the last `end` handed back - so a renderer that means to keep commands
 /// past this point copies them.
-pub fn begin(self: *Ui, surface: Dimensions) void {
-    self.surface = surface;
+pub fn begin(self: *Ui, surface: layout.Surface) void {
+    self.surface = surface.size;
+    // A scale of zero would lay out an interface with nothing in it, and a
+    // negative one is not a thing at all. Both read as a field somebody
+    // forgot to fill in, so both are taken as one.
+    self.scale = if (surface.scale > 0) surface.scale else 1;
+    self.safe_area = surface.safe_area;
     self.deferred = null;
     self.requested_cursor = null;
 
@@ -889,8 +900,14 @@ pub fn open(self: *Ui, declaration: layout.Declaration) void {
     self.openChecked(declaration) catch |err| self.remember(err);
 }
 
-fn openChecked(self: *Ui, declaration: layout.Declaration) Error!void {
+fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
     if (self.open_stack.items.len >= max_depth) return error.TooDeep;
+
+    // Every length the caller wrote, multiplied once, here. Nothing past this
+    // line knows the interface has a scale at all - which is the point of
+    // doing it at the top of the layout rather than in every game. See
+    // `layout.Surface.scale`.
+    const declaration = raw.scaled(self.scale);
 
     const index: u32 = @intCast(self.elements.items.len);
     try self.elements.append(self.gpa, .{
@@ -1010,10 +1027,14 @@ fn addRun(
     self: *Ui,
     start: u32,
     len: u32,
-    style: text_mod.TextStyle,
+    wanted: text_mod.TextStyle,
     spans_start: u32,
     spans_len: u32,
 ) Error!void {
+    // Measured, wrapped, stored and drawn at the interface's scale, so this
+    // is the only line in the text half that has to know there is one.
+    const style = wanted.scaled(self.scale);
+
     const index: u32 = @intCast(self.elements.items.len);
     const content = self.strings.items[start..][0..len];
 
@@ -1096,7 +1117,8 @@ pub fn textInput(self: *Ui, declaration: layout.Declaration, config: text_input.
     self.textInputChecked(declaration, config) catch |err| self.remember(err);
 }
 
-fn textInputChecked(self: *Ui, declaration: layout.Declaration, config: text_input.Config) Error!void {
+fn textInputChecked(self: *Ui, declaration: layout.Declaration, asked: text_input.Config) Error!void {
+    const config = asked.scaled(self.scale);
     try self.openChecked(declaration);
     const index = self.innermost();
 
@@ -1271,8 +1293,10 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
 
     try self.checkRatios();
 
-    // The root is the surface, whatever it asked for.
-    self.elements.items[0].dimensions = self.surface;
+    // The root is the surface, whatever it asked for - less whatever the
+    // display cannot show.
+    const safe = self.safeBox();
+    self.elements.items[0].dimensions = .init(safe.width, safe.height);
 
     try self.sizeAlongAxis(true, 0);
     try self.sizeFloats(true);
@@ -1292,7 +1316,7 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
 
     self.painted = 0;
     self.bars.clearRetainingCapacity();
-    try self.positionAndEmit(0, .zero);
+    try self.positionAndEmit(0, .{ .x = safe.x, .y = safe.y });
     try self.placeFloats();
     try self.measureScroll();
     try self.recordHits();
@@ -2551,12 +2575,12 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
 /// later has not been, and falls back to its own fit size rather than to a
 /// number that is not there yet.
 fn sizeFloats(self: *Ui, x_axis: bool) Error!void {
+    const safe = self.safeBox();
     for (self.floats.items) |float| {
         const target = self.floatTarget(float);
         const room = if (target) |index|
             self.elements.items[index].dimensions.onAxis(x_axis)
-        else
-            self.surface.onAxis(x_axis);
+        else if (x_axis) safe.width else safe.height;
 
         const element = &self.elements.items[float.element];
         const wanted = element.config.sizing.onAxis(x_axis);
@@ -2572,6 +2596,26 @@ fn sizeFloats(self: *Ui, x_axis: bool) Error!void {
 
         try self.sizeAlongAxis(x_axis, float.element);
     }
+}
+
+/// The part of the surface an interface may use.
+///
+/// The whole thing, less the safe area. What the root is laid out in and what
+/// a float with nothing to hang off is measured and placed against - so an
+/// interface written for a rectangle keeps clear of a television's edges
+/// without a line of it knowing.
+///
+/// **Nothing is clipped to it.** An inset that also cut would stop a
+/// full-bleed backdrop reaching the corners of the screen, and a backdrop is
+/// exactly the thing that should not keep clear.
+fn safeBox(self: *Ui) BoundingBox {
+    const inset = self.safe_area;
+    return .init(
+        @floatFromInt(inset.left),
+        @floatFromInt(inset.top),
+        @max(0, self.surface.width - inset.onAxis(true)),
+        @max(0, self.surface.height - inset.onAxis(false)),
+    );
 }
 
 /// Which element a float hangs off, or null for the surface.
@@ -2607,7 +2651,7 @@ fn placeFloats(self: *Ui) Error!void {
         const against: BoundingBox = if (target) |index|
             self.elements.items[index].box
         else
-            .init(0, 0, self.surface.width, self.surface.height);
+            self.safeBox();
 
         const size = self.elements.items[float.element].dimensions;
         const at: Point = .{
@@ -9093,4 +9137,303 @@ test "asking for a shape beats the tree, and only for the frame that asked" {
     // way Ply's does - or nothing could ever put it back.
     try withHandles(&ui);
     try testing.expectEqual(layout.CursorShape.ibeam, ui.cursor());
+}
+
+// -------------------------------------------------------------------------
+// An interface that scales
+// -------------------------------------------------------------------------
+
+/// One card with everything a scale touches on it: a fixed width, padding, a
+/// gap, a corner radius, a border, a line of text and a fixed leaf.
+fn sizedCard(u: *Ui, surface: layout.Surface) ![]const commands.RenderCommand {
+    u.begin(surface);
+    openRoot(u);
+    {
+        u.open(.{
+            .id = "card",
+            .width = .fixed(100),
+            .height = .fit,
+            .padding = .all(8),
+            .gap = 4,
+            .corner_radius = .all(6),
+            .border = .all(paint, 2),
+            .direction = .top_to_bottom,
+            .background_color = paint,
+        });
+        defer u.close();
+        u.text("abc", sixteen);
+        leaf(u, "dot", .{ .width = .fixed(10), .height = .fixed(10) });
+    }
+    u.close();
+    return u.end();
+}
+
+test "a scale multiplies every length" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try sizedCard(&ui, .init(400, 300));
+
+    // A hundred wide; eight of padding twice over, sixteen of text, four of
+    // gap and ten of dot make forty-six tall.
+    const one = ui.boxOf("card").?;
+    try testing.expectEqual(@as(f32, 100), one.width);
+    try testing.expectEqual(@as(f32, 46), one.height);
+    try testing.expectEqual(@as(f32, 10), ui.boxOf("dot").?.width);
+
+    // Twice the size, not twice as much of it: every one of those numbers
+    // doubles, the text included. A game that multiplied its own would have
+    // to remember all six.
+    _ = try sizedCard(&ui, .{ .size = .init(400, 300), .scale = 2 });
+    const two = ui.boxOf("card").?;
+    try testing.expectEqual(@as(f32, 200), two.width);
+    try testing.expectEqual(@as(f32, 92), two.height);
+    try testing.expectEqual(@as(f32, 20), ui.boxOf("dot").?.width);
+}
+
+test "the corner radius and the border scale with the box" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try sizedCard(&ui, .init(400, 300));
+    try testing.expectEqual(@as(f32, 6), roundingOf(ui.output.items, ui.boxOf("card").?).?);
+
+    // A radius that stayed put would be a hairline on a card at twice the
+    // size, and a border that stayed put would be a scratch.
+    const scaled = try sizedCard(&ui, .{ .size = .init(400, 300), .scale = 2 });
+    try testing.expectEqual(@as(f32, 12), roundingOf(scaled, ui.boxOf("card").?).?);
+
+    const box = ui.boxOf("card").?;
+    var widest: f32 = 0;
+    for (scaled) |command| {
+        if (std.meta.activeTag(command.config) != .border) continue;
+        if (!std.meta.eql(command.bounding_box, box)) continue;
+        widest = @floatFromInt(command.config.border.width.left);
+    }
+    try testing.expectEqual(@as(f32, 4), widest);
+}
+
+/// How round the rectangle drawn at this box is, if one was.
+fn roundingOf(drawn: []const commands.RenderCommand, box: BoundingBox) ?f32 {
+    for (drawn) |command| {
+        if (std.meta.activeTag(command.config) != .rectangle) continue;
+        if (!std.meta.eql(command.bounding_box, box)) continue;
+        return command.config.rectangle.corner_radius.top_left;
+    }
+    return null;
+}
+
+test "a share is a share at any scale" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const half = struct {
+        fn run(u: *Ui, surface: layout.Surface) !void {
+            u.begin(surface);
+            openRoot(u);
+            leaf(u, "half", .{ .width = .percent(0.5), .height = .fixed(20) });
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try half(&ui, .init(400, 300));
+    try testing.expectEqual(@as(f32, 200), ui.boxOf("half").?.width);
+
+    // The surface is what it is, so half of it is what it was - and doubling
+    // the fraction would have made this three quarters of the window. Only
+    // the height, which is a length, moves.
+    try half(&ui, .{ .size = .init(400, 300), .scale = 2 });
+    try testing.expectEqual(@as(f32, 200), ui.boxOf("half").?.width);
+    try testing.expectEqual(@as(f32, 40), ui.boxOf("half").?.height);
+}
+
+test "a scrollbar is drawn at the interface's scale" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const listed = struct {
+        fn run(u: *Ui, surface: layout.Surface) ![]const commands.RenderCommand {
+            u.begin(surface);
+            openRoot(u);
+            {
+                u.open(.{
+                    .id = "list",
+                    .width = .fixed(100),
+                    .height = .fixed(100),
+                    .clip = layout.Clip.scrollY.bar(.{}),
+                    .background_color = paint,
+                });
+                defer u.close();
+                leaf(u, "rows", .{ .width = .fixed(100), .height = .fixed(300) });
+            }
+            u.close();
+            return u.end();
+        }
+    }.run;
+
+    // Six pixels of bar down the right of a hundred-pixel box, with a third
+    // of it filled by the thumb.
+    _ = try listed(&ui, .init(400, 300));
+    const plain = barIn(&ui, "list", true).?;
+    try testing.expectEqual(@as(f32, 94), plain.thumb.x);
+    try testing.expectEqual(@as(f32, 6), plain.thumb.width);
+    try testing.expectEqual(@as(f32, 200), plain.max_scroll);
+
+    // Twelve down the right of a two-hundred-pixel box: a bar that stayed six
+    // wide would be half as easy to grab on the screen it was scaled for.
+    _ = try listed(&ui, .{ .size = .init(400, 300), .scale = 2 });
+    const twice = barIn(&ui, "list", true).?;
+    try testing.expectEqual(@as(f32, 188), twice.thumb.x);
+    try testing.expectEqual(@as(f32, 12), twice.thumb.width);
+    try testing.expectEqual(@as(f32, 400), twice.max_scroll);
+    try testing.expectApproxEqAbs(plain.thumb.height * 2, twice.thumb.height, 0.001);
+}
+
+test "a scale of zero is a scale of one" {
+    // Both readings of a zero here are mistakes - a field left unfilled, or
+    // arithmetic that came out wrong - and neither meant "lay out nothing".
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try sizedCard(&ui, .{ .size = .init(400, 300), .scale = 0 });
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("card").?.width);
+
+    _ = try sizedCard(&ui, .{ .size = .init(400, 300), .scale = -2 });
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("card").?.width);
+}
+
+// -------------------------------------------------------------------------
+// Keeping clear of the edges
+// -------------------------------------------------------------------------
+
+/// A root that fills whatever it is given, with a leaf in its top left corner
+/// and a menu floating against the surface.
+fn edged(u: *Ui, surface: layout.Surface) !void {
+    u.begin(surface);
+    {
+        u.open(.{ .id = "root", .width = .grow, .height = .grow, .background_color = paint });
+        defer u.close();
+        leaf(u, "corner", .{ .width = .fixed(20), .height = .fixed(20) });
+        u.empty(.{
+            .id = "menu",
+            .width = .fixed(60),
+            .height = .fixed(40),
+            .background_color = paint,
+            .floating = .{ .attach = .root, .anchor = .{ .element_x = .right, .parent_x = .right } },
+        });
+    }
+    _ = try u.end();
+}
+
+test "a safe area insets the root, and everything comes with it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try edged(&ui, .{ .size = .init(400, 300), .safe_area = .all(48) });
+
+    const root = ui.boxOf("root").?;
+    try testing.expectEqual(@as(f32, 48), root.x);
+    try testing.expectEqual(@as(f32, 48), root.y);
+    try testing.expectEqual(@as(f32, 304), root.width);
+    try testing.expectEqual(@as(f32, 204), root.height);
+
+    try testing.expectEqual(@as(f32, 48), ui.boxOf("corner").?.x);
+    try testing.expectEqual(@as(f32, 48), ui.boxOf("corner").?.y);
+}
+
+test "the four sides are four numbers" {
+    // A notch is not the same size as a home indicator, and neither is the
+    // same as the side bezels.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try edged(&ui, .{
+        .size = .init(400, 300),
+        .safe_area = .{ .left = 10, .right = 20, .top = 30, .bottom = 40 },
+    });
+
+    const root = ui.boxOf("root").?;
+    try testing.expectEqual(@as(f32, 10), root.x);
+    try testing.expectEqual(@as(f32, 30), root.y);
+    try testing.expectEqual(@as(f32, 370), root.width);
+    try testing.expectEqual(@as(f32, 230), root.height);
+}
+
+test "something floating against the surface keeps clear of the edges too" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try edged(&ui, .init(400, 300));
+    try testing.expectEqual(@as(f32, 340), ui.boxOf("menu").?.x);
+
+    // Against the right edge of what can be seen rather than the right edge
+    // of the screen - a menu that hung off the surface would be half over the
+    // bezel, which is the whole thing this exists to stop.
+    try edged(&ui, .{ .size = .init(400, 300), .safe_area = .all(48) });
+    try testing.expectEqual(@as(f32, 292), ui.boxOf("menu").?.x);
+}
+
+test "the safe area moves things and does not cut them" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // A backdrop declared out of the flow and told to cover the surface: it
+    // is placed inside the safe area, and what runs past the edge of that is
+    // still drawn. Clipping to the inset would leave a television showing a
+    // band of nothing round a picture it could perfectly well display.
+    const behind = struct {
+        fn run(u: *Ui, surface: layout.Surface) ![]const commands.RenderCommand {
+            u.begin(surface);
+            {
+                u.open(.{ .id = "root", .width = .grow, .height = .grow });
+                defer u.close();
+                u.empty(.{
+                    .id = "wide",
+                    .width = .fixed(400),
+                    .height = .fixed(300),
+                    .background_color = paint,
+                });
+            }
+            return u.end();
+        }
+    }.run;
+
+    const drawn = try behind(&ui, .{ .size = .init(400, 300), .safe_area = .all(48) });
+    try testing.expect(drawnAt(drawn, .init(48, 48, 400, 300)));
+}
+
+test "the pointer is in the surface's own pixels" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const surface: layout.Surface = .{ .size = .init(400, 300), .safe_area = .all(48) };
+    try edged(&ui, surface);
+
+    // Inside the inset strip: the interface is not there, so nothing is
+    // hovered. The commands come out in real pixels and so does the pointer -
+    // the safe area is not a second coordinate system.
+    ui.setPointer(10, 10, false);
+    try edged(&ui, surface);
+    try testing.expect(!ui.isPointerOver("root"));
+
+    ui.setPointer(60, 60, false);
+    try edged(&ui, surface);
+    try testing.expect(ui.isPointerOver("corner"));
+}
+
+test "a scale and a safe area are arithmetic at the top, and compose" {
+    // The engine's own line, checked as written.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try sizedCard(&ui, .{ .size = .init(3840, 2160), .scale = 2, .safe_area = .all(48) });
+
+    // The card is twice the size, and it starts where the display can show
+    // it. The inset is *not* doubled: it is a fact about the screen rather
+    // than a number out of the design.
+    const box = ui.boxOf("card").?;
+    try testing.expectEqual(@as(f32, 200), box.width);
+    try testing.expectEqual(@as(f32, 48), box.x);
+    try testing.expectEqual(@as(f32, 48), box.y);
 }

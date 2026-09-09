@@ -7,6 +7,7 @@
 //! zig build example-window
 //! zig build example-window -- --backend d3d11
 //! zig build example-window -- --frames 120
+//! zig build example-window -- --scale 2 --safe 48
 //! ```
 //!
 //! Everything above this file has been checked without a graphics card - the
@@ -696,6 +697,11 @@ pub fn main(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(gpa);
     var frames: ?u32 = null;
     var backend: rhi.Backend = .gl;
+    // Not written into the interface anywhere: the whole point of these two
+    // is that the same declarations lay out at any size and keep clear of any
+    // edge. `--scale 2` is a 4K screen, `--safe 48` is a television.
+    var scale: f32 = 1;
+    var safe: u16 = 0;
     var i: usize = 1;
     while (i < arguments.len) : (i += 1) {
         if (std.mem.eql(u8, arguments[i], "--frames") and i + 1 < arguments.len) {
@@ -704,6 +710,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arguments[i], "--backend") and i + 1 < arguments.len) {
             i += 1;
             backend = if (std.mem.eql(u8, arguments[i], "d3d11")) .d3d11 else .gl;
+        } else if (std.mem.eql(u8, arguments[i], "--scale") and i + 1 < arguments.len) {
+            i += 1;
+            scale = std.fmt.parseFloat(f32, arguments[i]) catch 1;
+        } else if (std.mem.eql(u8, arguments[i], "--safe") and i + 1 < arguments.len) {
+            i += 1;
+            safe = std.fmt.parseInt(u16, arguments[i], 10) catch 0;
         }
     }
 
@@ -819,7 +831,7 @@ pub fn main(init: std.process.Init) !void {
         elapsed += 1.0 / 60.0;
         renderer.setTime(elapsed);
 
-        layout.begin(size);
+        layout.begin(.{ .size = size, .scale = scale, .safe_area = .all(safe) });
         shell(&layout, size);
         const commands = try layout.end();
 
@@ -915,7 +927,7 @@ test "the shaders compile and the frame reaches the pixels" {
     defer layout.deinit();
     layout.setMeasurer(measured.measurer());
 
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     {
         layout.open(.{ .width = .grow, .height = .grow, .padding = .all(24) });
         defer layout.close();
@@ -983,7 +995,7 @@ test "text reaches the pixels too" {
     defer layout.deinit();
     layout.setMeasurer(measured.measurer());
 
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     {
         layout.open(.{ .width = .grow, .height = .grow, .padding = .all(8) });
         defer layout.close();
@@ -1044,7 +1056,7 @@ test "the scrollbar reaches the pixels, and moves when the list does" {
     // test above is orange: white would survive a channel swap.
     const frame = struct {
         fn run(u: *Ui, at: ui.Dimensions) ![]const ui.RenderCommand {
-            u.begin(at);
+            u.begin(.{ .size = at });
             {
                 u.open(.{
                     .id = "list",
@@ -1147,7 +1159,7 @@ test "a picture reaches the pixels, and only the part that was asked for" {
     defer layout.deinit();
     layout.setMeasurer(measured.measurer());
 
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     {
         layout.open(.{ .width = .grow, .height = .grow, .padding = .all(16) });
         defer layout.close();
@@ -1222,7 +1234,7 @@ test "a tint multiplies into the picture" {
     defer layout.deinit();
     layout.setMeasurer(measured.measurer());
 
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     layout.empty(.{
         .width = .grow,
         .height = .grow,
@@ -1275,7 +1287,7 @@ test "a turned box reaches the pixels turned" {
     layout.setMeasurer(measured.measurer());
 
     // A wide flat bar across the middle, turned a quarter so it stands up.
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     {
         layout.open(.{ .width = .grow, .height = .grow, .align_y = .center });
         defer layout.close();
@@ -1341,13 +1353,13 @@ test "an interface can be drawn on top of a frame rather than instead of it" {
     layout.setMeasurer(measured.measurer());
 
     // Stand in for the game: orange over the whole target.
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     layout.empty(.{ .width = .grow, .height = .grow, .background_color = .hex(0xFF8000) });
     try renderer.draw(.{ .texture = target }, size, try layout.end(), .black);
 
     // Then the interface, which asks for nothing to be cleared: a small blue
     // box in the corner.
-    layout.begin(size);
+    layout.begin(.{ .size = size });
     {
         layout.open(.{ .width = .grow, .height = .grow });
         defer layout.close();
