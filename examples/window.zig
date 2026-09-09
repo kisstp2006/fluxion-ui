@@ -795,9 +795,10 @@ pub fn main(init: std.process.Init) !void {
         layout.setPointer(at.x, at.y, window.buttonDown());
 
         // And then the wheel, to whatever that turned out to be under. The
-        // layout clamps it at either end when the frame finishes. `scrollBy`
-        // would want a name, and this window has two lists in it - the one in
-        // the sidebar and the notes field's own.
+        // layout clamps it at either end when the frame finishes. This window
+        // has one list, so `scrollBy("list", ...)` would do as well - a
+        // window with two would have to work out which one first, which is
+        // the hit test that has just run.
         const wheel = window.takeWheel();
         if (wheel != 0) _ = layout.scrollHovered(0, wheel);
 
