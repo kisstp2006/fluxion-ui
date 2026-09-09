@@ -262,6 +262,18 @@ pub const Scroll = struct {
     viewport: Dimensions = .zero,
     scroll_x: bool = false,
     scroll_y: bool = false,
+    /// Whether dragging the content scrolls it. See `layout.Clip`.
+    no_drag_scroll: bool = false,
+
+    /// How fast the content is still moving, in pixels a second, after the
+    /// finger let go. Same sign as `position`.
+    ///
+    /// A list that stops dead when the finger leaves the glass feels stuck to
+    /// it; one that carries on and slows down feels like a thing. That is the
+    /// whole of what this is for, and it is why `Ui.tick` exists to be given
+    /// a `dt` at all.
+    momentum: geometry.Vec2 = .{ .x = 0, .y = 0 },
+
     /// Whether the element was declared in the frame just finished. One that
     /// was not is dropped, so a page that stops showing a list stops
     /// remembering where it was scrolled to.
@@ -371,6 +383,26 @@ const PendingClick = struct {
     select: bool,
     /// Whether this was the second click in a row, which selects a word.
     word: bool,
+};
+
+/// The content of a scroll container, with the pointer held down on it.
+///
+/// Ply's `ActiveDrag::ScrollContainer`. Not the same as dragging the bar: the
+/// bar moves the opposite way to the content and by a different amount, while
+/// this is the content stuck to the finger.
+const ContentDrag = struct {
+    element: u32,
+    /// Where the pointer was when it started, and where the content was.
+    /// Both fixed, so the content tracks the finger exactly rather than
+    /// accumulating a rounding error per frame.
+    origin: geometry.Vec2,
+    scrolled: geometry.Vec2,
+    /// How far it had moved as of the last frame, for working out how fast it
+    /// is going now.
+    previous: geometry.Vec2 = .{ .x = 0, .y = 0 },
+    /// Whether it has moved far enough to count as a scroll rather than a
+    /// tap. Once it has, whatever was pressed is let go of. See `setPointer`.
+    scrolling: bool = false,
 };
 
 /// A scrollbar thumb with the pointer held down on it.
@@ -539,6 +571,13 @@ field_boundaries: std.ArrayList(f32),
 bars: std.ArrayList(Bar),
 /// The thumb the pointer went down on, until it comes up again.
 drag: ?ThumbDrag = null,
+/// The content the pointer went down on, until it comes up again.
+content_drag: ?ContentDrag = null,
+/// Whether the pointer is a finger rather than a mouse. See `setTouch`.
+touch: bool = false,
+/// How long the last frame was, from `tick`. What momentum is measured
+/// against, and zero until somebody says otherwise.
+dt: f32 = 0,
 
 /// What each scroll container was scrolled to, kept between frames.
 ///
@@ -753,6 +792,7 @@ pub fn scrollBy(self: *Ui, name: []const u8, dx: f32, dy: f32) void {
     scroll.position.x += dx;
     scroll.position.y += dy;
     scroll.position = scroll.clamped();
+    scroll.momentum = .{ .x = 0, .y = 0 };
     scroll.active = true;
 }
 
@@ -763,6 +803,7 @@ pub fn scrollTo(self: *Ui, name: []const u8, x: f32, y: f32) void {
     const scroll = self.scrolls.getPtr(key) orelse return;
     scroll.position = .{ .x = x, .y = y };
     scroll.position = scroll.clamped();
+    scroll.momentum = .{ .x = 0, .y = 0 };
     scroll.active = true;
 }
 
@@ -2731,6 +2772,7 @@ fn measureScroll(self: *Ui) Error!void {
         );
         entry.value_ptr.scroll_x = element.clip.scroll_x;
         entry.value_ptr.scroll_y = element.clip.scroll_y;
+        entry.value_ptr.no_drag_scroll = element.clip.no_drag_scroll;
         entry.value_ptr.live = true;
         // A container that has shrunk, or whose content has, may be scrolled
         // past its end. Clamping here rather than when it is nudged is what
@@ -2876,9 +2918,74 @@ fn recordHits(self: *Ui) Error!void {
 /// wrong one.
 pub fn tick(self: *Ui, dt: f32) void {
     self.now += dt;
+    self.dt = dt;
+
     var typed = self.edits.valueIterator();
     while (typed.next()) |edit| edit.blink += dt;
+
+    self.coast(dt);
 }
+
+/// Say whether the pointer is a finger.
+///
+/// One bit, and it decides one thing: `layout.Clip.no_drag_scroll` turns
+/// dragging off for a mouse and leaves it on for a touch, because on a touch
+/// screen there is nothing else to scroll with. A program that never says is
+/// taken to be using a mouse, which is the safer of the two to assume.
+pub fn setTouch(self: *Ui, is_touch: bool) void {
+    self.touch = is_touch;
+}
+
+/// Carry the scroll containers on after the finger has let go.
+///
+/// Exponential decay, which is what makes it frame-rate independent: half a
+/// second of coasting looks the same whether it took thirty frames or three
+/// hundred. Ply's constants, and Ply's rule that a container being dragged
+/// does not also coast - the finger is already saying where it goes.
+///
+/// A program that never calls `tick` gets no momentum at all, which is the
+/// honest answer for a library with no clock of its own.
+fn coast(self: *Ui, dt: f32) void {
+    if (dt <= 0) return;
+    const decay = @exp(-scroll_deceleration * dt);
+
+    var seen = self.scrolls.iterator();
+    while (seen.next()) |entry| {
+        const scroll = entry.value_ptr;
+
+        if (self.content_drag) |drag| {
+            if (drag.element == entry.key_ptr.*) continue;
+        }
+        if (@abs(scroll.momentum.x) <= scroll_stops_below and
+            @abs(scroll.momentum.y) <= scroll_stops_below) continue;
+
+        scroll.position.x += scroll.momentum.x * dt;
+        scroll.position.y += scroll.momentum.y * dt;
+        scroll.momentum.x *= decay;
+        scroll.momentum.y *= decay;
+        if (@abs(scroll.momentum.x) < scroll_stops_below) scroll.momentum.x = 0;
+        if (@abs(scroll.momentum.y) < scroll_stops_below) scroll.momentum.y = 0;
+
+        // Hitting either end takes the speed with it, or a list would go on
+        // pressing against its own bottom for a second after it got there.
+        const limit = scroll.limit();
+        if (scroll.position.x <= 0 or scroll.position.x >= limit.x) scroll.momentum.x = 0;
+        if (scroll.position.y <= 0 or scroll.position.y >= limit.y) scroll.momentum.y = 0;
+
+        scroll.position = scroll.clamped();
+        scroll.active = true;
+    }
+}
+
+/// Ply's three numbers. The decay reaches under a hundredth in a second, the
+/// floor is where a list is close enough to stopped to be stopped, and the
+/// smoothing is how much of this frame's speed to believe over the last.
+const scroll_deceleration: f32 = 5;
+const scroll_stops_below: f32 = 5;
+const scroll_smoothing: f32 = 0.4;
+/// How far a drag has to go before it stops being a tap. Ply has no such
+/// rule; see `setPointer`.
+const scroll_becomes_drag: f32 = 6;
 
 /// Say whether shift is held.
 ///
@@ -2922,9 +3029,13 @@ pub fn setPointer(self: *Ui, x: f32, y: f32, down: bool) void {
         self.held.appendSlice(self.gpa, self.over.items) catch {};
         self.takeFocus();
         self.pressField();
+        self.grabContent();
     } else if (self.pointer.isUp()) {
         self.drag = null;
         self.selecting = null;
+        // The drag ends but the speed does not: what it was going at when the
+        // finger left is what carries it on. See `coast`.
+        self.content_drag = null;
         // The chain is kept for the frame the button comes up in, so
         // `justReleased` has something to answer about, and dropped after.
         if (self.pointer.state == .idle) self.held.clearRetainingCapacity();
@@ -2933,6 +3044,10 @@ pub fn setPointer(self: *Ui, x: f32, y: f32, down: bool) void {
     // Not on the frame the button went down: the pointer has not moved yet,
     // and Ply waits the same frame for the same reason.
     if (self.drag) |grabbed| self.dragThumb(grabbed);
+
+    if (self.content_drag) |*drag| {
+        if (self.pointer.isDown() and !self.pointer.justPressed()) self.dragContent(drag);
+    }
 
     // A drag inside a text input keeps asking for the cursor to be put where
     // the pointer is, with the selection dragged along behind it.
@@ -2946,6 +3061,95 @@ pub fn setPointer(self: *Ui, x: f32, y: f32, down: bool) void {
             };
         }
     }
+}
+
+/// Take hold of the innermost scroll container under the pointer, if one
+/// wants to be dragged.
+///
+/// Innermost first, so a list inside a page scrolls rather than the page -
+/// and only a container that actually overflows, or a press anywhere on a
+/// short list would arm a drag that can never move.
+///
+/// The press is **not** consumed, which is Ply's behaviour: what is under the
+/// pointer is still pressed, and stays pressed until the drag turns out to be
+/// a scroll. See `dragContent`.
+fn grabContent(self: *Ui) void {
+    if (self.selecting != null or self.drag != null) return;
+
+    var i = self.over.items.len;
+    while (i > 0) {
+        i -= 1;
+        const id = self.over.items[i];
+        const scroll = self.scrolls.getPtr(id) orelse continue;
+        if (scroll.no_drag_scroll and !self.touch) continue;
+        if (!scroll.overflowsX() and !scroll.overflowsY()) continue;
+
+        self.content_drag = .{
+            .element = id,
+            .origin = self.pointer.position,
+            .scrolled = scroll.position,
+        };
+        return;
+    }
+}
+
+/// Move the content by as far as the finger has gone, and remember how fast.
+///
+/// Against where the drag started rather than against the last frame, so the
+/// content stays under the finger however many frames it lasts. The speed is
+/// the one thing measured per frame, because speed is what a per-frame
+/// difference *is*.
+fn dragContent(self: *Ui, drag: *ContentDrag) void {
+    const scroll = self.scrolls.getPtr(drag.element) orelse return;
+
+    // The content follows the finger, so scrolling *down* through a list is
+    // dragging *up* the page - which is why this is a subtraction and the
+    // scrollbar's is not.
+    const moved: geometry.Vec2 = .{
+        .x = self.pointer.position.x - drag.origin.x,
+        .y = self.pointer.position.y - drag.origin.y,
+    };
+    scroll.position = .{
+        .x = if (scroll.scroll_x) drag.scrolled.x - moved.x else scroll.position.x,
+        .y = if (scroll.scroll_y) drag.scrolled.y - moved.y else scroll.position.y,
+    };
+    scroll.position = scroll.clamped();
+    scroll.active = true;
+
+    // Once it has gone far enough to be a scroll rather than a tap, whatever
+    // was pressed is let go of.
+    //
+    // **Ply does not do this**, and a list of buttons is where it shows: drag
+    // to scroll, let go, and the button under the finger fires. Every touch
+    // platform cancels the tap instead, and the absence of it reads as a bug
+    // rather than as a decision.
+    if (!drag.scrolling and (@abs(moved.x) > scroll_becomes_drag or
+        @abs(moved.y) > scroll_becomes_drag))
+    {
+        drag.scrolling = true;
+        self.held.clearRetainingCapacity();
+    }
+
+    // Ply's filter: how fast it is going is mostly what it was going, plus a
+    // little of this frame - so one stuttering frame does not throw the
+    // whole thing across the screen.
+    const step: geometry.Vec2 = .{
+        .x = moved.x - drag.previous.x,
+        .y = moved.y - drag.previous.y,
+    };
+    drag.previous = moved;
+    if (self.dt <= 0) return;
+    if (@abs(step.x) <= 0.5 and @abs(step.y) <= 0.5) return;
+
+    scroll.momentum = .{
+        .x = scroll.momentum.x * (1 - scroll_smoothing) - (step.x / self.dt) * scroll_smoothing,
+        .y = scroll.momentum.y * (1 - scroll_smoothing) - (step.y / self.dt) * scroll_smoothing,
+    };
+}
+
+/// Whether the pointer is dragging a scroll container's content.
+pub fn draggingContent(self: *Ui) bool {
+    return self.content_drag != null;
 }
 
 /// Write down a press that landed on a text input, for `emitField` to answer.
@@ -7919,4 +8123,302 @@ test "a callback may change what the next frame draws" {
     ui.setPointer(50, 20, true);
     try frame(&ui, &counter);
     try testing.expectEqual(@as(u32, 2), counter.count);
+}
+
+// -------------------------------------------------------------------------
+// Dragging the content
+// -------------------------------------------------------------------------
+
+// A hundred pixel window onto three hundred of list, so there are two
+// hundred pixels to scroll through. Every drag below is measured against
+// that, and every one runs two frames before it can start: what is under the
+// pointer is known only once a frame has been laid out.
+
+/// A scrolling list, with `clip` saying how it may be scrolled.
+fn scroller(u: *Ui, clip: layout.Clip) !void {
+    u.begin(.init(400, 300));
+    openRoot(u);
+    {
+        u.open(.{
+            .id = "list",
+            .width = .fixed(100),
+            .height = .fixed(100),
+            .clip = clip,
+            .background_color = paint,
+        });
+        defer u.close();
+        leaf(u, "content", .{ .width = .fixed(100), .height = .fixed(300) });
+    }
+    u.close();
+    _ = try u.end();
+}
+
+test "dragging the content moves it under the finger" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try scroller(&ui, .scrollY);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.position.y);
+
+    ui.setPointer(50, 80, true);
+    try scroller(&ui, .scrollY);
+    try testing.expect(ui.draggingContent());
+
+    // Dragged thirty pixels *up* the screen, so the list scrolls thirty
+    // pixels *down* - the content is stuck to the finger, which is the whole
+    // difference between this and dragging the bar.
+    ui.setPointer(50, 50, true);
+    try testing.expectEqual(@as(f32, 30), ui.scrollOf("list").?.position.y);
+
+    // Back past where it started: it stops at the top rather than going past.
+    ui.setPointer(50, 200, true);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.position.y);
+
+    ui.setPointer(50, 200, false);
+    try testing.expect(!ui.draggingContent());
+}
+
+test "a drag is measured from where it started, not from the last frame" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try scroller(&ui, .scrollY);
+    ui.setPointer(50, 90, true);
+    try scroller(&ui, .scrollY);
+
+    // Wander down and back. Anything accumulating per-frame deltas would
+    // drift; this ends where the arithmetic says, which is where it began.
+    for ([_]f32{ 60, 40, 70, 30, 90 }) |y| ui.setPointer(50, y, true);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.position.y);
+
+    ui.setPointer(50, 50, true);
+    try testing.expectEqual(@as(f32, 40), ui.scrollOf("list").?.position.y);
+}
+
+test "a list that does not overflow is not worth dragging" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const short = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{
+                    .id = "list",
+                    .width = .fixed(100),
+                    .height = .fixed(100),
+                    .clip = .scrollY,
+                    .background_color = paint,
+                });
+                defer u.close();
+                leaf(u, "content", .{ .width = .fixed(100), .height = .fixed(40) });
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try short(&ui);
+    ui.setPointer(50, 50, true);
+    try short(&ui);
+
+    // Nothing to move, so no drag is armed at all - otherwise every press on
+    // a short list would arm one that can never do anything.
+    try testing.expect(!ui.draggingContent());
+}
+
+test "no_drag_scroll stops a mouse and lets a finger through" {
+    // Ply's meaning exactly: the flag is about the mouse, because on a touch
+    // screen dragging is the only way there is.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const clip: layout.Clip = .{ .vertical = true, .scroll_y = true, .no_drag_scroll = true };
+
+    try scroller(&ui, clip);
+    ui.setPointer(50, 80, true);
+    try scroller(&ui, clip);
+    try testing.expect(!ui.draggingContent());
+    ui.setPointer(50, 80, false);
+
+    ui.setTouch(true);
+    try scroller(&ui, clip);
+    ui.setPointer(50, 80, true);
+    try scroller(&ui, clip);
+    try testing.expect(ui.draggingContent());
+}
+
+test "the innermost list under the pointer is the one that moves" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const nested = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{
+                    .id = "page",
+                    .width = .fixed(200),
+                    .height = .fixed(200),
+                    .clip = .scrollY,
+                    .background_color = paint,
+                });
+                defer u.close();
+                {
+                    u.open(.{
+                        .id = "inner",
+                        .width = .fixed(100),
+                        .height = .fixed(100),
+                        .clip = .scrollY,
+                        .background_color = paint,
+                    });
+                    defer u.close();
+                    leaf(u, "rows", .{ .width = .fixed(100), .height = .fixed(300) });
+                }
+                leaf(u, "below", .{ .width = .fixed(100), .height = .fixed(300) });
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try nested(&ui);
+    ui.setPointer(50, 50, true);
+    try nested(&ui);
+    ui.setPointer(50, 20, true);
+
+    try testing.expectEqual(@as(f32, 30), ui.scrollOf("inner").?.position.y);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("page").?.position.y);
+}
+
+test "letting go leaves it coasting, and it slows to a stop" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try scroller(&ui, .scrollY);
+    ui.tick(1.0 / 60.0);
+    ui.setPointer(50, 90, true);
+    try scroller(&ui, .scrollY);
+
+    // Flicked upwards over three frames, sixty pixels a frame at sixty
+    // frames a second, so it is going fast when the finger leaves.
+    for ([_]f32{ 70, 50, 30 }) |y| {
+        ui.tick(1.0 / 60.0);
+        ui.setPointer(50, y, true);
+    }
+    const at_release = ui.scrollOf("list").?.position.y;
+    try testing.expect(ui.scrollOf("list").?.momentum.y > 100);
+
+    ui.setPointer(50, 30, false);
+
+    // It carries on without the finger.
+    ui.tick(1.0 / 60.0);
+    const coasted = ui.scrollOf("list").?.position.y;
+    try testing.expect(coasted > at_release);
+
+    // And slows to a stop rather than running for ever.
+    for (0..120) |_| ui.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.momentum.y);
+}
+
+test "a coast is stopped by a wheel, and by being told where to go" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try scroller(&ui, .scrollY);
+    ui.scrolls.getPtr(identify("list", 0)).?.momentum.y = 500;
+
+    ui.scrollBy("list", 0, 10);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.momentum.y);
+
+    ui.scrolls.getPtr(identify("list", 0)).?.momentum.y = 500;
+    ui.scrollTo("list", 0, 50);
+    try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.momentum.y);
+}
+
+test "a container being dragged does not also coast" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    try scroller(&ui, .scrollY);
+    ui.setPointer(50, 90, true);
+    try scroller(&ui, .scrollY);
+
+    ui.tick(1.0 / 60.0);
+    ui.setPointer(50, 60, true);
+    const held_at = ui.scrollOf("list").?.position.y;
+    try testing.expect(ui.scrollOf("list").?.momentum.y > 0);
+
+    // The finger is still saying where it goes, so the speed it has built up
+    // must not move it as well - or it would run away under the finger.
+    ui.tick(1.0 / 60.0);
+    try testing.expectEqual(held_at, ui.scrollOf("list").?.position.y);
+}
+
+test "a drag that turns into a scroll lets go of what it pressed" {
+    // The one place this parts company with Ply. A list of buttons, dragged
+    // and released, fires the button under the finger in Ply; every touch
+    // platform cancels the tap instead, and the absence of it reads as a bug.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const buttons = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{
+                    .id = "list",
+                    .width = .fixed(100),
+                    .height = .fixed(100),
+                    .clip = .scrollY,
+                    .direction = .top_to_bottom,
+                    .background_color = paint,
+                });
+                defer u.close();
+                for (0..10) |i| {
+                    var name: [8]u8 = undefined;
+                    const id = std.fmt.bufPrint(&name, "b{d}", .{i}) catch "b";
+                    leaf(u, id, .{ .width = .fixed(100), .height = .fixed(30) });
+                }
+            }
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try buttons(&ui);
+    ui.setPointer(50, 10, true);
+    try buttons(&ui);
+    // Pressed, because a press that has not moved is still a tap.
+    try testing.expect(ui.isElementPressed("b0"));
+
+    // Two pixels is a twitch, not a scroll.
+    ui.setPointer(50, 8, true);
+    try testing.expect(ui.isElementPressed("b0"));
+
+    // Twenty is a scroll, and the tap is off.
+    ui.setPointer(50, 30 - 20, true);
+    ui.setPointer(50, -10, true);
+    try testing.expect(!ui.isElementPressed("b0"));
+
+    ui.setPointer(50, -10, false);
+    try buttons(&ui);
+    try testing.expect(!ui.isElementReleased("b0"));
+}
+
+test "dragging a scrollbar is not dragging the content" {
+    // Both are a press inside the same box, and only one of them may win.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const clip = layout.Clip.scrollY.bar(.{});
+    try scroller(&ui, clip);
+
+    // On the thumb, which hugs the right edge at x 94 to 100.
+    ui.setPointer(97, 10, true);
+    try testing.expect(ui.draggingScrollbar());
+    try testing.expect(!ui.draggingContent());
 }

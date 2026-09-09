@@ -354,6 +354,41 @@ boxes by the time the commands come out.
 Wiring a wheel to `scrollBy` is the program's business, and
 `examples/window.zig` is four lines of it.
 
+### Dragging it
+
+```zig
+ui.tick(dt);                     // momentum needs to know how long a frame is
+ui.setTouch(from_a_finger);      // only `no_drag_scroll` reads this
+ui.setPointer(x, y, down);
+```
+
+Pressing inside a scroll container and moving takes the content with you, and
+letting go leaves it coasting - Ply's arithmetic, and Ply's three numbers: an
+exponential decay that reaches under a hundredth in a second, a floor of five
+pixels a second below which it is simply stopped, and a filter that believes
+four parts of the last frame's speed to one of this one's, so a single
+stuttering frame does not throw the list across the screen. Hitting either end
+takes the speed with it.
+
+**The innermost container under the pointer is the one that moves**, and only
+one that actually overflows takes hold at all - otherwise every press on a
+short list would arm a drag that can never do anything.
+
+**`no_drag_scroll` is about the mouse.** Ply's flag turns dragging off for a
+pointer and leaves it on for a finger, because on a touch screen there is
+nothing else; `setTouch` is what tells the two apart, and a program that never
+says is taken to be using a mouse.
+
+Momentum needs a `dt`, so a program that never calls `tick` gets a drag that
+follows the finger and stops dead when it leaves. That is the honest answer
+for a library with no clock of its own.
+
+**One deliberate difference.** Once a drag has moved more than a few pixels it
+lets go of whatever it pressed, so a list of buttons dragged and released does
+not fire the button under the finger. Ply keeps the press; every touch
+platform cancels the tap, and the absence of it reads as a bug rather than as
+a decision.
+
 ### Scrollbars
 
 ```zig
@@ -875,7 +910,7 @@ than from memory.
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
 | **Animated text** | all nine of Ply's: `wave`, `pulse`, `swing`, `jitter`, `transform`, `gradient`, `type`, `fade` and `scale` |
-| **Clipping and scrolling** | per axis, with the position remembered between frames and clamped when the content shrinks |
+| **Clipping and scrolling** | per axis, by wheel, by dragging the content, and by the bar, with momentum and with the position remembered between frames |
 | **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
 | **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, and clip-aware picking |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus` and `on_unfocus`, called when the frame is over |
@@ -893,8 +928,7 @@ the order it is worth doing in.
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
 | **TinyVG** | Ply can hand a vector image straight to `.image(...)` and rasterise it. Here a picture is a texture, and turning TinyVG into one is somebody else's pass. |
 | **Shaders and effects** | `.effect(...)` and `.shader(...)`: a fragment shader per element, with Ply's own build step behind it. This renderer is one pipeline and one draw call by design, and a shader per element is a pipeline per element - so this is not a missing feature so much as a different renderer. A program that wants it can consume the command list itself. |
-| **Drag scrolling** | Dragging the content itself, with momentum, a decay curve and a smoothing filter. This scrolls by wheel, by `scrollBy`, and by the scrollbar. Ply's `no_drag_scroll` exists to turn the thing off that is not here. |
-| **Smooth scrolling** | Ply animates towards a target position over a duration. Here a scroll position is a number, and it changes when something changes it. |
+| **Smooth scrolling** | Ply also animates *towards* a target over a duration, so a wheel notch glides rather than jumps. A flick coasts here; a notch still arrives at once. |
 | **`between_children` borders** | A line drawn between one child and the next, without an element per separator. |
 | **Easing and lerp** | Ply's `easing.rs` and `lerp.rs`: a curve library and a "move this towards that" helper, for animating anything. |
 | **The mouse cursor** | `set_cursor` / `get_cursor`, so hovering a text input gives an I-beam. A layout library can say *which* cursor; putting it on the screen is the window layer's. |

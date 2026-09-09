@@ -641,6 +641,16 @@ pub const Clip = struct {
     horizontal: bool = false,
     /// Cut off anything past the top and bottom.
     vertical: bool = false,
+    /// Whether dragging the content itself scrolls it, for a pointer that is
+    /// not a finger. Ply's `no_drag_scroll`, and the same meaning: a touch
+    /// drag still scrolls, because on a touch screen there is nothing else.
+    ///
+    /// A list of buttons is the case for turning it off. Dragging one on a
+    /// desktop is more likely to be a stray movement than a scroll, and the
+    /// wheel and the scrollbar are both still there.
+    ///
+    /// See `Ui.setTouch` for what tells the two pointers apart.
+    no_drag_scroll: bool = false,
     /// Whether the content may be moved sideways. Implies `horizontal`.
     scroll_x: bool = false,
     /// Whether it may be moved up and down. Implies `vertical`.
