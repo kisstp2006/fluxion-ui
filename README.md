@@ -789,7 +789,9 @@ top left onto the target's bottom left; `above`, `after`, `before` and
 **What it attaches to** is `.parent` (the element it was declared inside),
 `.root` (the whole surface, for a modal), or `.id` with a name. A name is
 resolved once the whole tree is laid out, so it may point at something declared
-*later* - Ply resolves as the element is declared and cannot.
+*later* - Ply resolves as the element is declared and cannot. The name itself
+is read as the float is declared, though, so it may be formatted into a buffer
+that the next one reuses.
 
 **It grows into its target.** A floating element has no parent to grow into, so
 `.grow` fills whatever it is anchored to and `.percent(0.5)` is half of it -

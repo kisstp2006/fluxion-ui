@@ -379,6 +379,17 @@ const Float = struct {
     element: u32,
     /// The element it was declared inside, which is who `.parent` means.
     declared_in: u32,
+    /// The number of the element `layout.Floating.to` names, hashed as the
+    /// float was declared, or null when it names nothing.
+    ///
+    /// Hashed then, and not looked up by name when the frame ends, because
+    /// the name is borrowed. A loop formats `row-3` into a buffer, declares a
+    /// tooltip that hangs off it, and formats `row-4` into the same buffer for
+    /// the next one - so by the time a lookup at the end of the frame ran,
+    /// every tooltip in the loop named the last row and hung off that. The
+    /// trap `text` and the placeholder fell into first, in the one field that
+    /// was still reading its string late.
+    target: ?u32 = null,
 };
 
 /// A press on a text input, waiting for the layout to say where it landed.
@@ -945,8 +956,14 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
         });
     }
 
-    if (declaration.floating) |_| {
-        try self.floats.append(self.gpa, .{ .element = index, .declared_in = self.innermost() });
+    if (declaration.floating) |float| {
+        try self.floats.append(self.gpa, .{
+            .element = index,
+            .declared_in = self.innermost(),
+            // Now, while the name is still the caller's to lend. See
+            // `Float.target`.
+            .target = if (float.to) |name| identify(name, 0) else null,
+        });
     } else if (self.open_stack.items.len > 0) {
         try self.pending.append(self.gpa, index);
     }
@@ -2667,8 +2684,7 @@ fn floatTarget(self: *Ui, float: Float) ?u32 {
         .parent => if (float.element == 0) null else float.declared_in,
         .root => null,
         .id => blk: {
-            const name = config.to orelse break :blk null;
-            const wanted = identify(name, 0);
+            const wanted = float.target orelse break :blk null;
             for (self.elements.items, 0..) |element, i| {
                 if (element.id == wanted) break :blk @intCast(i);
             }
@@ -7230,6 +7246,33 @@ test "attaching by name finds an element declared later" {
 
     // "later" sits after the spacer, and the tip hangs off its bottom left.
     try testing.expectEqual(BoundingBox.init(70, 25, 30, 10), ui.boxOf("tip").?);
+}
+
+test "the name a float hangs off is read as it is declared, so it may come from a buffer" {
+    // The trap `text` and the placeholder fell into first. A loop names each
+    // tooltip's row into one buffer, and while that name was looked up at the
+    // end of the frame, every tooltip hung off the last row.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    ui.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+    leaf(&ui, "row-0", .{ .width = .fixed(100), .height = .fixed(50) });
+    leaf(&ui, "row-1", .{ .width = .fixed(100), .height = .fixed(50) });
+
+    var name: [16]u8 = undefined;
+    for ([_][]const u8{ "tip-0", "tip-1" }, 0..) |tip, i| {
+        leaf(&ui, tip, .{
+            .width = .fixed(10),
+            .height = .fixed(10),
+            .floating = .{ .attach = .id, .to = try std.fmt.bufPrint(&name, "row-{d}", .{i}), .anchor = .below },
+        });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(@as(f32, 50), ui.boxOf("tip-0").?.y);
+    try testing.expectEqual(@as(f32, 100), ui.boxOf("tip-1").?.y);
 }
 
 test "a floating element is drawn over the page, whatever order it was declared in" {

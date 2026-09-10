@@ -715,6 +715,9 @@ pub const Floating = struct {
     /// Which element, when `attach` is `.id`. Looked up once the whole tree
     /// is laid out, so it may name something declared later - which Ply's
     /// cannot, because it resolves as the element is declared.
+    ///
+    /// The name itself is read as this element is declared, like `id`, so it
+    /// may be formatted into a buffer that the next float reuses.
     to: ?[]const u8 = null,
     /// Which point of this element goes on which point of the target.
     anchor: Anchor = .{},
