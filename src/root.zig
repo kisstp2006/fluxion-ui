@@ -67,12 +67,14 @@ pub const Callback = layout.Callback;
 pub const Clip = layout.Clip;
 pub const Scrollbar = layout.Scrollbar;
 pub const CursorShape = layout.CursorShape;
+pub const Focus = layout.Focus;
 
 pub const AlignX = geometry.AlignX;
 pub const AlignY = geometry.AlignY;
 
 pub const Pointer = input.Pointer;
 pub const PointerState = input.PointerState;
+pub const Navigation = input.Navigation;
 
 pub const TextStyle = text.TextStyle;
 pub const Measurer = text.Measurer;

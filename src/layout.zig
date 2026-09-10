@@ -353,6 +353,13 @@ pub const Declaration = struct {
     /// caret out of the field beside it.
     preserve_focus: bool = false,
 
+    /// Let this element take the focus from the keyboard or a pad, and say
+    /// how. `.focus = .{}` is enough to be in the Tab order. See `Focus`.
+    ///
+    /// A text input takes the focus without being told to; its declaration
+    /// only needs this to change where it comes in the order.
+    focus: ?Focus = null,
+
     /// Drawn above lower numbers, below higher ones. Elements at the same
     /// z-index are drawn in the order they were declared.
     z_index: i16 = 0,
@@ -565,6 +572,35 @@ pub const CursorShape = enum {
     resize_all,
     /// The circle-and-bar: not somewhere this can be dropped.
     not_allowed,
+};
+
+/// How an element takes the focus from the keyboard or a pad. Ply's
+/// `.accessibility(|a| a.focusable())` and the numbers that go with it.
+///
+/// ```zig
+/// ui.open(.{ .id = "play", .focus = .{} });                     // in the Tab order
+/// ui.open(.{ .id = "quit", .focus = .{ .tab_index = 3 } });     // and where
+/// ```
+///
+/// **Asked for, not worked out.** Nothing here decides that an element with
+/// a callback is a button: an immediate-mode button is usually an element
+/// whose branch asks `justReleased()`, and there is nothing on it to see. So
+/// an element that wants the keyboard says so, the same way a text input is
+/// the one thing that says so without being told.
+///
+/// Ply keeps these on its accessibility config, which is out of scope here -
+/// but none of this needs a screen reader, and in a game it is how a pad
+/// walks a menu.
+pub const Focus = struct {
+    /// Where it comes when Tab walks the interface: lower first, and every
+    /// element that has one before every element that does not, which come
+    /// in the order they were declared. Ties keep that order too. Ply's
+    /// `tab_index`, and the browsers' rule.
+    ///
+    /// Rarely wanted. Declaration order is reading order, and an interface
+    /// whose Tab order has to be spelt out is usually declared in the wrong
+    /// order.
+    tab_index: ?i16 = null,
 };
 
 /// Something to call when an element is pointed at or focused. Ply's

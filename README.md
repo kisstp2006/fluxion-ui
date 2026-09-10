@@ -180,6 +180,10 @@ the differences are the ones Zig forces, and there are three of them.
 | `.on_changed(\|t\| ...)` | `if (ui.textChanged("name")) ...` |
 | `.on_submit(\|t\| ...)` | `if (ui.textSubmitted("name")) ...` |
 | `.preserve_focus()` | `.preserve_focus = true` |
+| `.accessibility(\|a\| a.focusable())` | `.focus = .{}` |
+| `.accessibility(\|a\| a.focusable().tab_index(2))` | `.focus = .{ .tab_index = 2 }` |
+| Tab and Shift+Tab, read from macroquad | `ui.navigate(.next)`, `ui.navigate(.previous)` |
+| Enter and Space on the focus, read from macroquad | `ui.setActivate(down)` |
 | `.contain(16.0/9.0)` | `.contain = 16.0 / 9.0` |
 | `.cover(16.0/9.0)` | `.cover = 16.0 / 9.0` |
 | `.id("save")` | `.id = "save"` |
@@ -902,6 +906,51 @@ decision lives - a widget whose *owner* wires up the behaviour rather than
 whatever draws it - and for the focus pair, which polling cannot answer at
 all: nothing else can tell you the frame an element *lost* the keyboard.
 
+## The focus, from a keyboard or a pad
+
+```zig
+ui.open(.{ .id = "play", .focus = .{} });     // this one takes the focus
+defer ui.close();
+if (ui.justReleased()) play();               // a click, Enter, or a pad's A
+```
+
+```zig
+if (tab) _ = ui.navigate(if (shift) .previous else .next);
+ui.setActivate(enter or space or pad_a);     // once a frame, like setPointer
+```
+
+A game's interface has to work with nothing but a pad, and an
+application's with nothing but a keyboard. The library still never sees a
+key: what arrives is what the key *meant*, which is the bargain the [text
+input](#the-keyboard-is-the-programs) already makes.
+
+**An element takes the focus when it says so**, with `.focus = .{}`.
+Nothing is worked out from a callback: an immediate-mode button is usually
+an element whose branch asks `justReleased()`, and there is nothing on it to
+see. A text input takes the focus without being told to.
+
+**Tab walks them in the order they were declared** and comes round at the
+ends. `.focus = .{ .tab_index = 2 }` puts an element before all of those
+without one, lowest number first - Ply's rule, and the browsers'. From a
+panel somebody clicked, Tab goes on from where the panel was declared.
+`navigate` says whether the focus moved, which with one element that already
+has it is no.
+
+**The key that presses is a level, not an event**, and it goes through the
+pointer's four states: `pressed()`, `justPressed()`, `justReleased()` and the
+`on_press` and `on_release` callbacks answer for it as they do for a click,
+about whatever had the focus when it went down. A button cannot tell which of
+the two pressed it. Move the focus away while the key is down and letting go
+presses nothing, which is the keyboard's way of dragging off a button.
+
+**A click focuses the button, not the label in it**: the innermost element
+under the pointer that takes the focus gets it, unless something on the way
+there asks to `preserve_focus`. With nothing there that takes the focus, the
+innermost element gets it, as it always has.
+
+Answered from the last frame, like the pointer: an element that has just
+appeared cannot be tabbed to until the frame after.
+
 ## Text input
 
 ```zig
@@ -1082,6 +1131,7 @@ than from memory.
 | **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
 | **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, clip-aware picking, `wantsPointer` for a program that has its own use for a click, and a cursor shape to hand the window |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus` and `on_unfocus`, called when the frame is over |
+| **The focus from a keyboard or a pad** | `.focus` on a declaration, a Tab order with `tab_index`, a key that presses what has the focus the way a click does, and a click that focuses the button rather than its label |
 | **Floating** | out of the flow, anchored to a parent, an element by name, or the surface, with an offset, a z-index and optional clipping |
 | **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup |
 | **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text, and a pass that can draw over a scene rather than instead of it |
@@ -1093,7 +1143,7 @@ the order it is worth doing in.
 
 | | What it is, and what it needs |
 | --- | --- |
-| **Keyboard navigation** | Tab and Shift+Tab through whatever can take the focus, in an order a `tab_index` can override; the arrow keys moving it to the element each one names, and scrolling where none is named; Enter and Space pressing what has it; a ring drawn round it when the keyboard put it there; and PageUp, PageDown, Home and End scrolling the list under the pointer. Ply hangs all of it off its accessibility config, which is how it went out with accessibility - but in a game it is how a gamepad walks a menu, and none of it needs a screen reader. |
+| **The rest of keyboard navigation** | The arrow keys moving the focus to the element each one names, and scrolling where none is named; a ring drawn round the focus when the keyboard put it there; and PageUp, PageDown, Home and End scrolling the list under the pointer. Tab, `tab_index` and the key that presses are [here already](#the-focus-from-a-keyboard-or-a-pad). |
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
 | **TinyVG** | Ply can hand a vector image straight to `.image(...)` and rasterise it. Here a picture is a texture, and turning TinyVG into one is somebody else's pass. |
 | **Shaders and effects** | `.effect(...)` and `.shader(...)`: a fragment shader per element, with Ply's own build step behind it. This renderer is one pipeline and one draw call by design, and a shader per element is a pipeline per element - so this is not a missing feature so much as a different renderer. A program that wants it can consume the command list itself. |

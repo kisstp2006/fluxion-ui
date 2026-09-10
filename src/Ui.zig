@@ -183,6 +183,9 @@ const Element = struct {
     preserve_focus: bool = false,
     /// What the pointer looks like over it. See `Ui.cursor`.
     cursor: ?layout.CursorShape = null,
+    /// Whether it takes the focus from the keyboard, and how. See
+    /// `Focusing`.
+    focus: ?Focusing = null,
 
     /// The size it currently believes it is. Filled by the fit pass, then
     /// adjusted by the grow and shrink passes.
@@ -201,6 +204,16 @@ const Element = struct {
     /// the element has been closed.
     children_start: u32 = 0,
     children_length: u32 = 0,
+};
+
+/// What an element that takes the focus asked for, kept on it once the
+/// declaration is gone. See `layout.Focus`.
+const Focusing = struct {
+    tab_index: ?i16 = null,
+
+    fn of(asked: layout.Focus) Focusing {
+        return .{ .tab_index = asked.tab_index };
+    }
 };
 
 /// An element that has been opened and not yet closed.
@@ -248,6 +261,10 @@ const Hit = struct {
     solid: bool,
     /// What it asked the pointer to look like, if anything. See `Ui.cursor`.
     cursor: ?layout.CursorShape,
+    /// Whether it takes the focus from the keyboard. Kept here because the
+    /// keyboard is answered between frames too: `navigate` walks the
+    /// focusable entries of this list, which are in declaration order.
+    focus: ?Focusing,
 
     /// Whether a point is on this element.
     ///
@@ -539,6 +556,13 @@ over: std.ArrayList(u32),
 held: std.ArrayList(u32),
 /// Which element has the keyboard, or zero for none.
 focus: u32 = 0,
+/// The key that presses whatever has the focus - Enter, Space, a pad's A -
+/// and what it is doing. The pointer's four states, because a button asks
+/// the same four questions of either. See `setActivate`.
+activation: input.PointerState = .idle,
+/// What had the focus when that key went down, and so what it goes on
+/// pressing until it comes up. Zero for nothing.
+activated: u32 = 0,
 
 /// The elements that are out of the flow, in the order they were declared.
 ///
@@ -948,6 +972,7 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
         .capture = declaration.capture,
         .preserve_focus = declaration.preserve_focus,
         .cursor = declaration.cursor,
+        .focus = if (declaration.focus) |asked| .of(asked) else null,
         .floating = declaration.floating,
         .image = declaration.image,
         .rotate = declaration.rotate,
@@ -1157,6 +1182,9 @@ fn textInputChecked(self: *Ui, declaration: layout.Declaration, asked: text_inpu
     // says otherwise still wins - a read-only field showing an arrow is a
     // reasonable thing to want.
     if (declaration.cursor == null) self.elements.items[index].cursor = .ibeam;
+    // And the one element that takes the focus without being told to: an
+    // input nobody can Tab into is an input a keyboard cannot fill in.
+    if (declaration.focus == null) self.elements.items[index].focus = .{};
 
     const entry = try self.edits.getOrPut(self.gpa, self.elements.items[index].id);
     if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -3026,6 +3054,16 @@ fn notify(self: *Ui) void {
     if (self.pointer.justReleased()) {
         for (self.held.items) |id| self.tell(id, .release, self.isOver(id));
     }
+
+    // The key that presses what has the focus is heard the same way, by the
+    // one element it is pressing - a key has no chain under it to walk. On
+    // target means the focus never left it.
+    if (self.activated != 0) {
+        if (self.activation == .pressed_this_frame) self.tell(self.activated, .press, false);
+        if (self.activation == .released_this_frame) {
+            self.tell(self.activated, .release, self.focus == self.activated);
+        }
+    }
 }
 
 const Told = enum { hover, press, release, focus, unfocus };
@@ -3097,6 +3135,7 @@ fn recordHits(self: *Ui) Error!void {
             .drag_select = if (element.field) |config| config.drag_select else false,
             .solid = self.solidToPointer(element),
             .cursor = element.cursor,
+            .focus = element.focus,
         });
     }
 }
@@ -3581,19 +3620,38 @@ fn chainUnder(self: *Ui, point: geometry.Vec2) Error!void {
 
 /// Move the keyboard to whatever was just pressed.
 ///
-/// The innermost element under the pointer takes it, unless it asked not to.
-/// Ply's `preserve_focus` is for a toolbar button that should not take the
-/// caret out of the text field beside it - pressing it does something, and
-/// the field stays focused.
+/// **The innermost element that takes the focus** gets it - the button, not
+/// the label inside it, which is what a click means to a keyboard that will
+/// press Enter next. Ply's `preserve_focus` on anything between the two
+/// leaves the focus where it was: a toolbar button that should not take the
+/// caret out of the text field beside it does its work, and the field stays
+/// focused.
+///
+/// **With nothing under the pointer that takes the focus**, the innermost
+/// element has it, as it always has - which is what `focused()` and the
+/// focus callbacks answer for an interface that never asked for navigation.
 fn takeFocus(self: *Ui) void {
     if (self.over.items.len == 0) {
         self.focus = 0;
         return;
     }
 
+    var i = self.over.items.len;
+    while (i > 0) {
+        i -= 1;
+        const hit = self.hitOf(self.over.items[i]) orelse continue;
+        if (hit.focus == null) continue;
+        for (self.over.items[i..]) |id| {
+            const on_the_way = self.hitOf(id) orelse continue;
+            if (on_the_way.preserve_focus) return;
+        }
+        self.focus = hit.id;
+        return;
+    }
+
     const innermost_id = self.over.items[self.over.items.len - 1];
-    for (self.hits.items) |hit| {
-        if (hit.id == innermost_id and hit.preserve_focus) return;
+    if (self.hitOf(innermost_id)) |hit| {
+        if (hit.preserve_focus) return;
     }
     self.focus = innermost_id;
 }
@@ -3612,6 +3670,32 @@ fn isHeld(self: *Ui, id: u32) bool {
     return false;
 }
 
+/// Whether the key that presses what has the focus is holding this element
+/// down. See `setActivate`.
+fn isActivated(self: *Ui, id: u32) bool {
+    return id != 0 and self.activated == id;
+}
+
+/// The three press questions, asked of the pointer and of that key both. A
+/// button cannot tell which of the two pressed it, and should not have to.
+fn isPressing(self: *Ui, id: u32) bool {
+    return (self.pointer.isDown() and self.isHeld(id)) or
+        (self.activation.isDown() and self.isActivated(id));
+}
+
+fn wentDown(self: *Ui, id: u32) bool {
+    return (self.pointer.justPressed() and self.isHeld(id)) or
+        (self.activation == .pressed_this_frame and self.isActivated(id));
+}
+
+/// Up on the element it went down on: for the pointer, still over it; for
+/// the key, still focused on it - moving the focus away while the key is
+/// down is the keyboard's way of dragging off the button.
+fn cameUp(self: *Ui, id: u32) bool {
+    return (self.pointer.justReleased() and self.isHeld(id) and self.isOver(id)) or
+        (self.activation == .released_this_frame and self.isActivated(id) and self.focus == id);
+}
+
 // -- asked of the element currently open --
 
 /// Whether the pointer is over the element being declared. Ply's
@@ -3621,15 +3705,15 @@ pub fn hovered(self: *Ui) bool {
 }
 
 /// Whether the button went down on this element and has not come up. Ply's
-/// `ui.pressed()`.
+/// `ui.pressed()`. The key that presses what has the focus counts too.
 pub fn pressed(self: *Ui) bool {
-    return self.pointer.isDown() and self.isHeld(self.openId());
+    return self.isPressing(self.openId());
 }
 
 /// Whether the button went down on this element this frame. Ply's
 /// `ui.just_pressed()`.
 pub fn justPressed(self: *Ui) bool {
-    return self.pointer.justPressed() and self.isHeld(self.openId());
+    return self.wentDown(self.openId());
 }
 
 /// Whether the button came up on this element this frame. Ply's
@@ -3638,7 +3722,7 @@ pub fn justPressed(self: *Ui) bool {
 /// The one to hang a button on: it fires once, and only if the press started
 /// here - so dragging in from somewhere else and letting go does nothing.
 pub fn justReleased(self: *Ui) bool {
-    return self.pointer.justReleased() and self.isHeld(self.openId()) and self.hovered();
+    return self.cameUp(self.openId());
 }
 
 /// Whether this element has the keyboard. Ply's `ui.focused()`.
@@ -3660,13 +3744,12 @@ pub fn isPointerOver(self: *Ui, name: []const u8) bool {
 
 /// Ply's `is_pressed(id)`.
 pub fn isElementPressed(self: *Ui, name: []const u8) bool {
-    return self.pointer.isDown() and self.isHeld(identify(name));
+    return self.isPressing(identify(name));
 }
 
 /// Ply's `is_just_released(id)`.
 pub fn isElementReleased(self: *Ui, name: []const u8) bool {
-    const id = identify(name);
-    return self.pointer.justReleased() and self.isHeld(id) and self.isOver(id);
+    return self.cameUp(identify(name));
 }
 
 /// Whether the interface wants this click.
@@ -3777,6 +3860,130 @@ pub fn clearFocus(self: *Ui) void {
 /// Whether this element has the keyboard.
 pub fn isFocused(self: *Ui, name: []const u8) bool {
     return self.focus != 0 and self.focus == identify(name);
+}
+
+// -------------------------------------------------------------------------
+// Moving the focus from a keyboard or a pad
+// -------------------------------------------------------------------------
+
+/// Move the focus the way a key or a pad button asks. **Call it between
+/// frames**, before `begin`, like `setPointer`.
+///
+/// ```zig
+/// if (key == .tab) _ = ui.navigate(if (shift) .previous else .next);
+/// ```
+///
+/// Answered from where things were when the last frame finished: the Tab
+/// order is the order the focusable elements were declared in then. So an
+/// element that has just appeared cannot be tabbed to until the frame after -
+/// the same one-frame lag every pointer question here has, and invisible for
+/// the same reason.
+///
+/// **Says whether the focus moved.** With one focusable element that already
+/// has it, Tab moves nothing and says so.
+pub fn navigate(self: *Ui, to: input.Navigation) bool {
+    const before = self.focus;
+    switch (to) {
+        .next => self.stepTab(true),
+        .previous => self.stepTab(false),
+    }
+    return self.focus != before;
+}
+
+/// Say whether the key that presses what has the focus is down: Enter, Space,
+/// a pad's A - whichever the program binds. **Call it once a frame, before
+/// `begin`**, with the key's level rather than its events, like `setPointer`.
+///
+/// It goes through the pointer's four states and presses whatever had the
+/// focus when it went down: `pressed()` while it is held, `justPressed()` on
+/// the frame it went down, and `justReleased()` on the frame it came up - if
+/// the focus is still there. `on_press` and `on_release` are told, as they
+/// are for a click, and a button cannot tell which of the two pressed it.
+/// Ply's `handle_keyboard_activation`, which does it for Enter and Space.
+///
+/// With nothing focused it presses nothing. In a text input, Enter is
+/// `textAction(.submit)` rather than this; `wantsKeyboard` is how a program
+/// knows which of the two to send.
+pub fn setActivate(self: *Ui, down: bool) void {
+    self.activation = self.activation.advance(down);
+    switch (self.activation) {
+        // What has the focus now is what is pressed until the key comes up.
+        .pressed_this_frame => self.activated = self.focus,
+        .idle => self.activated = 0,
+        .pressed, .released_this_frame => {},
+    }
+}
+
+/// Where a hit comes in the Tab order. See `layout.Focus.tab_index`.
+const TabPlace = struct {
+    /// Zero for an element with a tab index and one for the rest, which is
+    /// what puts every numbered element first.
+    group: u1,
+    tab_index: i16,
+    /// Where it was declared, which settles everything else.
+    index: usize,
+
+    fn of(focus: ?Focusing, index: usize) TabPlace {
+        const numbered: ?i16 = if (focus) |asked| asked.tab_index else null;
+        return .{
+            .group = if (numbered == null) 1 else 0,
+            .tab_index = numbered orelse 0,
+            .index = index,
+        };
+    }
+
+    fn before(a: TabPlace, b: TabPlace) bool {
+        if (a.group != b.group) return a.group < b.group;
+        if (a.tab_index != b.tab_index) return a.tab_index < b.tab_index;
+        return a.index < b.index;
+    }
+};
+
+/// Tab, or Shift+Tab: the next focusable element after the focus in the Tab
+/// order, or the one before it, coming round at the ends.
+///
+/// Worked out as "the nearest place past this one" rather than by sorting,
+/// so it takes no memory and cannot fail - which matters, because this runs
+/// between frames, where there is nowhere to report an allocation failure.
+///
+/// **From an element that does not take the focus** - a panel somebody
+/// clicked - Tab goes on from where that element was declared. **From
+/// nothing**, it starts at the beginning, or at the end going backwards.
+fn stepTab(self: *Ui, forward: bool) void {
+    const here: ?TabPlace = if (self.focusedHit()) |at| .of(self.hits.items[at].focus, at) else null;
+
+    // The nearest place past `here`, and the first one of all - or, going
+    // backwards, the last - for coming round.
+    var nearest: ?TabPlace = null;
+    var first: ?TabPlace = null;
+    for (self.hits.items, 0..) |hit, i| {
+        if (hit.focus == null) continue;
+        const place: TabPlace = .of(hit.focus, i);
+
+        if (first == null or ahead(place, first.?, forward)) first = place;
+
+        const start = here orelse continue;
+        if (!ahead(start, place, forward)) continue;
+        if (nearest == null or ahead(place, nearest.?, forward)) nearest = place;
+    }
+
+    const chosen = nearest orelse first orelse return;
+    self.focus = self.hits.items[chosen.index].id;
+}
+
+/// Whether `a` comes before `b`, walking the Tab order this way round.
+fn ahead(a: TabPlace, b: TabPlace, forward: bool) bool {
+    return if (forward) a.before(b) else b.before(a);
+}
+
+/// Where the focus is in `hits`, or null when nothing has it - or when it is
+/// on something that was not on the page last frame.
+fn focusedHit(self: *Ui) ?usize {
+    if (self.focus == 0) return null;
+    for (self.hits.items, 0..) |hit, i| {
+        if (hit.id == self.focus) return i;
+    }
+    return null;
 }
 
 // -------------------------------------------------------------------------
@@ -9920,4 +10127,298 @@ test "a scrolling list keeps the room it was given, not the size of its content"
     // overflow at all, and nothing to scroll.
     try testing.expectEqual(@as(f32, 100), ui.boxOf("list").?.height);
     try testing.expectEqual(@as(f32, 300), ui.scrollOf("list").?.limit().y);
+}
+
+// -------------------------------------------------------------------------
+// The focus, from a keyboard or a pad
+// -------------------------------------------------------------------------
+//
+// Navigation is answered from where things were when the last frame
+// finished, like every pointer question, so each of these lays a frame out
+// before it navigates.
+
+/// A column: three buttons that take the focus, a spacer between the first
+/// two that does not, and a text input at the end that does without being
+/// told. Play is at y 0, the spacer at 50, options at 70, quit at 120 and the
+/// input at 170.
+fn focusMenu(u: *Ui) !void {
+    u.begin(.init(400, 400));
+    u.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom, .gap = 10 });
+    leaf(u, "play", .{ .width = .fixed(200), .height = .fixed(40), .focus = .{} });
+    leaf(u, "spacer", .{ .width = .fixed(200), .height = .fixed(10) });
+    leaf(u, "options", .{ .width = .fixed(200), .height = .fixed(40), .focus = .{} });
+    leaf(u, "quit", .{ .width = .fixed(200), .height = .fixed(40), .focus = .{} });
+    u.textInput(.{ .id = "name", .width = .fixed(200), .height = .fixed(24) }, .{});
+    u.close();
+    _ = try u.end();
+}
+
+test "Tab walks what takes the focus in the order it was declared, and comes round" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try focusMenu(&ui);
+
+    try testing.expect(ui.navigate(.next));
+    try testing.expect(ui.isFocused("play"));
+    // The spacer never asked, so it is passed over.
+    try testing.expect(ui.navigate(.next));
+    try testing.expect(ui.isFocused("options"));
+    _ = ui.navigate(.next);
+    try testing.expect(ui.isFocused("quit"));
+    // The text input is in the order without having said so.
+    _ = ui.navigate(.next);
+    try testing.expect(ui.isFocused("name"));
+    _ = ui.navigate(.next);
+    try testing.expect(ui.isFocused("play"));
+
+    // And back the other way, round the start.
+    _ = ui.navigate(.previous);
+    try testing.expect(ui.isFocused("name"));
+    _ = ui.navigate(.previous);
+    try testing.expect(ui.isFocused("quit"));
+}
+
+test "Shift+Tab from nothing starts at the end" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try focusMenu(&ui);
+
+    try testing.expect(ui.navigate(.previous));
+    try testing.expect(ui.isFocused("name"));
+}
+
+test "a tab_index goes first, lowest first, and ties keep their order" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    ui.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+    leaf(&ui, "a", .{ .width = .fixed(50), .height = .fixed(20), .focus = .{} });
+    leaf(&ui, "b", .{ .width = .fixed(50), .height = .fixed(20), .focus = .{ .tab_index = 2 } });
+    leaf(&ui, "c", .{ .width = .fixed(50), .height = .fixed(20), .focus = .{ .tab_index = 1 } });
+    leaf(&ui, "d", .{ .width = .fixed(50), .height = .fixed(20), .focus = .{} });
+    leaf(&ui, "e", .{ .width = .fixed(50), .height = .fixed(20), .focus = .{ .tab_index = 1 } });
+    ui.close();
+    _ = try ui.end();
+
+    // The numbered ones first, lowest first and c before e because it was
+    // declared first; then the rest in the order they were declared.
+    for ([_][]const u8{ "c", "e", "b", "a", "d", "c" }) |name| {
+        _ = ui.navigate(.next);
+        try testing.expect(ui.isFocused(name));
+    }
+}
+
+test "with one element to go to, Tab that stays put says it did not move" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    leaf(&ui, "only", .{ .width = .fixed(50), .height = .fixed(20), .focus = .{} });
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expect(ui.navigate(.next));
+    try testing.expect(!ui.navigate(.next));
+    try testing.expect(ui.isFocused("only"));
+
+    // And with nothing to go to at all, nothing moves.
+    var bare = withText(testing.allocator);
+    defer bare.deinit();
+    try panels(&bare);
+    try testing.expect(!bare.navigate(.next));
+}
+
+test "Tab goes on from a panel somebody clicked" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try focusMenu(&ui);
+
+    // The spacer takes no focus and nothing round it does, so the click
+    // gives it the focus as a click always has.
+    ui.setPointer(100, 55, true);
+    try testing.expect(ui.isFocused("spacer"));
+
+    // Tab goes on from where the spacer was declared, in either direction.
+    _ = ui.navigate(.next);
+    try testing.expect(ui.isFocused("options"));
+    ui.setFocus("spacer");
+    _ = ui.navigate(.previous);
+    try testing.expect(ui.isFocused("play"));
+}
+
+/// A button that takes the focus, with a label inside it that does not.
+/// The label is at 10, 10, twenty tall.
+fn labelledButton(u: *Ui, preserve: bool) !void {
+    u.begin(.init(400, 200));
+    openRoot(u);
+    {
+        u.open(.{
+            .id = "button",
+            .width = .fixed(200),
+            .height = .fixed(60),
+            .padding = .all(10),
+            .background_color = paint,
+            .preserve_focus = preserve,
+            .focus = .{},
+        });
+        defer u.close();
+        leaf(u, "label", .{ .width = .fixed(100), .height = .fixed(20) });
+    }
+    leaf(u, "elsewhere", .{ .width = .fixed(100), .height = .fixed(20), .focus = .{} });
+    u.close();
+    _ = try u.end();
+}
+
+test "a click focuses the button, not the label inside it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try labelledButton(&ui, false);
+
+    ui.setPointer(20, 15, true);
+    try testing.expect(ui.isFocused("button"));
+    try testing.expect(!ui.isFocused("label"));
+}
+
+test "a click that would focus a button asking to leave the focus alone leaves it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try labelledButton(&ui, true);
+
+    ui.setFocus("elsewhere");
+    // On the label, on the way to a button that preserves the focus.
+    ui.setPointer(20, 15, true);
+    try testing.expect(ui.isFocused("elsewhere"));
+}
+
+/// What the three press questions answered, asked in the button's branch.
+const Asked = struct {
+    pressed: bool = false,
+    just_pressed: bool = false,
+    just_released: bool = false,
+};
+
+/// Two buttons that take the focus, each writing down what it was told.
+fn askingButtons(u: *Ui, ok: *Asked, cancel: *Asked) !void {
+    u.begin(.init(400, 200));
+    openRoot(u);
+    inline for (.{ .{ "ok", ok }, .{ "cancel", cancel } }) |button| {
+        u.open(.{ .id = button[0], .width = .fixed(100), .height = .fixed(40), .background_color = paint, .focus = .{} });
+        defer u.close();
+        button[1].* = .{
+            .pressed = u.pressed(),
+            .just_pressed = u.justPressed(),
+            .just_released = u.justReleased(),
+        };
+    }
+    u.close();
+    _ = try u.end();
+}
+
+test "the key that presses presses what has the focus, like a click" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    var ok: Asked = .{};
+    var cancel: Asked = .{};
+    try askingButtons(&ui, &ok, &cancel);
+    _ = ui.navigate(.next);
+
+    // Down: pressed, and just pressed, on the one with the focus only.
+    ui.setActivate(true);
+    try askingButtons(&ui, &ok, &cancel);
+    try testing.expect(ok.pressed and ok.just_pressed and !ok.just_released);
+    try testing.expect(!cancel.pressed and !cancel.just_pressed);
+    try testing.expect(ui.isElementPressed("ok"));
+
+    // Held: still pressed, and "just" was only the once.
+    ui.setActivate(true);
+    try askingButtons(&ui, &ok, &cancel);
+    try testing.expect(ok.pressed and !ok.just_pressed);
+
+    // Up: released, which is what a button hangs its work on.
+    ui.setActivate(false);
+    try askingButtons(&ui, &ok, &cancel);
+    try testing.expect(!ok.pressed and ok.just_released);
+    try testing.expect(ui.isElementReleased("ok"));
+
+    // And only the once.
+    ui.setActivate(false);
+    try askingButtons(&ui, &ok, &cancel);
+    try testing.expect(!ok.just_released);
+}
+
+test "the key presses nothing when nothing has the focus" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    var ok: Asked = .{};
+    var cancel: Asked = .{};
+    try askingButtons(&ui, &ok, &cancel);
+
+    ui.setActivate(true);
+    try askingButtons(&ui, &ok, &cancel);
+    try testing.expect(!ok.pressed and !cancel.pressed);
+    ui.setActivate(false);
+    try askingButtons(&ui, &ok, &cancel);
+    try testing.expect(!ok.just_released and !cancel.just_released);
+}
+
+test "moving the focus while the key is down presses nothing when it comes up" {
+    // The keyboard's way of dragging off a button: whatever was pressed is
+    // still pressed until the key comes up, and coming up somewhere else is
+    // a change of mind.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    var ok: Asked = .{};
+    var cancel: Asked = .{};
+    try askingButtons(&ui, &ok, &cancel);
+    _ = ui.navigate(.next);
+
+    ui.setActivate(true);
+    try askingButtons(&ui, &ok, &cancel);
+    _ = ui.navigate(.next);
+    try testing.expect(ui.isFocused("cancel"));
+
+    ui.setActivate(true);
+    try askingButtons(&ui, &ok, &cancel);
+    // Still the one it went down on, not the one with the focus now.
+    try testing.expect(ok.pressed and !cancel.pressed);
+
+    ui.setActivate(false);
+    try askingButtons(&ui, &ok, &cancel);
+    try testing.expect(!ok.just_released and !cancel.just_released);
+}
+
+test "a press by the key reaches the callbacks, and says where it came up" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    var tally: Tally = .{};
+    try watchedButton(&ui, &tally);
+    // The watched button does not take the focus from Tab, but the focus can
+    // be given to anything, and the key presses whatever has it.
+    ui.setFocus("button");
+
+    ui.setActivate(true);
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.press);
+    try testing.expectEqual(identify("button"), tally.last);
+
+    ui.setActivate(true);
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.press);
+
+    ui.setActivate(false);
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 1), tally.release);
+    try testing.expect(tally.on_target);
+
+    // Again, with the focus taken away in between: heard, and off target.
+    ui.setActivate(true);
+    try watchedButton(&ui, &tally);
+    ui.clearFocus();
+    ui.setActivate(false);
+    try watchedButton(&ui, &tally);
+    try testing.expectEqual(@as(u32, 2), tally.release);
+    try testing.expect(!tally.on_target);
 }

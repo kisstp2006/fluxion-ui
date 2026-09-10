@@ -97,6 +97,21 @@ pub const Pointer = struct {
     }
 };
 
+/// Where the focus should go: what a key or a pad button *meant*, which is
+/// all this library is ever told about either. See `Ui.navigate`.
+///
+/// The same arrangement as `text_input.Action`, and for the same reason. A
+/// layout library has no business knowing that Tab is Tab on this keyboard,
+/// that a pad's shoulder button means "next page" in this game, or that the
+/// program has a key-binding screen - so the program decides what a key is
+/// for, and this decides what that means for the focus.
+pub const Navigation = enum {
+    /// Tab: the next element in the Tab order, coming round at the end.
+    next,
+    /// Shift+Tab: the one before, coming round at the start.
+    previous,
+};
+
 test "the transition table fires just-pressed exactly once" {
     var state: PointerState = .idle;
 

@@ -10,6 +10,9 @@
 //! zig build example-window -- --scale 2 --safe 48
 //! ```
 //!
+//! Tab and Shift+Tab walk the list, the menu, the tags and the fields, and
+//! Enter or Space presses whatever has the focus, as a click would.
+//!
 //! Everything above this file has been checked without a graphics card - the
 //! layout against a monospace measurer, the renderer against the `none`
 //! backend that validates every call and draws none of them. This is where
@@ -135,8 +138,10 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
 
                 // Asked before the element is opened, because the answer is
                 // about where it was last frame - which is what an
-                // immediate-mode interface always has to work from.
-                const lit = u.isPointerOver(id);
+                // immediate-mode interface always has to work from. Hovered
+                // and focused look the same here; Enter presses one as a
+                // click does, so the pressed colour covers both.
+                const lit = u.isPointerOver(id) or u.isFocused(id);
                 const down = u.isElementPressed(id);
 
                 u.open(.{
@@ -152,6 +157,7 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                         theme.hover
                     else
                         theme.card,
+                    .focus = .{},
                 });
                 defer u.close();
                 u.text(text, .{ .font_size = 13, .color = theme.ink });
@@ -197,8 +203,11 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
 
                 // Asked about both, because a floating element ends the chain
                 // the pointer walks up: standing on the menu does not count as
-                // standing on the button it hangs off.
-                const open = u.isPointerOver("menu-button") or u.isPointerOver("menu");
+                // standing on the button it hangs off. And open while the
+                // keyboard is on the button or in the menu, so Tab walks in.
+                const open = u.isPointerOver("menu-button") or u.isPointerOver("menu") or
+                    u.isFocused("menu-button") or u.isFocused("menu-open") or
+                    u.isFocused("menu-save") or u.isFocused("menu-close");
 
                 u.open(.{
                     .id = "menu-button",
@@ -213,6 +222,7 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                     // library leaves it to the element. The text fields
                     // further down ask for nothing and get a caret anyway.
                     .cursor = .pointing_hand,
+                    .focus = .{},
                 });
                 defer u.close();
                 u.text("Menu", .{ .font_size = 13, .color = theme.ink });
@@ -249,10 +259,11 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                             .padding = .xy(8, 0),
                             .align_y = .center,
                             .corner_radius = .all(4),
-                            .background_color = if (u.isPointerOver(item[0]))
+                            .background_color = if (u.isPointerOver(item[0]) or u.isFocused(item[0]))
                                 theme.hover
                             else
                                 .transparent,
+                            .focus = .{},
                         });
                         defer u.close();
                         u.text(item[1], .{ .font_size = 13, .color = theme.ink });
@@ -305,8 +316,9 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
                         .height = .fit,
                         .padding = .xy(10, 5),
                         .corner_radius = .all(12),
-                        .background_color = if (u.isPointerOver(label)) theme.hover else theme.card,
+                        .background_color = if (u.isPointerOver(label) or u.isFocused(label)) theme.hover else theme.card,
                         .border = .all(theme.line, 1),
+                        .focus = .{},
                     });
                     defer u.close();
                     u.text(label, .{ .font_size = 12, .color = theme.ink });
@@ -515,6 +527,10 @@ const Window = struct {
     typed: [32]Typed = undefined,
     typed_len: usize = 0,
     mods: platform.Mods = .{},
+    /// Whether Enter or Space is held: the key that presses whatever has the
+    /// focus. A level rather than the events, because that is what
+    /// `setActivate` takes - the same shape as the mouse button.
+    accept: bool = false,
 
     /// One thing the keyboard did, in the order it did it.
     ///
@@ -595,6 +611,9 @@ const Window = struct {
             .close => self.inner.win.setShouldClose(true),
             .key => |k| {
                 self.mods = k.mods;
+                if (k.key == .enter or k.key == .kp_enter or k.key == .space) {
+                    self.accept = k.action.down();
+                }
                 if (k.key == .escape and k.action == .press) {
                     self.inner.win.setShouldClose(true);
                 } else if (k.action.down() and self.typed_len < self.typed.len) {
@@ -644,6 +663,10 @@ const Window = struct {
 
     fn buttonDown(self: Window) bool {
         return self.down;
+    }
+
+    fn acceptHeld(self: Window) bool {
+        return self.accept;
     }
 
     /// Draw the pointer as this, if it is not already.
@@ -793,6 +816,10 @@ pub fn main(init: std.process.Init) !void {
         const at = window.cursor();
         layout.setShift(window.shiftHeld());
         layout.setPointer(at.x, at.y, window.buttonDown());
+        // Enter and Space press whatever has the focus, the way a click does -
+        // except in a text field, where Enter is the field's and Space is a
+        // character. `wantsKeyboard` is how a program tells the two apart.
+        layout.setActivate(window.acceptHeld() and !layout.wantsKeyboard());
 
         // And then the wheel, to whatever that turned out to be under. The
         // layout clamps it at either end when the frame finishes. This window
@@ -811,7 +838,11 @@ pub fn main(init: std.process.Init) !void {
                 const length = std.unicode.utf8Encode(code, &utf8) catch continue;
                 layout.typeText(utf8[0..length]);
             },
-            .key => |k| if (editing(k)) |action| {
+            // Tab moves the focus whatever has it, so a text field can be left
+            // from the keyboard as well as entered.
+            .key => |k| if (k.key == .tab) {
+                _ = layout.navigate(if (k.mods.shift) .previous else .next);
+            } else if (editing(k)) |action| {
                 if (layout.textAction(action)) |taken| {
                     // No platform clipboard here, so Ctrl+V pastes whatever
                     // Ctrl+C or Ctrl+X last took - enough to show the round
