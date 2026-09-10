@@ -182,7 +182,9 @@ the differences are the ones Zig forces, and there are three of them.
 | `.preserve_focus()` | `.preserve_focus = true` |
 | `.accessibility(\|a\| a.focusable())` | `.focus = .{}` |
 | `.accessibility(\|a\| a.focusable().tab_index(2))` | `.focus = .{ .tab_index = 2 }` |
+| `.accessibility(\|a\| a.focusable().focus_down("quit"))` | `.focus = .{ .down = "quit" }` |
 | Tab and Shift+Tab, read from macroquad | `ui.navigate(.next)`, `ui.navigate(.previous)` |
+| The arrow keys, read from macroquad | `ui.navigate(.down)`, and a pad's with `ui.holdNavigation(.down)` |
 | Enter and Space on the focus, read from macroquad | `ui.setActivate(down)` |
 | `.contain(16.0/9.0)` | `.contain = 16.0 / 9.0` |
 | `.cover(16.0/9.0)` | `.cover = 16.0 / 9.0` |
@@ -916,6 +918,8 @@ if (ui.justReleased()) play();               // a click, Enter, or a pad's A
 
 ```zig
 if (tab) _ = ui.navigate(if (shift) .previous else .next);
+if (arrow_down) _ = ui.navigate(.down);      // and up, left and right
+ui.holdNavigation(pad_direction);            // a d-pad or a stick, once a frame
 ui.setActivate(enter or space or pad_a);     // once a frame, like setPointer
 ```
 
@@ -933,8 +937,33 @@ see. A text input takes the focus without being told to.
 ends. `.focus = .{ .tab_index = 2 }` puts an element before all of those
 without one, lowest number first - Ply's rule, and the browsers'. From a
 panel somebody clicked, Tab goes on from where the panel was declared.
-`navigate` says whether the focus moved, which with one element that already
-has it is no.
+
+**The arrows go to the element that way.** The one the focus names, if it
+names one - `.focus = .{ .down = "quit" }`, Ply's `focus_down`, read as it is
+declared like every name here - and otherwise the nearest, among the boxes
+as they were drawn last frame:
+
+- only what is further that way counts, by its middle and by its far edge,
+  so something level with the focus is never a step down;
+- what shares the focus's band - its column for up and down, its row for
+  left and right - comes first, and the smallest gap wins, so a menu steps
+  to the button directly below even when one beside it is nearer;
+- only when the band is empty does the rest count, by the gap plus twice the
+  distance across;
+- ties go to the one nearer the middle, and then to the one declared first.
+
+A turned element is measured where it was drawn. A row scrolled out of its
+list can be reached - otherwise a pad could never walk a long list - and one
+that a clip which does not scroll has cut off cannot. With nothing further
+that way the focus stays where it is, and `navigate` says so, so the press is
+the game's to use: `if (!ui.navigate(.left)) previousTab();`.
+
+**A pad's direction is a level**, and `holdNavigation` turns it into steps:
+one when it is pressed, another 0.35 seconds later and one every 0.08 after
+that, on the clock `tick` keeps - `setRepeat` changes both. Never more than
+one a frame, and a hitch in the game does not come back as a burst of rows.
+A keyboard repeats on its own, so every arrow key event, repeats and all, is
+one `navigate`.
 
 **The key that presses is a level, not an event**, and it goes through the
 pointer's four states: `pressed()`, `justPressed()`, `justReleased()` and the
@@ -1131,7 +1160,7 @@ than from memory.
 | **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
 | **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, clip-aware picking, `wantsPointer` for a program that has its own use for a click, and a cursor shape to hand the window |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus` and `on_unfocus`, called when the frame is over |
-| **The focus from a keyboard or a pad** | `.focus` on a declaration, a Tab order with `tab_index`, a key that presses what has the focus the way a click does, and a click that focuses the button rather than its label |
+| **The focus from a keyboard or a pad** | `.focus` on a declaration, a Tab order with `tab_index`, the arrows and a pad's d-pad going to a named neighbour or the nearest element that way, a held direction that repeats on `tick`'s clock, a key that presses what has the focus the way a click does, and a click that focuses the button rather than its label |
 | **Floating** | out of the flow, anchored to a parent, an element by name, or the surface, with an offset, a z-index and optional clipping |
 | **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup |
 | **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text, and a pass that can draw over a scene rather than instead of it |
@@ -1143,7 +1172,7 @@ the order it is worth doing in.
 
 | | What it is, and what it needs |
 | --- | --- |
-| **The rest of keyboard navigation** | The arrow keys moving the focus to the element each one names, and scrolling where none is named; a ring drawn round the focus when the keyboard put it there; and PageUp, PageDown, Home and End scrolling the list under the pointer. Tab, `tab_index` and the key that presses are [here already](#the-focus-from-a-keyboard-or-a-pad). |
+| **The rest of keyboard navigation** | A ring drawn round the focus when the keyboard put it there; the arrow keys scrolling the list under the pointer when there is nowhere to move the focus; and PageUp, PageDown, Home and End scrolling it too. Tab, `tab_index`, the arrows and the key that presses are [here already](#the-focus-from-a-keyboard-or-a-pad). |
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
 | **TinyVG** | Ply can hand a vector image straight to `.image(...)` and rasterise it. Here a picture is a texture, and turning TinyVG into one is somebody else's pass. |
 | **Shaders and effects** | `.effect(...)` and `.shader(...)`: a fragment shader per element, with Ply's own build step behind it. This renderer is one pipeline and one draw call by design, and a shader per element is a pipeline per element - so this is not a missing feature so much as a different renderer. A program that wants it can consume the command list itself. |

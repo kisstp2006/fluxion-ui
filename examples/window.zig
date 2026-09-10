@@ -10,8 +10,9 @@
 //! zig build example-window -- --scale 2 --safe 48
 //! ```
 //!
-//! Tab and Shift+Tab walk the list, the menu, the tags and the fields, and
-//! Enter or Space presses whatever has the focus, as a click would.
+//! Tab and Shift+Tab walk the list, the menu, the tags and the fields, the
+//! arrow keys go to the nearest of them that way, and Enter or Space presses
+//! whatever has the focus, as a click would.
 //!
 //! Everything above this file has been checked without a graphics card - the
 //! layout against a monospace measurer, the renderer against the `none`
@@ -397,6 +398,17 @@ fn shell(u: *Ui, size: ui.Dimensions) void {
             });
         }
     }
+}
+
+/// Which way an arrow key moves the focus, or null for any other key.
+fn arrow(k: platform.event.KeyEvent) ?ui.Navigation {
+    return switch (k.key) {
+        .up => .up,
+        .down => .down,
+        .left => .left,
+        .right => .right,
+        else => null,
+    };
 }
 
 /// What a key means to a text input, or null if it means nothing.
@@ -839,9 +851,12 @@ pub fn main(init: std.process.Init) !void {
                 layout.typeText(utf8[0..length]);
             },
             // Tab moves the focus whatever has it, so a text field can be left
-            // from the keyboard as well as entered.
+            // from the keyboard as well as entered. The arrows move it too,
+            // except in a text field, where they move the caret instead.
             .key => |k| if (k.key == .tab) {
                 _ = layout.navigate(if (k.mods.shift) .previous else .next);
+            } else if (arrow(k) != null and !layout.wantsKeyboard()) {
+                _ = layout.navigate(arrow(k).?);
             } else if (editing(k)) |action| {
                 if (layout.textAction(action)) |taken| {
                     // No platform clipboard here, so Ctrl+V pastes whatever

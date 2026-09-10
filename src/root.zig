@@ -75,6 +75,7 @@ pub const AlignY = geometry.AlignY;
 pub const Pointer = input.Pointer;
 pub const PointerState = input.PointerState;
 pub const Navigation = input.Navigation;
+pub const Repeat = input.Repeat;
 
 pub const TextStyle = text.TextStyle;
 pub const Measurer = text.Measurer;

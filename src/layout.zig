@@ -601,6 +601,19 @@ pub const Focus = struct {
     /// whose Tab order has to be spelt out is usually declared in the wrong
     /// order.
     tab_index: ?i16 = null,
+
+    /// Where the arrow keys - or a pad's d-pad - go from here, by name, when
+    /// the nearest element that way is not the right one. Ply's `focus_up`
+    /// and its three siblings. Leave them out and `Ui.navigate` searches.
+    ///
+    /// **Read as the element is declared**, like `id`, so a name formatted
+    /// into a buffer that the next element reuses is safe - the mistake
+    /// `Floating.to` used to make. A name that was not on the page last frame
+    /// is passed over, and the search decides instead.
+    up: ?[]const u8 = null,
+    down: ?[]const u8 = null,
+    left: ?[]const u8 = null,
+    right: ?[]const u8 = null,
 };
 
 /// Something to call when an element is pointed at or focused. Ply's

@@ -110,6 +110,28 @@ pub const Navigation = enum {
     next,
     /// Shift+Tab: the one before, coming round at the start.
     previous,
+    /// The arrow keys, and a pad's d-pad or stick: the element that way -
+    /// the one the focus names, or else the nearest. See `Ui.navigate` for
+    /// what "nearest" means.
+    up,
+    down,
+    left,
+    right,
+};
+
+/// How a direction held on a pad repeats. See `Ui.holdNavigation`.
+///
+/// In seconds, like everything timed here. A keyboard repeats on its own -
+/// the operating system sends the key again and again, and each one is a
+/// `navigate` - but a pad's d-pad and stick are levels with no repeat of
+/// their own, so this is the keyboard's repeat, made for them.
+pub const Repeat = struct {
+    /// How long a direction has to be held before it starts repeating.
+    delay: f32 = 0.35,
+    /// How often it steps after that. Ply repeats its navigation keys every
+    /// 0.04 seconds, which is a keyboard's rate; a pad walking a menu wants
+    /// to be slower than that, or it overshoots the row the player wanted.
+    interval: f32 = 0.08,
 };
 
 test "the transition table fires just-pressed exactly once" {

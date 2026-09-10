@@ -210,9 +210,96 @@ const Element = struct {
 /// declaration is gone. See `layout.Focus`.
 const Focusing = struct {
     tab_index: ?i16 = null,
+    /// The neighbours it named, hashed while the names were still the
+    /// caller's to lend. See `layout.Focus.up`.
+    up: ?u32 = null,
+    down: ?u32 = null,
+    left: ?u32 = null,
+    right: ?u32 = null,
 
     fn of(asked: layout.Focus) Focusing {
-        return .{ .tab_index = asked.tab_index };
+        return .{
+            .tab_index = asked.tab_index,
+            .up = if (asked.up) |name| identify(name) else null,
+            .down = if (asked.down) |name| identify(name) else null,
+            .left = if (asked.left) |name| identify(name) else null,
+            .right = if (asked.right) |name| identify(name) else null,
+        };
+    }
+
+    /// The neighbour it named that way, if it named one.
+    fn toward(self: Focusing, to: input.Navigation) ?u32 {
+        return switch (to) {
+            .up => self.up,
+            .down => self.down,
+            .left => self.left,
+            .right => self.right,
+            .next, .previous => null,
+        };
+    }
+};
+
+/// Where an element could be brought into view - and so where an arrow key
+/// may go looking for it. See `Ui.stepToward`.
+///
+/// Every clipping ancestor's box cuts it down, the way `Hit.visible` is cut
+/// down, **except along an axis an ancestor scrolls**: anything in there can
+/// be scrolled into that ancestor's window, so along that axis nothing is
+/// out of reach, as long as the window itself can be seen. Without that
+/// exception a pad could never walk further down a list than the rows it
+/// happens to be showing.
+const Reach = struct {
+    left: f32 = -std.math.inf(f32),
+    top: f32 = -std.math.inf(f32),
+    right: f32 = std.math.inf(f32),
+    bottom: f32 = std.math.inf(f32),
+
+    /// Inside out, so that nothing meets it and nothing cut from it is ever
+    /// anything but this again.
+    const nowhere: Reach = .{
+        .left = std.math.inf(f32),
+        .top = std.math.inf(f32),
+        .right = -std.math.inf(f32),
+        .bottom = -std.math.inf(f32),
+    };
+
+    fn of(box: BoundingBox) Reach {
+        return .{ .left = box.x, .top = box.y, .right = box.right(), .bottom = box.bottom() };
+    }
+
+    /// Whether any of a box is inside.
+    fn meets(self: Reach, box: BoundingBox) bool {
+        return box.x < self.right and self.left < box.right() and
+            box.y < self.bottom and self.top < box.bottom();
+    }
+
+    /// What is left of this inside an element that clips like this.
+    fn through(self: Reach, clip: layout.Clip, box: BoundingBox) Reach {
+        if (!clip.clips()) return self;
+
+        var out = self;
+        if (clip.horizontal) {
+            out.left = @max(out.left, box.x);
+            out.right = @min(out.right, box.right());
+        }
+        if (clip.vertical) {
+            out.top = @max(out.top, box.y);
+            out.bottom = @min(out.bottom, box.bottom());
+        }
+
+        if (clip.scrolls()) {
+            // Nothing can be scrolled into a window that cannot be seen.
+            if (!self.meets(box)) return .nowhere;
+            if (clip.scroll_x) {
+                out.left = -std.math.inf(f32);
+                out.right = std.math.inf(f32);
+            }
+            if (clip.scroll_y) {
+                out.top = -std.math.inf(f32);
+                out.bottom = std.math.inf(f32);
+            }
+        }
+        return out;
     }
 };
 
@@ -265,6 +352,9 @@ const Hit = struct {
     /// keyboard is answered between frames too: `navigate` walks the
     /// focusable entries of this list, which are in declaration order.
     focus: ?Focusing,
+    /// Where it could be scrolled into view, which is where an arrow key may
+    /// look for it. See `Reach`.
+    reach: Reach,
 
     /// Whether a point is on this element.
     ///
@@ -563,6 +653,10 @@ activation: input.PointerState = .idle,
 /// What had the focus when that key went down, and so what it goes on
 /// pressing until it comes up. Zero for nothing.
 activated: u32 = 0,
+/// A direction held on a pad, and when it next steps. See `holdNavigation`.
+hold: Hold = .{},
+/// How a held direction repeats. See `setRepeat`.
+repeat: input.Repeat = .{},
 
 /// The elements that are out of the flow, in the order they were declared.
 ///
@@ -3120,6 +3214,19 @@ fn recordHits(self: *Ui) Error!void {
                 outer.visible;
             break :block from_parent;
         };
+        // The same walk, except that a scrolling ancestor cuts nothing off
+        // along the axis it scrolls. See `Reach`.
+        const reach: Reach = if (i == 0)
+            .of(element.box)
+        else if (element.float_visible) |box|
+            .of(box)
+        else if (element.floating != null)
+            .of(.init(0, 0, self.surface.width, self.surface.height))
+        else
+            self.hits.items[parent].reach.through(
+                self.elements.items[parent].clip,
+                self.elements.items[parent].box,
+            );
 
         self.hits.appendAssumeCapacity(.{
             .id = element.id,
@@ -3136,6 +3243,7 @@ fn recordHits(self: *Ui) Error!void {
             .solid = self.solidToPointer(element),
             .cursor = element.cursor,
             .focus = element.focus,
+            .reach = reach,
         });
     }
 }
@@ -3879,16 +3987,76 @@ pub fn isFocused(self: *Ui, name: []const u8) bool {
 /// the same one-frame lag every pointer question here has, and invisible for
 /// the same reason.
 ///
-/// **Says whether the focus moved.** With one focusable element that already
-/// has it, Tab moves nothing and says so.
+/// **The arrows go to the element that way.** The one the focus names, if it
+/// names one - `.focus = .{ .down = "quit" }` - and otherwise the nearest,
+/// found among where things were drawn last frame. See `stepToward` for what
+/// nearest means. With nothing focused, an arrow starts where Tab would.
+///
+/// **Says whether the focus moved**, so a program can have the presses the
+/// interface did not want: `if (!ui.navigate(.left)) previousTab();`. With
+/// one focusable element that already has the focus, Tab moves nothing and
+/// says so, and an arrow with nothing further that way does the same.
 pub fn navigate(self: *Ui, to: input.Navigation) bool {
     const before = self.focus;
     switch (to) {
         .next => self.stepTab(true),
         .previous => self.stepTab(false),
+        .up, .down, .left, .right => self.stepToward(to),
     }
     return self.focus != before;
 }
+
+/// Say which way a pad is held, once a frame, before `begin` - or null when
+/// it is not held at all.
+///
+/// ```zig
+/// ui.holdNavigation(if (pad.down(.dpad_down)) .down else if (pad.down(.dpad_up)) .up else null);
+/// ```
+///
+/// A d-pad or a stick is a level with no repeat of its own, so this makes
+/// one: a step as soon as a direction is pressed, another `Repeat.delay`
+/// later, and one every `Repeat.interval` after that, on the clock `tick`
+/// keeps. Changing direction starts again at once. A keyboard does not need
+/// this - it repeats on its own, and each repeat is a `navigate`.
+///
+/// **Never more than one step a frame**, and a frame that arrives late does
+/// not make up for it with a burst: a hitch in the game is no reason for the
+/// menu to jump three rows. Without `tick` a hold steps once and then waits
+/// for ever, which is the honest answer for a library with no clock.
+pub fn holdNavigation(self: *Ui, held: ?input.Navigation) void {
+    const wanted = held orelse {
+        self.hold.held = null;
+        return;
+    };
+
+    if (self.hold.held == null or self.hold.held.? != wanted) {
+        self.hold = .{ .held = wanted, .next_at = self.now + @as(f64, self.repeat.delay) };
+        _ = self.navigate(wanted);
+        return;
+    }
+
+    if (self.now < self.hold.next_at) return;
+    _ = self.navigate(wanted);
+    // Kept to the schedule rather than to when this frame happened to land,
+    // so the rate is right on average - but a schedule already behind is
+    // started again from now, which is what stops the burst.
+    self.hold.next_at += @as(f64, self.repeat.interval);
+    if (self.hold.next_at <= self.now) self.hold.next_at = self.now + @as(f64, self.repeat.interval);
+}
+
+/// How a direction held with `holdNavigation` repeats. The defaults are a
+/// pad's; see `input.Repeat`.
+pub fn setRepeat(self: *Ui, repeat: input.Repeat) void {
+    self.repeat = repeat;
+}
+
+/// A direction held on a pad, and when it steps next. See `holdNavigation`.
+const Hold = struct {
+    held: ?input.Navigation = null,
+    /// By `Ui.now`: a delay after the press, and an interval after each
+    /// step once it is repeating.
+    next_at: f64 = 0,
+};
 
 /// Say whether the key that presses what has the focus is down: Enter, Space,
 /// a pad's A - whichever the program binds. **Call it once a frame, before
@@ -3984,6 +4152,158 @@ fn focusedHit(self: *Ui) ?usize {
         if (hit.id == self.focus) return i;
     }
     return null;
+}
+
+/// An arrow key: the neighbour the focus names that way, or else the nearest
+/// element that takes the focus that way.
+///
+/// **Nearest** is decided in two rounds, over the boxes as they were drawn:
+///
+///   * Only what is **further that way** counts, by its middle and by its
+///     far edge both - so an element level with the focus is never a step
+///     down, and neither is one that merely hangs below it.
+///   * **The band first.** Of those, the ones that overlap the focus across
+///     the way the arrow points - the same column for up and down, the same
+///     row for left and right - beat everything else, and the smallest gap
+///     between the two boxes wins. A menu therefore always steps to the
+///     button directly below, even when one off to the side is nearer.
+///   * **Then the rest**, only when the band is empty, by the gap plus twice
+///     the distance across: off to the side costs double.
+///   * **Ties** go to the one whose middle is nearer the focus's, and then to
+///     the one declared first, which keeps the answer the same every time.
+///
+/// A band and not a cone, which is what the engine's notes first asked for:
+/// a cone measures from middles, and gets it wrong when the boxes are very
+/// different sizes - the middle of a wide button is far off to one side, and
+/// a narrow one directly under it can fall outside its cone.
+///
+/// Only elements the focus could be brought to are looked at - see `Reach` -
+/// so a row scrolled out of its list is in and one a clip has cut off is not.
+fn stepToward(self: *Ui, to: input.Navigation) void {
+    const at = self.focusedHit() orelse {
+        // Nothing to go from, so start where Tab would.
+        self.stepTab(true);
+        return;
+    };
+    const from = self.hits.items[at];
+
+    if (from.focus) |focus| {
+        if (focus.toward(to)) |named| {
+            for (self.hits.items) |hit| {
+                if (hit.id != named) continue;
+                self.focus = named;
+                return;
+            }
+            // Not on the page last frame, so the search decides after all.
+        }
+    }
+
+    const start: Seen = .of(drawnBox(from), to);
+    var best: ?Candidate = null;
+    for (self.hits.items, 0..) |hit, i| {
+        if (hit.focus == null or hit.id == from.id) continue;
+        const box = drawnBox(hit);
+        if (!hit.reach.meets(box)) continue;
+
+        const seen: Seen = .of(box, to);
+        if (!seen.isAheadOf(start)) continue;
+
+        const candidate: Candidate = .of(seen, start, i);
+        if (best == null or candidate.beats(best.?)) best = candidate;
+    }
+
+    const won = best orelse return;
+    self.focus = self.hits.items[won.index].id;
+}
+
+/// A box seen from the way an arrow points: how far along that way each of
+/// its two edges is, so that further that way is always larger, and where it
+/// sits across. Up and left are down and right with the sign turned over,
+/// which is what lets one search serve all four.
+const Seen = struct {
+    near: f32,
+    far: f32,
+    side_start: f32,
+    side_end: f32,
+
+    fn of(box: BoundingBox, to: input.Navigation) Seen {
+        return switch (to) {
+            .down => .{ .near = box.y, .far = box.bottom(), .side_start = box.x, .side_end = box.right() },
+            .up => .{ .near = -box.bottom(), .far = -box.y, .side_start = box.x, .side_end = box.right() },
+            .right => .{ .near = box.x, .far = box.right(), .side_start = box.y, .side_end = box.bottom() },
+            .left => .{ .near = -box.right(), .far = -box.x, .side_start = box.y, .side_end = box.bottom() },
+            // Tab is not a direction. `stepToward` is only asked about the
+            // four that are.
+            .next, .previous => unreachable,
+        };
+    }
+
+    fn middle(self: Seen) f32 {
+        return (self.near + self.far) / 2;
+    }
+
+    fn sideMiddle(self: Seen) f32 {
+        return (self.side_start + self.side_end) / 2;
+    }
+
+    fn isAheadOf(self: Seen, start: Seen) bool {
+        return self.middle() > start.middle() and self.far > start.far;
+    }
+};
+
+/// One element an arrow could go to, and how good a choice it is. See
+/// `stepToward`.
+const Candidate = struct {
+    /// Zero in the focus's band, one outside it - and every candidate in the
+    /// band beats every one outside.
+    tier: u1,
+    /// The gap along the way the arrow points, plus twice the gap across.
+    distance: f32,
+    /// How far its middle is from the focus's, across the way - for ties.
+    offset: f32,
+    index: usize,
+
+    fn of(seen: Seen, start: Seen, index: usize) Candidate {
+        const overlap = @min(seen.side_end, start.side_end) - @max(seen.side_start, start.side_start);
+        const gap = @max(0, seen.near - start.far);
+        const across = if (overlap > 0) 0 else @max(seen.side_start - start.side_end, start.side_start - seen.side_end);
+        return .{
+            .tier = if (overlap > 0) 0 else 1,
+            .distance = gap + 2 * across,
+            .offset = @abs(seen.sideMiddle() - start.sideMiddle()),
+            .index = index,
+        };
+    }
+
+    /// Strictly better. Equal is not enough, so of two equal candidates the
+    /// one met first - the one declared first - is kept.
+    fn beats(self: Candidate, other: Candidate) bool {
+        if (self.tier != other.tier) return self.tier < other.tier;
+        if (self.distance != other.distance) return self.distance < other.distance;
+        return self.offset < other.offset;
+    }
+};
+
+/// Where a hit was drawn, as an upright box: a turned element's box, turned,
+/// and then the smallest upright box round that. What the arrow keys measure,
+/// because a button is where it looks to be.
+fn drawnBox(hit: Hit) BoundingBox {
+    if (hit.motion.isIdentity()) return hit.box;
+
+    const corners = [4]geometry.Vec2{
+        .{ .x = hit.box.x, .y = hit.box.y },
+        .{ .x = hit.box.right(), .y = hit.box.y },
+        .{ .x = hit.box.x, .y = hit.box.bottom() },
+        .{ .x = hit.box.right(), .y = hit.box.bottom() },
+    };
+    var low = hit.motion.apply(corners[0]);
+    var high = low;
+    for (corners[1..]) |corner| {
+        const turned = hit.motion.apply(corner);
+        low = .{ .x = @min(low.x, turned.x), .y = @min(low.y, turned.y) };
+        high = .{ .x = @max(high.x, turned.x), .y = @max(high.y, turned.y) };
+    }
+    return .init(low.x, low.y, high.x - low.x, high.y - low.y);
 }
 
 // -------------------------------------------------------------------------
@@ -10421,4 +10741,341 @@ test "a press by the key reaches the callbacks, and says where it came up" {
     try watchedButton(&ui, &tally);
     try testing.expectEqual(@as(u32, 2), tally.release);
     try testing.expect(!tally.on_target);
+}
+
+// -- the arrows --
+
+/// A box that takes the focus, put exactly where it is told: floated against
+/// the surface, so nothing in the flow moves it.
+fn placed(u: *Ui, name: []const u8, x: f32, y: f32, width: f32, height: f32, focus: layout.Focus) void {
+    leaf(u, name, .{
+        .width = .fixed(width),
+        .height = .fixed(height),
+        .floating = .{ .attach = .root, .offset = .{ .x = x, .y = y } },
+        .focus = focus,
+    });
+}
+
+/// The picture in the plan, with A further down: F with the focus, A directly
+/// below it, B nearer but off to the side, and C level with F. B is declared
+/// before A, so the order they were declared in cannot be what picks A.
+fn bandFixture(u: *Ui) !void {
+    u.begin(.init(640, 400));
+    openRoot(u);
+    placed(u, "F", 60, 40, 200, 56, .{});
+    placed(u, "C", 300, 40, 140, 56, .{});
+    placed(u, "B", 300, 120, 140, 48, .{});
+    placed(u, "A", 60, 220, 200, 56, .{});
+    u.close();
+    _ = try u.end();
+}
+
+test "down goes to the element in the focus's band, not the nearer one beside it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try bandFixture(&ui);
+
+    // A is 124 below F. B is 24 below and 40 to the side, 104 with the side
+    // counted twice - nearer, even so. Only A shares F's column, and that
+    // comes first.
+    ui.setFocus("F");
+    try testing.expect(ui.navigate(.down));
+    try testing.expect(ui.isFocused("A"));
+
+    try testing.expect(ui.navigate(.up));
+    try testing.expect(ui.isFocused("F"));
+}
+
+test "what is level with the focus is not a step that way" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try bandFixture(&ui);
+
+    // Nothing is above F. C is level with it, and level is not up.
+    ui.setFocus("F");
+    try testing.expect(!ui.navigate(.up));
+    try testing.expect(ui.isFocused("F"));
+
+    // Left and right are up and down turned on their side.
+    try testing.expect(ui.navigate(.right));
+    try testing.expect(ui.isFocused("C"));
+    try testing.expect(ui.navigate(.left));
+    try testing.expect(ui.isFocused("F"));
+}
+
+test "outside the band, the distance across counts twice" {
+    // Neither is under F. P is nearer down and further across, Q the other
+    // way round. Counted evenly P would win, 70 to 110; counted as the search
+    // counts them, Q wins, 120 to 130.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(640, 400));
+    openRoot(&ui);
+    placed(&ui, "F", 200, 0, 100, 40, .{});
+    placed(&ui, "P", 360, 50, 40, 40, .{});
+    placed(&ui, "Q", 310, 140, 40, 40, .{});
+    ui.close();
+    _ = try ui.end();
+
+    ui.setFocus("F");
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("Q"));
+}
+
+test "a tie goes to the one nearer the middle, then to the one declared first" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui, left_x: f32) !void {
+            u.begin(.init(640, 400));
+            openRoot(u);
+            placed(u, "F", 100, 0, 200, 40, .{});
+            // Both in F's column, the same twenty below it.
+            placed(u, "R", 210, 60, 90, 40, .{});
+            placed(u, "L", left_x, 60, 90, 40, .{});
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    // Middles at 145 and 255, each 55 from F's 200: a tie, and R was
+    // declared first.
+    try frame(&ui, 100);
+    ui.setFocus("F");
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("R"));
+
+    // Twenty further in, L is nearer the middle.
+    try frame(&ui, 120);
+    ui.setFocus("F");
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("L"));
+}
+
+test "a named neighbour beats the search, and one not on the page does not" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui, down: []const u8) !void {
+            u.begin(.init(640, 400));
+            openRoot(u);
+            placed(u, "F", 60, 40, 200, 56, .{ .down = down });
+            placed(u, "A", 60, 152, 200, 56, .{});
+            placed(u, "far", 500, 300, 60, 40, .{});
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui, "far");
+    ui.setFocus("F");
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("far"));
+
+    // A name nothing on the page has, so the search decides.
+    try frame(&ui, "missing");
+    ui.setFocus("F");
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("A"));
+}
+
+test "a neighbour's name is read as it is declared, so it may come from a buffer" {
+    // The mistake `Floating.to` used to make, in the other place a
+    // declaration names an element. t1 is directly under b0, so both the
+    // search and a name read too late would pick it; only the name b0 was
+    // given picks t0.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(640, 400));
+    openRoot(&ui);
+    var name: [8]u8 = undefined;
+    for ([_][]const u8{ "b0", "b1" }, 0..) |button, i| {
+        const target = try std.fmt.bufPrint(&name, "t{d}", .{i});
+        placed(&ui, button, @as(f32, @floatFromInt(i)) * 300, 0, 100, 40, .{ .down = target });
+    }
+    placed(&ui, "t1", 0, 100, 100, 40, .{});
+    placed(&ui, "t0", 500, 300, 100, 40, .{});
+    ui.close();
+    _ = try ui.end();
+
+    ui.setFocus("b0");
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("t0"));
+}
+
+test "with nothing focused, an arrow starts where Tab would" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try focusMenu(&ui);
+
+    try testing.expect(ui.navigate(.down));
+    try testing.expect(ui.isFocused("play"));
+    // And from there it is a search like any other, past the spacer.
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("options"));
+}
+
+test "a turned element is found where it was drawn" {
+    // R is tall and thin and turned a quarter round, so it is drawn lying
+    // across F's column fifty below it. Measured by its unturned box it would
+    // be off to the side, and D - seventy below, in the column - would win.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(640, 400));
+    openRoot(&ui);
+    placed(&ui, "F", 0, 0, 200, 40, .{});
+    placed(&ui, "D", 0, 110, 100, 30, .{});
+    leaf(&ui, "R", .{
+        .width = .fixed(20),
+        .height = .fixed(200),
+        .floating = .{ .attach = .root, .offset = .{ .x = 250, .y = 0 } },
+        .rotate = .degrees(90),
+        .focus = .{},
+    });
+    ui.close();
+    _ = try ui.end();
+
+    ui.setFocus("F");
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("R"));
+}
+
+const row_names = [_][]const u8{ "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9" };
+
+/// Ten thirty-pixel rows that take the focus, in a hundred-pixel box that
+/// clips them as it is told to.
+fn rowsIn(u: *Ui, clip: layout.Clip) !void {
+    u.begin(.init(400, 400));
+    openRoot(u);
+    {
+        u.open(.{ .width = .fixed(200), .height = .fixed(100), .direction = .top_to_bottom, .clip = clip });
+        defer u.close();
+        for (row_names) |name| leaf(u, name, .{ .width = .fixed(200), .height = .fixed(30), .focus = .{} });
+    }
+    u.close();
+    _ = try u.end();
+}
+
+test "a row scrolled out of its list can be reached, and one a clip cut off cannot" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Rows at 0, 30, 60, 90 and 120: the window shows three and a third, and
+    // r4 is wholly below it - but it can be scrolled to.
+    try rowsIn(&ui, .scrollY);
+    ui.setFocus("r2");
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("r3"));
+    try testing.expect(ui.navigate(.down));
+    try testing.expect(ui.isFocused("r4"));
+
+    // The same rows in a box that only clips: r3 still shows a little of
+    // itself and r4 nothing at all, so the focus stops at r3.
+    try rowsIn(&ui, .both);
+    ui.setFocus("r2");
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("r3"));
+    try testing.expect(!ui.navigate(.down));
+    try testing.expect(ui.isFocused("r3"));
+}
+
+// -- a held direction --
+
+/// Ten rows down a column, for walking with a held direction.
+fn heldRows(u: *Ui) !void {
+    u.begin(.init(400, 400));
+    u.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+    for (row_names) |name| leaf(u, name, .{ .width = .fixed(200), .height = .fixed(30), .focus = .{} });
+    u.close();
+    _ = try u.end();
+}
+
+/// How many steps down the rows the focus has come, the first row being one.
+fn stepsTaken(ui: *Ui) usize {
+    for (row_names, 1..) |name, steps| {
+        if (ui.isFocused(name)) return steps;
+    }
+    return 0;
+}
+
+test "a held direction steps at once, again after the delay, then every interval" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try heldRows(&ui);
+    // Numbers a float holds exactly, so the frames land on the steps.
+    ui.setRepeat(.{ .delay = 0.5, .interval = 0.25 });
+
+    // Eighth-of-a-second frames: the press, half a second to the first
+    // repeat, and then one every other frame.
+    for ([_]usize{ 1, 1, 1, 1, 2, 2, 3, 3, 4 }) |expected| {
+        ui.tick(0.125);
+        ui.holdNavigation(.down);
+        try testing.expectEqual(expected, stepsTaken(&ui));
+    }
+
+    // Let go and press again: a step at once, however soon.
+    ui.tick(0.125);
+    ui.holdNavigation(null);
+    ui.tick(0.125);
+    ui.holdNavigation(.down);
+    try testing.expectEqual(@as(usize, 5), stepsTaken(&ui));
+
+    // A new direction is a new press.
+    ui.tick(0.125);
+    ui.holdNavigation(.up);
+    try testing.expectEqual(@as(usize, 4), stepsTaken(&ui));
+}
+
+test "a held direction without a clock steps once and waits" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try heldRows(&ui);
+
+    for (0..20) |_| ui.holdNavigation(.down);
+    try testing.expectEqual(@as(usize, 1), stepsTaken(&ui));
+}
+
+test "a late frame takes one step, not a burst" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try heldRows(&ui);
+    ui.setRepeat(.{ .delay = 0.5, .interval = 0.25 });
+
+    ui.tick(0.125);
+    ui.holdNavigation(.down);
+    // A two-second hitch, with half a dozen repeats due by now: one is taken.
+    ui.tick(2);
+    ui.holdNavigation(.down);
+    try testing.expectEqual(@as(usize, 2), stepsTaken(&ui));
+    // And the frame after does not make up the rest.
+    ui.tick(0.125);
+    ui.holdNavigation(.down);
+    try testing.expectEqual(@as(usize, 2), stepsTaken(&ui));
+}
+
+test "the default repeat is twelve steps in a second and a fifth" {
+    // 0.35 seconds to the first repeat and 0.08 between the rest, at sixty
+    // frames a second: steps at 0, 0.35, 0.43 and so on up to 1.15.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 800));
+    ui.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+    for (0..20) |_| ui.empty(.{ .width = .fixed(200), .height = .fixed(30), .background_color = paint, .focus = .{} });
+    ui.close();
+    _ = try ui.end();
+
+    var steps: usize = 0;
+    for (0..72) |_| {
+        const before = ui.focus;
+        ui.tick(1.0 / 60.0);
+        ui.holdNavigation(.down);
+        if (ui.focus != before) steps += 1;
+    }
+    try testing.expectEqual(@as(usize, 12), steps);
 }
