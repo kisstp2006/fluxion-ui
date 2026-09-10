@@ -18,12 +18,16 @@
 //! text - `Ui` has no opinion, and the layout tests in this package use the
 //! last two.
 //!
-//! The list is **already sorted** and already clipped: back to front, scissor
-//! rectangles paired, offscreen elements dropped. A renderer walks it once,
-//! forwards, and never sorts anything.
+//! The list is **already sorted**: back to front, with the scissor rectangles
+//! paired. A renderer walks it once, forwards, and never sorts anything.
+//!
+//! It is **not culled**. An element scrolled out of its list, or placed past
+//! the edge of the surface, still comes out, and the scissor or the edge of
+//! the target is what keeps it off the screen. Dropping those before they get
+//! here is culling, which Ply has and this does not yet.
 //!
 //! ```zig
-//! for (ui.end()) |command| switch (command.config) {
+//! for (try ui.end()) |command| switch (command.config) {
 //!     .rectangle => |r| drawRect(command.bounding_box, r.color, r.corner_radius),
 //!     .border => |b| drawBorder(command.bounding_box, b),
 //!     .scissor_start => pushClip(command.bounding_box),
@@ -71,9 +75,10 @@ pub const Border = struct {
 /// the next `Ui.begin`. A renderer that needs to keep it - to cache a glyph
 /// run, say - copies it.
 ///
-/// Nothing produces this yet. Text needs a font, a font needs a rasteriser,
-/// and the ecosystem has not got one - see the README. The command exists now
-/// so that the seam does not change shape when it arrives.
+/// `Ui.text` and `Ui.markup` produce these, one per line - or one per piece
+/// of a line styled differently from the rest - and so does a text input, for
+/// what it shows. Turning one into glyphs is the renderer's half: the
+/// ready-made one rasterises them with Fluxion Font into an atlas.
 pub const Text = struct {
     text: []const u8,
     color: Color,

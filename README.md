@@ -1093,6 +1093,7 @@ the order it is worth doing in.
 
 | | What it is, and what it needs |
 | --- | --- |
+| **Keyboard navigation** | Tab and Shift+Tab through whatever can take the focus, in an order a `tab_index` can override; the arrow keys moving it to the element each one names, and scrolling where none is named; Enter and Space pressing what has it; a ring drawn round it when the keyboard put it there; and PageUp, PageDown, Home and End scrolling the list under the pointer. Ply hangs all of it off its accessibility config, which is how it went out with accessibility - but in a game it is how a gamepad walks a menu, and none of it needs a screen reader. |
 | **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
 | **TinyVG** | Ply can hand a vector image straight to `.image(...)` and rasterise it. Here a picture is a texture, and turning TinyVG into one is somebody else's pass. |
 | **Shaders and effects** | `.effect(...)` and `.shader(...)`: a fragment shader per element, with Ply's own build step behind it. This renderer is one pipeline and one draw call by design, and a shader per element is a pipeline per element - so this is not a missing feature so much as a different renderer. A program that wants it can consume the command list itself. |
@@ -1189,13 +1190,14 @@ Zig 0.16.0.
 
 ## License
 
-`SPDX-License-Identifier: BSL-1.0`
+`SPDX-License-Identifier: BSD-2-Clause`
 
-[Boost Software License 1.0](LICENSE) - permissive, and short enough to read
-in a minute. The one obligation is that the copyright notice travels with the
-*source*; a binary built from it carries nothing.
+[BSD 2-Clause](LICENSE) - permissive, and short enough to read in a minute.
+The two obligations are that the copyright notice travels with the source,
+and that a binary built from it reproduces the notice in its documentation.
 
 Fluxion libraries are licensed by layer: the foundation is CC0, the engine
-infrastructure this one belongs to is BSL-1.0, and what builds on top of it is
-BSD. [Ply](https://github.com/TheRedDeveloper/ply-engine), which this is a
-port of, is 0BSD and asks for nothing.
+infrastructure is BSL-1.0, and what builds on top of it - this, and
+[Fluxion Font](https://github.com/kisstp2006/fluxion-font) - is BSD.
+[Ply](https://github.com/TheRedDeveloper/ply-engine), which this is a port
+of, is 0BSD and asks for nothing.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 attribute vec2 a_corner : 0;
 attribute vec4 a_rect : 1;
 attribute vec4 a_color : 2;
