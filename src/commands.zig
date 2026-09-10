@@ -137,7 +137,9 @@ pub const RenderCommand = struct {
     bounding_box: BoundingBox,
     config: Config,
     /// Which element this came from, so that a renderer or a debug view can
-    /// point back at it. Stable between frames for an element with an `id`.
+    /// point back at it. Stable between frames for an element with an `id`,
+    /// and for an unnamed one as long as its parent is and nothing unnamed
+    /// appears before it there - see `layout.Declaration.id`.
     id: u32 = 0,
     /// Drawn above lower numbers. The list is already in this order; the
     /// field is here so a renderer can batch by it.

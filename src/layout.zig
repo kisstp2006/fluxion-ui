@@ -247,9 +247,18 @@ pub const LayoutConfig = struct {
 /// then provides builder methods to hide the nesting; a Zig struct literal
 /// with defaults needs neither.
 pub const Declaration = struct {
-    /// A name for this element, so that state - hover, focus, scroll - can
-    /// follow it between frames. Elements without one get a name from their
-    /// position in the tree, which is stable as long as the tree is.
+    /// A name for this element, so that state - hover, focus, scroll, what
+    /// was typed - follows it between frames, wherever it is declared.
+    ///
+    /// Elements without one are numbered by their parent and their place
+    /// among its unnamed children, so something appearing in another part of
+    /// the tree leaves them alone. Another unnamed element appearing *before*
+    /// one in the same parent still renumbers it, and so does its parent
+    /// being renumbered - so anything whose state has to survive that wants a
+    /// name. See `Ui.identifyUnnamed`.
+    ///
+    /// Read as the element is declared, so it may be formatted into a buffer
+    /// that is reused straight afterwards.
     id: ?[]const u8 = null,
 
     width: Sizing = .fit,
@@ -596,7 +605,8 @@ pub const Callback = struct {
     /// What happened. One shape for all five, where Ply has three - the
     /// fields that do not apply are simply the ones nobody reads.
     pub const Event = struct {
-        /// Which element, as `Ui.identify` of its name.
+        /// Which element: its name hashed, as `Ui.identify` does it, or the
+        /// number an unnamed one goes by - see `Declaration.id`.
         id: u32,
         /// Where the pointer was and what its button was doing. The state a
         /// focus change was noticed in, for those two.

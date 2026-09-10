@@ -72,6 +72,10 @@ pub const max_depth = 256;
 /// one is written down so that a name hashes to the same number in every
 /// build, which is what makes a recorded layout comparable between runs.
 const id_seed: u64 = 0xF1D_0000_0001;
+/// And the one unnamed elements are numbered with. A different one, so that
+/// no name can come out as an unnamed element's number by happening to be
+/// the same nine bytes. See `identifyUnnamed`.
+const unnamed_seed: u64 = 0xF1D_0000_0002;
 
 /// What can go wrong that is worth stopping for.
 pub const Error = error{
@@ -206,6 +210,10 @@ const Open = struct {
     /// after that point is one of its children - which is how `close` finds
     /// them in constant time instead of searching.
     pending_at: u32,
+    /// How many unnamed elements, and how many runs of text, have been
+    /// declared directly inside it so far - which is where the next of each
+    /// is numbered from. See `identifyUnnamed`.
+    unnamed: Unnamed.Counts = .{},
 };
 
 /// One element, as something the pointer can land on.
@@ -507,6 +515,9 @@ children: std.ArrayList(u32),
 pending: std.ArrayList(u32),
 /// The elements currently open, innermost last.
 open_stack: std.ArrayList(Open),
+/// What `Open.unnamed` counts, for whatever is declared outside every
+/// element: the root, and anything declared beside it by mistake.
+top_unnamed: Unnamed.Counts = .{},
 
 /// This frame's output.
 output: std.ArrayList(RenderCommand),
@@ -602,10 +613,10 @@ requested_cursor: ?layout.CursorShape = null,
 
 /// What each scroll container was scrolled to, kept between frames.
 ///
-/// The one piece of state in this library that outlives a frame. A layout is
-/// otherwise a pure function of its declaration, and a scroll position cannot
-/// be: it is what the person reading has done to the page, and redeclaring
-/// the page must not undo it.
+/// State that outlives a frame, like what was typed into a field - see
+/// `edits`. A layout is otherwise a pure function of its declaration, and a
+/// scroll position cannot be: it is what the person reading has done to the
+/// page, and redeclaring the page must not undo it.
 scrolls: std.AutoHashMapUnmanaged(u32, Scroll),
 
 /// The text declared this frame. One entry per `text` call.
@@ -746,6 +757,7 @@ pub fn begin(self: *Ui, surface: layout.Surface) void {
     self.safe_area = surface.safe_area;
     self.deferred = null;
     self.requested_cursor = null;
+    self.top_unnamed = .{};
 
     self.elements.clearRetainingCapacity();
     self.floats.clearRetainingCapacity();
@@ -796,12 +808,11 @@ fn innermost(self: *Ui) u32 {
 /// the stored position as the element is configured - and the reason is that
 /// positioning happens long afterwards, by which time the declaration is
 /// gone. The caller writes `.clip = .scrollY` and never touches the offset.
-fn remembered(self: *Ui, declaration: layout.Declaration) layout.Clip {
+fn remembered(self: *Ui, declaration: layout.Declaration, id: u32) layout.Clip {
     var clip = declaration.clip;
     if (!clip.scrolls()) return clip;
 
-    const name = identify(declaration.id, @intCast(self.elements.items.len));
-    if (self.scrolls.get(name)) |scroll| clip.offset = scroll.clamped();
+    if (self.scrolls.get(id)) |scroll| clip.offset = scroll.clamped();
     return clip;
 }
 
@@ -810,7 +821,7 @@ fn remembered(self: *Ui, declaration: layout.Declaration) layout.Clip {
 ///
 /// Named rather than numbered, so a caller asks the way it declared.
 pub fn scrollOf(self: *Ui, name: []const u8) ?Scroll {
-    return self.scrolls.get(identify(name, 0));
+    return self.scrolls.get(identify(name));
 }
 
 /// Move a scroll container by this much, in pixels.
@@ -820,7 +831,7 @@ pub fn scrollOf(self: *Ui, name: []const u8) ?Scroll {
 /// rather than scrolling into nothing. Nudging an element that does not
 /// scroll, or does not exist, does nothing.
 pub fn scrollBy(self: *Ui, name: []const u8, dx: f32, dy: f32) void {
-    const scroll = self.scrolls.getPtr(identify(name, 0)) orelse return;
+    const scroll = self.scrolls.getPtr(identify(name)) orelse return;
     nudge(scroll, dx, dy);
 }
 
@@ -888,7 +899,7 @@ fn nudge(scroll: *Scroll, dx: f32, dy: f32) void {
 /// Put a scroll container at this position, in pixels from the top left of
 /// its content.
 pub fn scrollTo(self: *Ui, name: []const u8, x: f32, y: f32) void {
-    const key = identify(name, 0);
+    const key = identify(name);
     const scroll = self.scrolls.getPtr(key) orelse return;
     scroll.position = .{ .x = x, .y = y };
     scroll.position = scroll.clamped();
@@ -921,15 +932,18 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
     const declaration = raw.scaled(self.scale);
 
     const index: u32 = @intCast(self.elements.items.len);
+    // Worked out once, here, because numbering an unnamed element moves its
+    // parent's count on - asking twice would number it twice.
+    const id = if (declaration.id) |name| identify(name) else self.nextUnnamed(.element);
     try self.elements.append(self.gpa, .{
-        .id = identify(declaration.id, index),
+        .id = id,
         .config = declaration.layout(),
         .background_color = declaration.background_color,
         .corner_radius = declaration.corner_radius,
         .border = declaration.border,
         .z_index = declaration.z_index,
         .slot_fit = declaration.slotFit(),
-        .clip = self.remembered(declaration),
+        .clip = self.remembered(declaration, id),
         .parent = self.innermost(),
         .capture = declaration.capture,
         .preserve_focus = declaration.preserve_focus,
@@ -962,7 +976,7 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
             .declared_in = self.innermost(),
             // Now, while the name is still the caller's to lend. See
             // `Float.target`.
-            .target = if (float.to) |name| identify(name, 0) else null,
+            .target = if (float.to) |name| identify(name) else null,
         });
     } else if (self.open_stack.items.len > 0) {
         try self.pending.append(self.gpa, index);
@@ -1068,7 +1082,7 @@ fn addRun(
         } else .{ .zero, .zero };
 
     try self.elements.append(self.gpa, .{
-        .id = identify(null, index),
+        .id = self.nextUnnamed(.run),
         .config = .{},
         .background_color = .transparent,
         .corner_radius = .sharp,
@@ -3641,17 +3655,17 @@ fn openId(self: *Ui) u32 {
 
 /// Whether the pointer is over this element. Ply's `pointer_over(id)`.
 pub fn isPointerOver(self: *Ui, name: []const u8) bool {
-    return self.isOver(identify(name, 0));
+    return self.isOver(identify(name));
 }
 
 /// Ply's `is_pressed(id)`.
 pub fn isElementPressed(self: *Ui, name: []const u8) bool {
-    return self.pointer.isDown() and self.isHeld(identify(name, 0));
+    return self.pointer.isDown() and self.isHeld(identify(name));
 }
 
 /// Ply's `is_just_released(id)`.
 pub fn isElementReleased(self: *Ui, name: []const u8) bool {
-    const id = identify(name, 0);
+    const id = identify(name);
     return self.pointer.justReleased() and self.isHeld(id) and self.isOver(id);
 }
 
@@ -3753,7 +3767,7 @@ pub fn pointerOver(self: *Ui) []const u32 {
 
 /// Give the keyboard to an element, by name.
 pub fn setFocus(self: *Ui, name: []const u8) void {
-    self.focus = identify(name, 0);
+    self.focus = identify(name);
 }
 
 pub fn clearFocus(self: *Ui) void {
@@ -3762,7 +3776,7 @@ pub fn clearFocus(self: *Ui) void {
 
 /// Whether this element has the keyboard.
 pub fn isFocused(self: *Ui, name: []const u8) bool {
-    return self.focus != 0 and self.focus == identify(name, 0);
+    return self.focus != 0 and self.focus == identify(name);
 }
 
 // -------------------------------------------------------------------------
@@ -3869,7 +3883,7 @@ fn typeTextChecked(self: *Ui, run: []const u8) Error!void {
 /// What a text input holds, or null if there is no such element or it was not
 /// on the page last frame.
 pub fn textValueOf(self: *Ui, name: []const u8) ?[]const u8 {
-    const edit = self.edits.getPtr(identify(name, 0)) orelse return null;
+    const edit = self.edits.getPtr(identify(name)) orelse return null;
     return edit.value();
 }
 
@@ -3878,7 +3892,7 @@ pub fn textValueOf(self: *Ui, name: []const u8) ?[]const u8 {
 /// Does not push an undo: filling a form in is not an edit the reader made,
 /// and letting Ctrl+Z take it back would undo something they never did.
 pub fn setTextValue(self: *Ui, name: []const u8, run: []const u8) void {
-    const edit = self.edits.getPtr(identify(name, 0)) orelse return;
+    const edit = self.edits.getPtr(identify(name)) orelse return;
     edit.setValue(self.gpa, run) catch |err| self.remember(err);
     edit.active = true;
 }
@@ -3886,20 +3900,20 @@ pub fn setTextValue(self: *Ui, name: []const u8, run: []const u8) void {
 /// Whether the text changed this frame - a key, a paste, an undo. What an
 /// `on_changed` callback would be told, asked for instead.
 pub fn textChanged(self: *Ui, name: []const u8) bool {
-    const edit = self.edits.getPtr(identify(name, 0)) orelse return false;
+    const edit = self.edits.getPtr(identify(name)) orelse return false;
     return edit.changed_this_frame;
 }
 
 /// Whether Enter was pressed in this input this frame. Ply's `on_submit`.
 pub fn textSubmitted(self: *Ui, name: []const u8) bool {
-    const edit = self.edits.getPtr(identify(name, 0)) orelse return false;
+    const edit = self.edits.getPtr(identify(name)) orelse return false;
     return edit.submitted_this_frame;
 }
 
 /// Everything one text input remembers, for a caller that wants the cursor or
 /// the selection rather than only the text.
 pub fn editOf(self: *Ui, name: []const u8) ?*text_input.TextEdit {
-    return self.edits.getPtr(identify(name, 0));
+    return self.edits.getPtr(identify(name));
 }
 
 /// Forget the inputs that were not declared this frame.
@@ -3938,19 +3952,89 @@ inline fn childrenOf(self: *Ui, element: Element) []const u32 {
     return self.children.items[element.children_start..][0..element.children_length];
 }
 
-/// A number for an element, stable between frames.
+/// The number a named element goes by: its name, hashed.
 ///
-/// A named element hashes its name, so it keeps the same number wherever it
-/// moves in the tree - which is what will let hover, focus and scroll follow
-/// it. An unnamed one takes its position in the declaration order, which is
-/// stable as long as the shape of the tree is.
+/// The same wherever the element is declared, so hover, focus, a scroll
+/// position and what was typed all follow a named element about the tree -
+/// and a caller can ask about it by name from anywhere, which is all
+/// `scrollOf`, `boxOf` and the rest do.
 ///
 /// [Fluxion Hash](https://github.com/kisstp2006/fluxion-hash) is where this
-/// belongs once state has to survive between frames. Until then a hash from
-/// the standard library is one fewer dependency to pin.
-fn identify(name: ?[]const u8, index: u32) u32 {
-    const label = name orelse return index +% 1;
-    return @truncate(std.hash.Wyhash.hash(id_seed, label));
+/// belongs, now that state survives between frames. Until it is pinned here,
+/// a hash from the standard library is one fewer dependency.
+fn identify(name: []const u8) u32 {
+    return @truncate(std.hash.Wyhash.hash(id_seed, name));
+}
+
+/// What an unnamed number is being made for.
+///
+/// Elements and runs of text are counted apart, because text comes and goes
+/// far more often than the boxes round it - a warning under a heading, a count
+/// beside a title - and a label appearing must not renumber the list or the
+/// field next to it.
+const Unnamed = enum(u8) {
+    element,
+    run,
+
+    /// How many of each have been numbered inside one parent so far.
+    const Counts = struct {
+        element: u32 = 0,
+        run: u32 = 0,
+
+        /// The next place for this kind, with the count moved on past it.
+        fn take(self: *Counts, kind: Unnamed) u32 {
+            const count = switch (kind) {
+                .element => &self.element,
+                .run => &self.run,
+            };
+            const place = count.*;
+            count.* += 1;
+            return place;
+        }
+    };
+};
+
+/// The number for the next unnamed element or run declared in whatever is
+/// open. See `identifyUnnamed`.
+fn nextUnnamed(self: *Ui, kind: Unnamed) u32 {
+    if (self.open_stack.items.len == 0) {
+        // The root, and anything declared beside it by mistake. Nothing is
+        // their parent, so zero stands in for one.
+        return identifyUnnamed(0, kind, self.top_unnamed.take(kind));
+    }
+    const frame = &self.open_stack.items[self.open_stack.items.len - 1];
+    return identifyUnnamed(self.elements.items[frame.element].id, kind, frame.unnamed.take(kind));
+}
+
+/// The number an unnamed element goes by: its parent's number, and which of
+/// the parent's unnamed children it is.
+///
+/// **Relative to the parent, not to the whole tree**, and that is the fix for
+/// a bug worth the paragraph. Unnamed elements used to be numbered by where
+/// they came in the whole declaration, so anything appearing *anywhere*
+/// before one - a badge in the header, a menu opening - renumbered it and
+/// everything after it. A list below forgot where it was scrolled to, a field
+/// forgot what had been typed into it, and the keyboard went to whatever had
+/// taken the field's old number. Numbered like this, a change in one branch
+/// leaves every other branch alone.
+///
+/// It is the scheme Clay and Ply use, less two ways of being renumbered that
+/// theirs keeps: only unnamed siblings are counted, so a named one coming and
+/// going does not move the rest, and runs of text are counted apart from
+/// elements - see `Unnamed`. What still renumbers an unnamed element is an
+/// unnamed sibling of its own kind appearing before it, or its parent being
+/// renumbered; anything whose state has to survive that wants a name.
+///
+/// A hash, so two elements can in principle share a number. Those are the
+/// odds Clay and Ply run at too, and in thirty-two bits they are small.
+fn identifyUnnamed(parent: u32, kind: Unnamed, place: u32) u32 {
+    // Little-endian whatever the machine, so the number is the same in every
+    // build - see `id_seed`.
+    var key: [9]u8 = undefined;
+    std.mem.writeInt(u32, key[0..4], parent, .little);
+    key[4] = @intFromEnum(kind);
+    std.mem.writeInt(u32, key[5..9], place, .little);
+    return @truncate(std.hash.Wyhash.hash(unnamed_seed, &key));
 }
 
 /// The commands this frame produced, wrapped so they can be asked questions.
@@ -3967,7 +4051,7 @@ pub fn list(self: *Ui) commands.List {
 /// caller asking where the body pane went should not have to give it a colour
 /// to find out.
 pub fn boxOf(self: *Ui, name: []const u8) ?BoundingBox {
-    const wanted = identify(name, 0);
+    const wanted = identify(name);
     for (self.elements.items) |element| {
         if (element.id == wanted) return element.box;
     }
@@ -4341,9 +4425,9 @@ test "the command list comes out back to front" {
     try testing.expectEqual(commands.Config.rectangle, std.meta.activeTag(drawn[1].config));
     try testing.expectEqual(commands.Config.border, std.meta.activeTag(drawn[2].config));
 
-    try testing.expectEqual(identify("parent", 0), drawn[0].id);
-    try testing.expectEqual(identify("child", 0), drawn[1].id);
-    try testing.expectEqual(identify("parent", 0), drawn[2].id);
+    try testing.expectEqual(identify("parent"), drawn[0].id);
+    try testing.expectEqual(identify("child"), drawn[1].id);
+    try testing.expectEqual(identify("parent"), drawn[2].id);
 }
 
 test "an element that paints nothing is still laid out" {
@@ -4439,9 +4523,183 @@ test "an empty frame is a frame, and produces nothing" {
 }
 
 test "a named element keeps its number wherever it moves" {
-    // Which is what will let hover and focus follow it between frames.
-    try testing.expectEqual(identify("save-button", 0), identify("save-button", 99));
-    try testing.expect(identify("save", 0) != identify("load", 0));
+    // Which is what lets hover, focus and scroll follow it between frames.
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    {
+        ui.open(.{ .width = .grow, .height = .grow });
+        defer ui.close();
+        leaf(&ui, "save", .{ .width = .fixed(10), .height = .fixed(10) });
+    }
+    const alone = (try ui.end())[0].id;
+
+    // A level further down, and after a sibling.
+    ui.begin(.init(800, 600));
+    {
+        ui.open(.{ .width = .grow, .height = .grow });
+        defer ui.close();
+        ui.open(.{});
+        defer ui.close();
+        leaf(&ui, "load", .{ .width = .fixed(10), .height = .fixed(10) });
+        leaf(&ui, "save", .{ .width = .fixed(10), .height = .fixed(10) });
+    }
+    const moved = try ui.end();
+
+    try testing.expectEqual(alone, moved[1].id);
+    try testing.expect(moved[0].id != moved[1].id);
+}
+
+// -------------------------------------------------------------------------
+// Unnamed elements
+// -------------------------------------------------------------------------
+//
+// An unnamed element is numbered by its parent and its place among the
+// parent's unnamed children - see `identifyUnnamed`. Each of these was a bug
+// while they were numbered by where they came in the whole declaration: a
+// badge appearing in a header took the number of whatever came after it.
+
+/// A page with a header and an unnamed list of ten fifty-pixel rows, a
+/// hundred tall and starting at y 20. With `badge`, the header holds one more
+/// unnamed element - in another branch of the tree from the list.
+fn pageWithList(u: *Ui, badge: bool) ![]const commands.RenderCommand {
+    u.begin(.init(400, 400));
+    u.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+    {
+        u.open(.{ .width = .grow, .height = .fixed(20) });
+        defer u.close();
+        if (badge) u.empty(.{ .width = .fixed(10), .height = .fixed(10), .background_color = .hex(0xFF0000) });
+    }
+    {
+        u.open(.{ .width = .fixed(100), .height = .fixed(100), .direction = .top_to_bottom, .clip = .scrollY });
+        defer u.close();
+        for (0..10) |_| u.empty(.{ .width = .fixed(100), .height = .fixed(50), .background_color = paint });
+    }
+    u.close();
+    return try u.end();
+}
+
+test "an unnamed list keeps its place when something appears in another branch" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    _ = try pageWithList(&ui, false);
+    ui.setPointer(50, 60, false);
+    try testing.expect(ui.scrollHovered(0, 120));
+
+    // The first row has gone up out of the list, which starts at 20.
+    const scrolled = try pageWithList(&ui, false);
+    try testing.expectEqual(@as(f32, 20 - 120), rectangleIn(scrolled, paint).?.y);
+
+    // A badge in the header, and the list is where it was left.
+    const badged = try pageWithList(&ui, true);
+    try testing.expectEqual(@as(f32, 20 - 120), rectangleIn(badged, paint).?.y);
+}
+
+/// The same page with an unnamed text input where the list was.
+fn pageWithField(u: *Ui, badge: bool) ![]const commands.RenderCommand {
+    u.begin(.init(400, 400));
+    u.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+    {
+        u.open(.{ .width = .grow, .height = .fixed(20) });
+        defer u.close();
+        if (badge) u.empty(.{ .width = .fixed(10), .height = .fixed(10), .background_color = .hex(0xFF0000) });
+    }
+    u.textInput(.{ .width = .fixed(200), .height = .fixed(20) }, .{ .placeholder = "empty" });
+    u.close();
+    return try u.end();
+}
+
+test "an unnamed input keeps what was typed, and the keyboard, when something appears in another branch" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try pageWithField(&ui, false);
+    ui.setPointer(20, 30, true);
+    _ = try pageWithField(&ui, false);
+    ui.setPointer(20, 30, false);
+    ui.typeText("hello");
+    try testing.expect(ui.wantsKeyboard());
+
+    // The field's old number went to the badge, and with it the text and the
+    // focus - so the badge had the keyboard and the field showed "empty".
+    var seen: [8][]const u8 = undefined;
+    const badged = try pageWithField(&ui, true);
+    try testing.expectEqualStrings("hello", drawnText(badged, &seen)[0]);
+    try testing.expect(ui.wantsKeyboard());
+}
+
+test "a label coming and going beside an unnamed list does not renumber it" {
+    // Runs of text are counted apart from elements, because a label is the
+    // thing most likely to come and go - and in the same parent, not in
+    // another branch, so this is the case numbering by parent alone misses.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const panel = struct {
+        fn run(u: *Ui, warning: bool) ![]const commands.RenderCommand {
+            u.begin(.init(400, 400));
+            u.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+            u.text("Inventory", sixteen);
+            if (warning) u.text("Too heavy", sixteen);
+            {
+                u.open(.{ .width = .fixed(100), .height = .fixed(100), .direction = .top_to_bottom, .clip = .scrollY });
+                defer u.close();
+                for (0..10) |_| u.empty(.{ .width = .fixed(100), .height = .fixed(50), .background_color = paint });
+            }
+            u.close();
+            return try u.end();
+        }
+    }.run;
+
+    _ = try panel(&ui, false);
+    ui.setPointer(50, 50, false);
+    try testing.expect(ui.scrollHovered(0, 120));
+    const before = rectangleIn(try panel(&ui, false), paint).?.y;
+
+    // The warning pushes the list down a line, and it is still scrolled by
+    // the same amount.
+    const after = rectangleIn(try panel(&ui, true), paint).?.y;
+    try testing.expectEqual(before + 16, after);
+}
+
+test "unnamed siblings are told apart" {
+    // The count has to move on, or two lists side by side would be one list
+    // twice, and scrolling either would scroll both.
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    const lists = struct {
+        fn run(u: *Ui) ![]const commands.RenderCommand {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            for (0..2) |_| {
+                u.open(.{ .width = .fixed(100), .height = .fixed(100), .direction = .top_to_bottom, .clip = .scrollY });
+                defer u.close();
+                for (0..10) |_| u.empty(.{ .width = .fixed(100), .height = .fixed(50), .background_color = paint });
+            }
+            u.close();
+            return try u.end();
+        }
+    }.run;
+
+    _ = try lists(&ui);
+    ui.setPointer(150, 50, false);
+    try testing.expect(ui.scrollHovered(0, 40));
+    const drawn = try lists(&ui);
+
+    // The first row of each: the left list's where it started, the right
+    // one's forty up.
+    var left: ?f32 = null;
+    var right: ?f32 = null;
+    for (drawn) |command| {
+        if (command.config != .rectangle) continue;
+        const first = if (command.bounding_box.x < 100) &left else &right;
+        if (first.* == null) first.* = command.bounding_box.y;
+    }
+    try testing.expectEqual(@as(f32, 0), left.?);
+    try testing.expectEqual(@as(f32, -40), right.?);
 }
 
 // -------------------------------------------------------------------------
@@ -5444,7 +5702,7 @@ test "the pointer finds the element under it, and its ancestors with it" {
 
     // Outermost first.
     const chain = ui.pointerOver();
-    try testing.expectEqual(identify("button", 0), chain[chain.len - 1]);
+    try testing.expectEqual(identify("button"), chain[chain.len - 1]);
 }
 
 test "the pointer somewhere else finds nothing of ours" {
@@ -5933,7 +6191,7 @@ test "the copies are thrown away and the buffer reused each frame" {
 /// The bar a container drew on one axis, as the record the pointer is
 /// answered from has it.
 fn barIn(ui: *Ui, name: []const u8, vertical: bool) ?Bar {
-    return ui.barOf(identify(name, 0), vertical);
+    return ui.barOf(identify(name), vertical);
 }
 
 /// Whether a rectangle really was emitted at this box - the record above says
@@ -6784,7 +7042,7 @@ test "a text input can have a scrollbar, and it is dragged like any other" {
     // Ninety-six pixels of lines in a sixty pixel box: there is something to
     // scroll, so there is a bar, and it belongs to the field rather than to a
     // scroll container that does not exist.
-    const bar = ui.barOf(identify("notes", 0), true).?;
+    const bar = ui.barOf(identify("notes"), true).?;
     try testing.expect(bar.field);
     try testing.expectEqual(@as(f32, 36), bar.max_scroll);
     try testing.expect(bar.thumb_travel > 0);
@@ -7304,7 +7562,7 @@ test "a floating element is drawn over the page, whatever order it was declared 
     for (drawn) |command| {
         if (std.meta.activeTag(command.config) == .rectangle) last = command.id;
     }
-    try testing.expectEqual(identify("over", 0), last);
+    try testing.expectEqual(identify("over"), last);
 }
 
 test "the pointer finds a floating element before what is under it" {
@@ -7945,7 +8203,7 @@ test "an image inside a clip is clipped like anything else" {
 
 /// The transform stamped on the first command belonging to this element.
 fn motionIn(drawn: []const commands.RenderCommand, name: []const u8) ?geometry.Transform {
-    const wanted = identify(name, 0);
+    const wanted = identify(name);
     for (drawn) |command| {
         if (command.id == wanted) return command.transform;
     }
@@ -8287,7 +8545,7 @@ test "a press and a release reach the element that was pressed" {
     ui.setPointer(50, 20, true);
     try watchedButton(&ui, &tally);
     try testing.expectEqual(@as(u32, 1), tally.press);
-    try testing.expectEqual(identify("button", 0), tally.last);
+    try testing.expectEqual(identify("button"), tally.last);
 
     // Held: pressed does not fire again, which is what "once" means.
     ui.setPointer(50, 20, true);
@@ -8407,7 +8665,7 @@ test "a callback is only called about its own element" {
 
     try testing.expectEqual(@as(u32, 0), mine.press);
     try testing.expectEqual(@as(u32, 1), theirs.press);
-    try testing.expectEqual(identify("second", 0), theirs.last);
+    try testing.expectEqual(identify("second"), theirs.last);
 }
 
 test "an element with no callbacks costs nothing to walk past" {
@@ -8717,12 +8975,12 @@ test "a coast is stopped by a wheel, and by being told where to go" {
     defer ui.deinit();
 
     try scroller(&ui, .scrollY);
-    ui.scrolls.getPtr(identify("list", 0)).?.momentum.y = 500;
+    ui.scrolls.getPtr(identify("list")).?.momentum.y = 500;
 
     ui.scrollBy("list", 0, 10);
     try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.momentum.y);
 
-    ui.scrolls.getPtr(identify("list", 0)).?.momentum.y = 500;
+    ui.scrolls.getPtr(identify("list")).?.momentum.y = 500;
     ui.scrollTo("list", 0, 50);
     try testing.expectEqual(@as(f32, 0), ui.scrollOf("list").?.momentum.y);
 }
@@ -8927,7 +9185,7 @@ test "the wheel stops a coast" {
     try twoLists(&ui);
     ui.setPointer(50, 50, false);
     try twoLists(&ui);
-    ui.scrolls.getPtr(identify("left", 0)).?.momentum.y = 500;
+    ui.scrolls.getPtr(identify("left")).?.momentum.y = 500;
 
     _ = ui.scrollHovered(0, 10);
     try testing.expectEqual(@as(f32, 0), ui.scrollOf("left").?.momentum.y);

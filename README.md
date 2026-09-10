@@ -350,6 +350,24 @@ draggable panel wants it, so dragging the knob does not also drag the panel.
 `.preserve_focus = true` leaves the keyboard where it is, for a toolbar button
 that should not take the caret out of the field beside it.
 
+### Which element is which
+
+Everything that outlives a frame - hover, a press, the focus, a scroll
+position, what was typed - is kept against a number, and the number is how an
+element is recognised in the next frame.
+
+**A named element is its name**, hashed, wherever it is declared: move it or
+wrap it in another box, and everything it had follows it. That is also what
+lets `isPointerOver("save")` be asked from anywhere.
+
+**An unnamed one is its parent and its place** among the parent's unnamed
+children - the scheme Clay and Ply use, except that only unnamed children are
+counted, and runs of text apart from elements. So a badge appearing in the
+header, a menu opening or a warning over a list leaves the rest of the page
+alone. What does renumber one is another unnamed element appearing before it
+in the same parent, or its parent being renumbered; anything whose state has
+to survive that wants a name.
+
 ### What the pointer looks like
 
 ```zig
@@ -430,11 +448,12 @@ refuse to overflow:
 
 All three are Ply's, and each has a test that fails without it.
 
-The scroll position is **the one piece of state that outlives a frame**. A
-layout is otherwise a pure function of its declaration and a scroll position
-cannot be: it is what the reader has done to the page, and redeclaring the
-page must not undo it. It is remembered per element, clamped when each frame
-ends - so a container whose content shrank is self-correcting - and forgotten
+The scroll position is **state that outlives a frame**, like what is typed
+into a field. A layout is otherwise a pure function of its declaration and a
+scroll position cannot be: it is what the reader has done to the page, and
+redeclaring the page must not undo it. It is remembered per element - see
+[which element is which](#which-element-is-which) - clamped when each frame
+ends, so a container whose content shrank is self-correcting, and forgotten
 when the element stops being declared.
 
 Positive means the content has moved **up and left**, so a list scrolled to
