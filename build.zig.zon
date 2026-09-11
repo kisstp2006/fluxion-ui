@@ -27,8 +27,8 @@
         // same reason: the library's own output is a command list, and a
         // program with its own renderer never fetches this.
         .fluxion_rhi = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-rhi#8bffcb079cefdceeb83dccdb9e03370ab53ba605",
-            .hash = "fluxion_rhi-0.1.0--pvwD2-HAwCbfON8RllHgO5xF9QpllujHVG4tHb2XYTG",
+            .url = "git+https://github.com/kisstp2006/fluxion-rhi#7c1df5db874d74c754e53cd93848b0cd3bdf4cd7",
+            .hash = "fluxion_rhi-0.1.0--pvwD_GzBAD2E4V-etlt_-GUfngq0Mhy6-L-B7NLd4uW",
             .lazy = true,
         },
 
@@ -37,16 +37,16 @@
         // for the same reason. Without it the same shader would be in this
         // repository twice, in two languages, drifting apart.
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#98c2a25a4d1cae45d3feaf0fc7effe6db6e2c61e",
-            .hash = "fluxion_shader-0.1.0-FqFMErVpAwDOsVWqOKytrOQPuP3ZMqIlRPC7Q1ZCfIXp",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#f86db608c8cf2247fb739e32b054e6b41fca3273",
+            .hash = "fluxion_shader-0.1.0-FqFMEmaMAwA0wYgi2ulZW4oKDds1fvXP623VqQTQ8fGk",
             .lazy = true,
         },
 
         // The window one example opens. Lazy, and the library imports it
         // nowhere: a layout engine has no business opening windows.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#373505b40d7d5d20840adba8485cc3bf707ce4ce",
-            .hash = "fluxion_platform-0.1.0-WsOjUVkbDADvAs9Vhe9Wbgw8FROUEtsQIVRwAiLuonq5",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#9ee5f1357cb6bc3e7b9b5323826e4e8957009e79",
+            .hash = "fluxion_platform-0.1.0-WsOjUWHDDwDCjU4rmewIqMFLVQEOj7pQ-NfBLPZ_5B9t",
             .lazy = true,
         },
     },
