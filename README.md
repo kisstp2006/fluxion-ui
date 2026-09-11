@@ -1022,7 +1022,11 @@ _ = ui.textAction(.{ .paste = clipboard.get() });
 Ctrl against Cmd, key repeat, dead keys and the layout the reader actually has
 are all decisions a program makes and a layout library cannot. What is ported
 is everything after that decision, which is where the behaviour lives.
-`examples/window.zig` has the whole binding, and it is thirty lines.
+`examples/window.zig` has the whole binding, in about forty lines: the arrows
+and the deletions by where the key is, the letters by the virtual key
+fluxion-platform names them with - Ctrl+Z is the Z the reader can see, which
+on a German or Hungarian keyboard is where a US one has Y - and AltGr, which
+Windows reports as Ctrl and Alt together, not taken for Ctrl.
 
 **Home and End are decided here, not by the caller.** `.start` and `.end` mean
 the line in a multiline input and the whole text in a single-line one, so one

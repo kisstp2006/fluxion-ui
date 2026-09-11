@@ -419,28 +419,44 @@ fn arrow(k: platform.event.KeyEvent) ?ui.Navigation {
 /// all decisions a program makes and a layout library cannot.
 fn editing(k: platform.event.KeyEvent) ?ui.text_input.Action {
     const shift = k.mods.shift;
-    const ctrl = k.mods.control;
+    const ctrl = command(k);
 
-    return switch (k.key) {
-        .left => .moveTo(if (ctrl) .word_left else .left, shift),
-        .right => .moveTo(if (ctrl) .word_right else .right, shift),
-        .up => .moveTo(.up, shift),
-        .down => .moveTo(.down, shift),
+    // The keys no layout moves, by where they are.
+    switch (k.key) {
+        .left => return .moveTo(if (ctrl) .word_left else .left, shift),
+        .right => return .moveTo(if (ctrl) .word_right else .right, shift),
+        .up => return .moveTo(.up, shift),
+        .down => return .moveTo(.down, shift),
         // Home and End are the line in a multiline input and the whole text
         // in a single-line one, and the library decides which - so the same
         // binding is right for both. Ctrl reaches past the line either way.
-        .home => .moveTo(if (ctrl) .text_start else .start, shift),
-        .end => .moveTo(if (ctrl) .text_end else .end, shift),
-        .backspace => if (ctrl) .backspace_word else .backspace,
-        .delete => if (ctrl) .delete_word else .delete,
-        .enter, .kp_enter => .submit,
-        .a => if (ctrl) .select_all else null,
-        .c => if (ctrl) .copy else null,
-        .x => if (ctrl) .cut else null,
-        .z => if (ctrl) (if (shift) .redo else .undo) else null,
-        .y => if (ctrl) .redo else null,
+        .home => return .moveTo(if (ctrl) .text_start else .start, shift),
+        .end => return .moveTo(if (ctrl) .text_end else .end, shift),
+        .backspace => return if (ctrl) .backspace_word else .backspace,
+        .delete => return if (ctrl) .delete_word else .delete,
+        .enter, .kp_enter => return .submit,
+        else => {},
+    }
+
+    // The letters by the name the layout gives them: ctrl+Z is the Z the
+    // reader can see, which on a German or Hungarian keyboard is where a US
+    // one has Y.
+    if (!ctrl) return null;
+    return switch (k.virtual) {
+        .a => .select_all,
+        .c => .copy,
+        .x => .cut,
+        .z => if (shift) .redo else .undo,
+        .y => .redo,
         else => null,
     };
+}
+
+/// Whether control is held as a command: control, and not AltGr, which
+/// Windows reports as control and alt together and which types characters -
+/// `@` on a Hungarian keyboard is AltGr and V - rather than giving commands.
+fn command(k: platform.event.KeyEvent) bool {
+    return k.mods.control and !k.mods.alt;
 }
 
 /// A sheet of two pictures, drawn here rather than loaded from a file.
@@ -866,7 +882,7 @@ pub fn main(init: std.process.Init) !void {
                     clipped_len = @min(taken.len, clipboard.len);
                     @memcpy(clipboard[0..clipped_len], taken[0..clipped_len]);
                 }
-            } else if (k.key == .v and k.mods.control) {
+            } else if (k.virtual == .v and command(k)) {
                 _ = layout.textAction(.{ .paste = clipboard[0..clipped_len] });
             },
         };
@@ -1431,4 +1447,28 @@ test "an interface can be drawn on top of a frame rather than instead of it" {
     // the second pass had cleared.
     try testing.expect(channel(pixels, 100, 100, 0) > 200);
     try testing.expectApproxEqAbs(128, @as(f32, @floatFromInt(channel(pixels, 100, 100, 1))), 12);
+}
+
+test "a shortcut is the letter the layout puts on the key, and AltGr is none" {
+    const pressed = struct {
+        fn key(physical: platform.Key, virtual: platform.Key, mods: platform.Mods) platform.event.KeyEvent {
+            return .{
+                .window = .none,
+                .key = physical,
+                .virtual = virtual,
+                .scancode = @enumFromInt(0),
+                .action = .press,
+                .mods = mods,
+            };
+        }
+    }.key;
+
+    // A Hungarian keyboard: Z is the key where US has Y, and Y the other way
+    // round. Undo and redo follow the letters, not the places.
+    try testing.expectEqual(ui.text_input.Action.undo, editing(pressed(.y, .z, .{ .control = true })).?);
+    try testing.expectEqual(ui.text_input.Action.redo, editing(pressed(.z, .y, .{ .control = true })).?);
+    // AltGr and Y types `>` there; control and alt together are not a command.
+    try testing.expectEqual(@as(?ui.text_input.Action, null), editing(pressed(.z, .y, .{ .control = true, .alt = true })));
+    // The arrows are where they are on every layout.
+    try testing.expectEqual(ui.text_input.Action.moveTo(.left, false), editing(pressed(.left, .left, .none)).?);
 }
