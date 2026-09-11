@@ -1117,6 +1117,15 @@ zig build example-window                     # OpenGL
 zig build example-window -- --backend d3d11  # Direct3D 11
 ```
 
+**The third backend is a browser's.** Built for `wasm32-freestanding`,
+fluxion-rhi draws through WebGL 2 on the page's canvas, and the renderer hands
+it the same shader again, as GLSL ES 3.00 - fluxion-shader writes all three
+languages from the one source. Off wasm the WebGL backend runs against
+fluxion-webgl's stub, which compiles anything and draws nothing, so the test
+for it checks the one thing a machine without a browser can: that WebGL is
+given a shader in a language it reads. Without one the renderer is refused at
+`init`, and the page stays blank.
+
 ## Colour
 
 Four floats from zero to one, which is what a GPU takes. Ply keeps the same
@@ -1255,6 +1264,12 @@ a frame into a texture and read the pixels back - because a shader that does
 not compile, an attribute at the wrong offset and a viewport the wrong way up
 all pass everything else and produce a blank window. On a machine with no
 display they skip.
+
+The renderer is built for `wasm32-freestanding` as well, where fluxion-rhi
+draws through WebGL. That build is compiled and never run - there is no page
+to run it in - because none of the tests see that target, and a call with
+nowhere to go in a browser, the way `std.debug.print` has none, is only found
+by compiling for one.
 
 The layout tests are layouts with known right answers, checked against the boxes that
 came out - which is the only way to test a layout engine, because an

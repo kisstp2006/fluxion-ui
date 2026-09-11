@@ -173,23 +173,28 @@ pub const Renderer = struct {
         const sampler = try device.createSampler(.linear);
         errdefer device.destroySampler(sampler);
 
-        // One source, both languages. Compiling it here rather than
-        // shipping two hand-written translations is what stops the same
-        // shader existing twice in this repository and drifting apart.
+        // One source, every backend's language: GLSL for OpenGL, GLSL ES
+        // for WebGL and HLSL for Direct3D. Compiling it here rather than
+        // shipping hand-written translations is what stops the same shader
+        // existing three times in this repository and drifting apart.
         var log: std.Io.Writer.Allocating = .init(gpa);
         defer log.deinit();
 
         var module = shader_mod.compile(gpa, shader_source, &log.writer) catch |err| {
-            // Printed rather than swallowed: the alternative to a message
+            // Logged rather than swallowed: the alternative to a message
             // with a line and a caret under it is a blank window, and a
             // blank window is the hardest thing in graphics to look at.
-            std.debug.print("fluxion-ui shader:\n{s}\n", .{log.written()});
+            // Through `std.log` rather than `std.debug.print`, which has
+            // nowhere to print in a browser and does not compile for one;
+            // a program there points `std.log` at the console.
+            std.log.err("fluxion-ui shader:\n{s}", .{log.written()});
             return err;
         };
         defer module.deinit();
 
         const shader = try device.createShader(.{
             .glsl = .{ .vertex = module.glsl.vertex, .fragment = module.glsl.fragment },
+            .glsl_es = .{ .vertex = module.glsl_es.vertex, .fragment = module.glsl_es.fragment },
             .hlsl = .{ .vertex = module.hlsl.vertex, .fragment = module.hlsl.fragment },
             .label = "fluxion-ui",
         });
@@ -776,7 +781,7 @@ fn intersect(current: ?rhi.types.Rect, box: ui.BoundingBox, size: ui.Dimensions)
 // Shaders
 // -------------------------------------------------------------------------
 
-/// The one shader, in the one language, that both backends are compiled from.
+/// The one shader, in the one language, that every backend is compiled from.
 ///
 /// What it draws is a signed distance to a rounded box - negative inside,
 /// positive outside, and the value in pixels, so `0.5 - d` clamped to zero
@@ -1094,6 +1099,46 @@ test "the whole thing runs end to end against a device that draws nothing" {
     // the title that has ink.
     try testing.expect(fixture.renderer.instances.items.len > 5);
     try testing.expect(fixture.renderer.atlas.count() > 0);
+}
+
+test "the WebGL backend is handed the shader in its own language" {
+    // Off wasm, fluxion-rhi's WebGL backend runs against fluxion-webgl's
+    // stub, which compiles anything and draws nothing - so this is not about
+    // the picture. It is about the one thing that decides between a picture
+    // and a blank canvas before a browser is ever opened: WebGL reads GLSL
+    // ES and nothing else, and a renderer that hands over only GLSL and HLSL
+    // is refused at `init`.
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    var device: rhi.Device = try .init(testing.allocator, .{ .backend = .webgl });
+    defer device.deinit();
+    try testing.expectEqual(rhi.Backend.webgl, device.backendTag());
+
+    // The canvas, which the stub says is 800 by 600 - the same as `page`.
+    const surface = try device.createSurface(.{});
+    defer device.destroySurface(surface);
+
+    var face: font.Font = try .init(bytes);
+    var renderer: Renderer = try .init(testing.allocator, &device, &face);
+    defer renderer.deinit();
+
+    var layout: ui.Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(.monospace(0.5, 1.0));
+
+    layout.begin(.{ .size = page });
+    {
+        layout.open(.{ .width = .grow, .height = .grow, .padding = .all(20) });
+        defer layout.close();
+        layout.text("Fluxion UI", .{ .font_size = 20, .color = .white });
+    }
+    const commands = try layout.end();
+
+    // A whole frame through the backend: the atlas uploaded, the buffers
+    // written, the uniform block and the sampler bound by slot, and drawn.
+    try renderer.draw(.{ .surface = surface }, page, commands, .black);
+    try device.present(surface);
 }
 
 test "a frame with more boxes than the buffer holds grows it" {

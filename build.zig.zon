@@ -25,17 +25,19 @@
 
         // What the optional `fluxion_ui_rhi` module draws with. Lazy for the
         // same reason: the library's own output is a command list, and a
-        // program with its own renderer never fetches this.
+        // program with its own renderer never fetches this. Pinned to a commit
+        // that draws in a browser, through WebGL 2.
         .fluxion_rhi = .{
             .url = "git+https://github.com/kisstp2006/fluxion-rhi#7c1df5db874d74c754e53cd93848b0cd3bdf4cd7",
             .hash = "fluxion_rhi-0.1.0--pvwD_GzBAD2E4V-etlt_-GUfngq0Mhy6-L-B7NLd4uW",
             .lazy = true,
         },
 
-        // What that module writes its shader in: one source, and both
-        // backends' languages come out of it. Lazy with the renderer, and
+        // What that module writes its shader in: one source, and every
+        // backend's language comes out of it. Lazy with the renderer, and
         // for the same reason. Without it the same shader would be in this
-        // repository twice, in two languages, drifting apart.
+        // repository three times, in three languages, drifting apart.
+        // Pinned to a commit that writes GLSL ES 3.00 as well.
         .fluxion_shader = .{
             .url = "git+https://github.com/kisstp2006/fluxion-shader#f86db608c8cf2247fb739e32b054e6b41fca3273",
             .hash = "fluxion_shader-0.1.0-FqFMEmaMAwA0wYgi2ulZW4oKDds1fvXP623VqQTQ8fGk",

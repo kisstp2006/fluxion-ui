@@ -82,6 +82,13 @@ pub fn build(b: *std.Build) void {
             .root_module = render_mod,
         });
         test_step.dependOn(&b.addRunArtifact(render_tests).step);
+
+        // And the renderer built for a browser, where fluxion-rhi draws
+        // through WebGL. Compiled rather than run - there is no page here to
+        // run it in - because compiling is what catches a call that has
+        // nowhere to go on wasm32-freestanding, the way `std.debug.print`
+        // has none. The tests above never see that target.
+        if (webRenderer(b, optimize)) |web| test_step.dependOn(&web.step);
     }
 
     // zig build docs -> zig-out/docs
@@ -210,4 +217,70 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(example_tests).step);
     }
+}
+
+/// The renderer for `wasm32-freestanding`, as a module a page could
+/// instantiate: its three calls and nothing else. Null while a package it
+/// needs is still being fetched.
+fn webRenderer(b: *std.Build, optimize: std.builtin.OptimizeMode) ?*std.Build.Step.Compile {
+    const wasm = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const math = b.dependency("fluxion_math", .{ .target = wasm, .optimize = optimize });
+    const rhi = b.lazyDependency("fluxion_rhi", .{ .target = wasm, .optimize = optimize });
+    const font = b.lazyDependency("fluxion_font", .{ .target = wasm, .optimize = optimize });
+    const shader = b.lazyDependency("fluxion_shader", .{ .target = wasm, .optimize = optimize });
+
+    const ui = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = wasm,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "fluxion_math", .module = math.module("fluxion_math") },
+        },
+    });
+    const render = b.createModule(.{
+        .root_source_file = b.path("src/render/rhi.zig"),
+        .target = wasm,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "fluxion_ui", .module = ui },
+            .{ .name = "fluxion_rhi", .module = (rhi orelse return null).module("fluxion_rhi") },
+            .{ .name = "fluxion_font", .module = (font orelse return null).module("fluxion_font") },
+            .{ .name = "fluxion_shader", .module = (shader orelse return null).module("fluxion_shader") },
+        },
+    });
+
+    // A function nothing refers to is never analysed, and compiles for any
+    // target at all - so the root takes the address of each call a program
+    // makes. A page points `std.log` at its console; this has no page, so
+    // the log goes nowhere.
+    const root = b.addWriteFiles().add("web.zig",
+        \\const std = @import("std");
+        \\const render = @import("fluxion_ui_rhi");
+        \\
+        \\pub const std_options: std.Options = .{ .logFn = log };
+        \\
+        \\fn log(comptime _: std.log.Level, comptime _: @EnumLiteral(), comptime _: []const u8, _: anytype) void {}
+        \\
+        \\comptime {
+        \\    _ = &render.Renderer.init;
+        \\    _ = &render.Renderer.draw;
+        \\    _ = &render.Renderer.deinit;
+        \\}
+        \\
+    );
+    const exe = b.addExecutable(.{
+        .name = "fluxion-ui-rhi-web",
+        .root_module = b.createModule(.{
+            .root_source_file = root,
+            .target = wasm,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "fluxion_ui_rhi", .module = render },
+            },
+        }),
+    });
+    // What a page instantiates: no `main`, and the exports kept.
+    exe.entry = .disabled;
+    exe.rdynamic = true;
+    return exe;
 }
