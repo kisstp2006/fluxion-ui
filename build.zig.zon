@@ -17,9 +17,9 @@
         // What one example measures and draws text with. Lazy, and named
         // here rather than imported by the library: a layout asks how wide a
         // run of text is and does not care who answers - see `text.Measurer`.
-        // A path dependency until the repository is published.
         .fluxion_font = .{
-            .path = "../fluxion-font",
+            .url = "git+https://github.com/kisstp2006/fluxion-font#eee6818fd9ddf97470162442c585cf9ff4091683",
+            .hash = "fluxion_font-0.1.0-f3pT4ouoAgC4IaUP5NWv0ApyW1YFSJ3OryM8g9R6uMcj",
             .lazy = true,
         },
 
@@ -27,7 +27,8 @@
         // same reason: the library's own output is a command list, and a
         // program with its own renderer never fetches this.
         .fluxion_rhi = .{
-            .path = "../fluxion-rhi",
+            .url = "git+https://github.com/kisstp2006/fluxion-rhi#8bffcb079cefdceeb83dccdb9e03370ab53ba605",
+            .hash = "fluxion_rhi-0.1.0--pvwD2-HAwCbfON8RllHgO5xF9QpllujHVG4tHb2XYTG",
             .lazy = true,
         },
 
@@ -36,14 +37,16 @@
         // for the same reason. Without it the same shader would be in this
         // repository twice, in two languages, drifting apart.
         .fluxion_shader = .{
-            .path = "../fluxion-shader",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#98c2a25a4d1cae45d3feaf0fc7effe6db6e2c61e",
+            .hash = "fluxion_shader-0.1.0-FqFMErVpAwDOsVWqOKytrOQPuP3ZMqIlRPC7Q1ZCfIXp",
             .lazy = true,
         },
 
         // The window one example opens. Lazy, and the library imports it
         // nowhere: a layout engine has no business opening windows.
         .fluxion_platform = .{
-            .path = "../fluxion-platform",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#373505b40d7d5d20840adba8485cc3bf707ce4ce",
+            .hash = "fluxion_platform-0.1.0-WsOjUVkbDADvAs9Vhe9Wbgw8FROUEtsQIVRwAiLuonq5",
             .lazy = true,
         },
     },

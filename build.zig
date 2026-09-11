@@ -42,21 +42,27 @@ pub fn build(b: *std.Build) void {
     const rhi_dep = b.lazyDependency("fluxion_rhi", .{ .target = target, .optimize = optimize });
     const font_for_render = b.lazyDependency("fluxion_font", .{ .target = target, .optimize = optimize });
     const shader_dep = b.lazyDependency("fluxion_shader", .{ .target = target, .optimize = optimize });
+    const have_renderer = rhi_dep != null and font_for_render != null and shader_dep != null;
 
-    const render_mod: ?*std.Build.Module = if (rhi_dep != null and font_for_render != null and shader_dep != null)
-        b.addModule("fluxion_ui_rhi", .{
-            .root_source_file = b.path("src/render/rhi.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "fluxion_ui", .module = mod },
-                .{ .name = "fluxion_rhi", .module = rhi_dep.?.module("fluxion_rhi") },
-                .{ .name = "fluxion_font", .module = font_for_render.?.module("fluxion_font") },
-                .{ .name = "fluxion_shader", .module = shader_dep.?.module("fluxion_shader") },
-            },
-        })
-    else
-        null;
+    // Declared whether or not the three have arrived, and handed them once
+    // they have. On the first run after a clean checkout they have not: the
+    // build runner fetches them when the build scripts return, and runs them
+    // again. A consumer asks for this module in that first run too, and
+    // `Dependency.module` panics on a name that is not there - before anything
+    // has been fetched, so every run after it would panic the same way.
+    const render_mod = b.addModule("fluxion_ui_rhi", .{
+        .root_source_file = b.path("src/render/rhi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "fluxion_ui", .module = mod },
+        },
+    });
+    if (have_renderer) {
+        render_mod.addImport("fluxion_rhi", rhi_dep.?.module("fluxion_rhi"));
+        render_mod.addImport("fluxion_font", font_for_render.?.module("fluxion_font"));
+        render_mod.addImport("fluxion_shader", shader_dep.?.module("fluxion_shader"));
+    }
 
     // zig build test
     const tests = b.addTest(.{
@@ -70,10 +76,10 @@ pub fn build(b: *std.Build) void {
     // The renderer carries its own, and they run against the `none` backend -
     // which accepts every call and draws nothing, so the instances and the
     // scissor batches can be checked on a machine with no GPU.
-    if (render_mod) |render| {
+    if (have_renderer) {
         const render_tests = b.addTest(.{
             .name = "fluxion-ui-rhi-tests",
-            .root_module = render,
+            .root_module = render_mod,
         });
         test_step.dependOn(&b.addRunArtifact(render_tests).step);
     }
@@ -151,7 +157,7 @@ pub fn build(b: *std.Build) void {
         // An example that draws on a GPU needs three more packages, and a
         // clean checkout has none of them on the first run - the build runner
         // fetches them and starts again.
-        if (example.needs_window and (platform_dep == null or rhi_dep == null or render_mod == null)) {
+        if (example.needs_window and (platform_dep == null or !have_renderer)) {
             continue;
         }
 
@@ -174,7 +180,7 @@ pub fn build(b: *std.Build) void {
             }) catch @panic("OOM");
             imports.append(b.allocator, .{
                 .name = "fluxion_ui_rhi",
-                .module = render_mod.?,
+                .module = render_mod,
             }) catch @panic("OOM");
         }
 
