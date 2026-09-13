@@ -18,8 +18,8 @@
         // here rather than imported by the library: a layout asks how wide a
         // run of text is and does not care who answers - see `text.Measurer`.
         .fluxion_font = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-font#eee6818fd9ddf97470162442c585cf9ff4091683",
-            .hash = "fluxion_font-0.1.0-f3pT4ouoAgC4IaUP5NWv0ApyW1YFSJ3OryM8g9R6uMcj",
+            .url = "git+https://github.com/kisstp2006/fluxion-font#38615f1e07dcb7ddaa0959ef4ea27a1ea115ac2d",
+            .hash = "fluxion_font-0.1.0-f3pT4n3pAwChQk8rk88uwmL4cZDTLTwWBXcu-VUqvM5K",
             .lazy = true,
         },
 
@@ -28,8 +28,8 @@
         // program with its own renderer never fetches this. Pinned to a commit
         // that draws in a browser, through WebGL 2.
         .fluxion_rhi = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-rhi#7dd0ca471432fd731692f3bf0cd02a33551ca0d1",
-            .hash = "fluxion_rhi-0.1.0--pvwD_GzBAAKb_E-29Dpa6F5jLTAMWP8PCXFnAOzb4tL",
+            .url = "git+https://github.com/kisstp2006/fluxion-rhi#f2dcd22a793f352e7a18a71be1988e21a85d5d4d",
+            .hash = "fluxion_rhi-0.1.0--pvwD_GzBADcptcRoeoNW0jNUYw0C2E9nw8TkvOKp42Z",
             .lazy = true,
         },
 
@@ -47,8 +47,8 @@
         // The window one example opens. Lazy, and the library imports it
         // nowhere: a layout engine has no business opening windows.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#96c5acc58d792c8f670c5c1a7b4b3d9b53a12fb0",
-            .hash = "fluxion_platform-0.1.0-WsOjUYYeEACL_j-AGVgBNiPwb2wlj0G5bCqyaw248YGc",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#f59b5bc8c504a1abb0fc0e1e5807f9cc364dc39a",
+            .hash = "fluxion_platform-0.1.0-WsOjUZ3mEwCC2n9VdBIhaYA07ujr8aTEpynZq4CSOmeR",
             .lazy = true,
         },
     },
