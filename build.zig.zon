@@ -26,10 +26,10 @@
         // What the optional `fluxion_ui_rhi` module draws with. Lazy for the
         // same reason: the library's own output is a command list, and a
         // program with its own renderer never fetches this. Pinned to a commit
-        // that draws in a browser, through WebGL 2.
+        // that draws in browsers and on Android.
         .fluxion_rhi = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-rhi#f2dcd22a793f352e7a18a71be1988e21a85d5d4d",
-            .hash = "fluxion_rhi-0.1.0--pvwD_GzBADcptcRoeoNW0jNUYw0C2E9nw8TkvOKp42Z",
+            .url = "git+https://github.com/kisstp2006/fluxion-rhi#5ba39058c8334cee35f3b209a648c634c6776cf3",
+            .hash = "fluxion_rhi-0.1.0--pvwD-e8BADncd8vWuzTWsJoN-iTu-CcJmysypgstbuQ",
             .lazy = true,
         },
 
