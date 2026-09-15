@@ -581,6 +581,14 @@ const Line = struct {
     width: f32,
 };
 
+/// A text cursor, as a frame left it.
+const Caret = struct {
+    /// The input it is in, so that a focus moved since can be told apart.
+    id: u32,
+    /// Upright, in surface pixels, and already turned if the input was.
+    box: BoundingBox,
+};
+
 /// One entry of the position-and-emit walk.
 const Frame = struct {
     element: u32,
@@ -713,6 +721,9 @@ clipboard: std.ArrayList(u8),
 /// Refilled for each field as it is drawn.
 field_lines: std.ArrayList(text_input.VisualLine),
 field_boundaries: std.ArrayList(f32),
+/// Where the last `end` put the cursor of the input with the keyboard, and
+/// which input that was. See `caret`.
+caret_at: ?Caret = null,
 
 /// The scrollbars drawn this frame, for the next frame to be pointed at.
 bars: std.ArrayList(Bar),
@@ -1437,6 +1448,10 @@ fn remember(self: *Ui, err: Error) void {
 ///
 /// The list is owned by the `Ui` and is valid until the next `begin`.
 pub fn end(self: *Ui) Error![]const RenderCommand {
+    // The caret is the one this frame draws, and none if it draws no input
+    // with the keyboard. See `caret`.
+    self.caret_at = null;
+
     if (self.deferred) |err| {
         self.deferred = null;
         return err;
@@ -2718,14 +2733,18 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
     }
 
     // The cursor, on top, and only while the field has the keyboard.
+    const cursor_box: BoundingBox = .init(
+        origin_x + cursor_x,
+        origin_y + step * @as(f32, @floatFromInt(spot.line)),
+        2,
+        step,
+    );
+    // Written down whether or not the blink is showing it: an input method
+    // opening its window here wants the place, not the pixels.
+    if (has_keyboard) self.caret_at = .{ .id = element.id, .box = drawnBox(self.stamp, cursor_box) };
     if (has_keyboard and edit.cursorVisible()) {
         try self.output.append(self.gpa, .{
-            .bounding_box = .init(
-                origin_x + cursor_x,
-                origin_y + step * @as(f32, @floatFromInt(spot.line)),
-                2,
-                step,
-            ),
+            .bounding_box = cursor_box,
             .id = element.id,
             .z_index = element.z_index,
             .transform = self.stamp,
@@ -3950,6 +3969,41 @@ pub fn wantsKeyboard(self: *Ui) bool {
     return self.edits.contains(self.focus);
 }
 
+/// Where the cursor of the input with the keyboard is, or null when no input
+/// has it.
+///
+/// The other half of what a platform's text input needs. `wantsKeyboard` says
+/// that somebody is typing, which is what raises a phone's keyboard; this
+/// says where, which is what puts an input method's composition and its list
+/// of candidates next to the text instead of on top of it.
+///
+/// ```zig
+/// try window.setTextInput(ui.wantsKeyboard());
+/// if (ui.caret()) |at| try window.setTextInputArea(.{
+///     .x = @intFromFloat(at.x),
+///     .y = @intFromFloat(at.y),
+///     .width = @intFromFloat(@ceil(at.width)),
+///     .height = @intFromFloat(@ceil(at.height)),
+/// });
+/// ```
+///
+/// The box is the one the cursor is drawn in, in the surface pixels `boxOf`
+/// answers in, and it is there while the blink has the cursor hidden: an
+/// input method wants the place, not the pixels. A turned input gives the
+/// upright box round its turned cursor, which is where it shows. A scroll
+/// container that has the input out of sight does not cut it off.
+///
+/// As the last `end` drew it, like `boxOf` - so null for an input that was
+/// not drawn at all, having no room or no measurer to be drawn with. But the
+/// focus is checked when this is asked, so once the focus moves it is null
+/// straight away rather than one frame later: never the cursor of an input
+/// that has lost the keyboard.
+pub fn caret(self: *Ui) ?BoundingBox {
+    const at = self.caret_at orelse return null;
+    if (self.focus != at.id) return null;
+    return at.box;
+}
+
 /// The elements under the pointer, outermost first. Ply's
 /// `pointer_over_ids()`.
 pub fn pointerOver(self: *Ui) []const u32 {
@@ -4198,11 +4252,11 @@ fn stepToward(self: *Ui, to: input.Navigation) void {
         }
     }
 
-    const start: Seen = .of(drawnBox(from), to);
+    const start: Seen = .of(drawnBox(from.motion, from.box), to);
     var best: ?Candidate = null;
     for (self.hits.items, 0..) |hit, i| {
         if (hit.focus == null or hit.id == from.id) continue;
-        const box = drawnBox(hit);
+        const box = drawnBox(hit.motion, hit.box);
         if (!hit.reach.meets(box)) continue;
 
         const seen: Seen = .of(box, to);
@@ -4284,22 +4338,23 @@ const Candidate = struct {
     }
 };
 
-/// Where a hit was drawn, as an upright box: a turned element's box, turned,
-/// and then the smallest upright box round that. What the arrow keys measure,
-/// because a button is where it looks to be.
-fn drawnBox(hit: Hit) BoundingBox {
-    if (hit.motion.isIdentity()) return hit.box;
+/// Where a box was drawn, as an upright box: turned by the motion it was
+/// drawn with, and then the smallest upright box round that. What the arrow
+/// keys measure, because a button is where it looks to be, and what `caret`
+/// hands an input method, for the same reason.
+fn drawnBox(motion: geometry.Transform, box: BoundingBox) BoundingBox {
+    if (motion.isIdentity()) return box;
 
     const corners = [4]geometry.Vec2{
-        .{ .x = hit.box.x, .y = hit.box.y },
-        .{ .x = hit.box.right(), .y = hit.box.y },
-        .{ .x = hit.box.x, .y = hit.box.bottom() },
-        .{ .x = hit.box.right(), .y = hit.box.bottom() },
+        .{ .x = box.x, .y = box.y },
+        .{ .x = box.right(), .y = box.y },
+        .{ .x = box.x, .y = box.bottom() },
+        .{ .x = box.right(), .y = box.bottom() },
     };
-    var low = hit.motion.apply(corners[0]);
+    var low = motion.apply(corners[0]);
     var high = low;
     for (corners[1..]) |corner| {
-        const turned = hit.motion.apply(corner);
+        const turned = motion.apply(corner);
         low = .{ .x = @min(low.x, turned.x), .y = @min(low.y, turned.y) };
         high = .{ .x = @max(high.x, turned.x), .y = @max(high.y, turned.y) };
     }
@@ -7299,12 +7354,12 @@ test "the cursor is drawn where the text ends, and only while focused" {
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
-    const caret: Color = .hex(0xFF0000);
+    const red: Color = .hex(0xFF0000);
     ui.setTextValue("name", "abc");
 
     // Not focused: no cursor at all, however solid the blink says it is.
-    const unfocused = try oneField(&ui, .{ .cursor_color = caret });
-    try testing.expect(rectangleIn(unfocused, caret) == null);
+    const unfocused = try oneField(&ui, .{ .cursor_color = red });
+    try testing.expect(rectangleIn(unfocused, red) == null);
 
     // Setting the value from the program leaves the cursor where it was,
     // only clamping it - which is Ply's rule and is why this types instead.
@@ -7312,12 +7367,139 @@ test "the cursor is drawn where the text ends, and only while focused" {
 
     ui.setFocus("name");
     ui.typeText("abc");
-    const with_keyboard = try oneField(&ui, .{ .cursor_color = caret });
+    const with_keyboard = try oneField(&ui, .{ .cursor_color = red });
 
     // Three characters at eight pixels, and two pixels wide.
-    const drawn_at = rectangleIn(with_keyboard, caret).?;
+    const drawn_at = rectangleIn(with_keyboard, red).?;
     try testing.expectEqual(@as(f32, 24), drawn_at.x);
     try testing.expectEqual(@as(f32, 2), drawn_at.width);
+}
+
+test "the caret is where the cursor is drawn, blinking or not" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const red: Color = .hex(0xFF0000);
+
+    // Nothing has the keyboard, so there is nowhere to put an input method.
+    _ = try oneField(&ui, .{ .cursor_color = red });
+    try testing.expect(ui.caret() == null);
+
+    ui.setFocus("name");
+    ui.typeText("abc");
+    const lit = try oneField(&ui, .{ .cursor_color = red });
+    const drawn_at = rectangleIn(lit, red).?;
+    try testing.expectEqual(drawn_at, ui.caret().?);
+    try testing.expectEqual(BoundingBox.init(24, 0, 2, 16), ui.caret().?);
+
+    // Six tenths of a second is the off half of the blink: nothing is drawn,
+    // and the place is still there, because the place is what is wanted.
+    ui.tick(0.6);
+    const dark = try oneField(&ui, .{ .cursor_color = red });
+    try testing.expect(rectangleIn(dark, red) == null);
+    try testing.expectEqual(drawn_at, ui.caret().?);
+
+    // The focus going is heard at once, not a frame later: `wantsKeyboard`
+    // has already stopped, and the two must never disagree.
+    ui.clearFocus();
+    try testing.expect(!ui.wantsKeyboard());
+    try testing.expect(ui.caret() == null);
+    _ = try oneField(&ui, .{ .cursor_color = red });
+    try testing.expect(ui.caret() == null);
+}
+
+test "an input that is not declared any more takes its caret with it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    _ = try oneField(&ui, .{});
+    ui.setFocus("name");
+    _ = try oneField(&ui, .{});
+    try testing.expect(ui.caret() != null);
+
+    // Nothing moved the focus off it: the field is simply not on the page,
+    // so there is nothing to type into and no place to point at.
+    ui.begin(.init(400, 200));
+    openRoot(&ui);
+    ui.close();
+    _ = try ui.end();
+    try testing.expect(!ui.wantsKeyboard());
+    try testing.expect(ui.caret() == null);
+}
+
+test "the caret is in the pixels boxOf answers in, on the line it is on" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 200));
+            {
+                u.open(.{ .width = .grow, .height = .grow, .padding = .all(10) });
+                defer u.close();
+                u.textInput(
+                    .{ .id = "notes", .width = .fixed(200), .height = .fixed(100), .padding = .all(4) },
+                    .{ .multiline = true },
+                );
+            }
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+    ui.setFocus("notes");
+    ui.typeText("one\ntwo!");
+    try frame(&ui);
+
+    // Four characters into the second line: the field's own padding in from
+    // its box, then 4 x 8 across and one sixteen-pixel line down.
+    const field = ui.boxOf("notes").?;
+    try testing.expectEqual(BoundingBox.init(field.x + 4 + 32, field.y + 4 + 16, 2, 16), ui.caret().?);
+    try testing.expectEqual(BoundingBox.init(10, 10, 200, 100), field);
+}
+
+test "a turned input's caret is the upright box round where it shows" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui, degrees: f32) !void {
+            u.begin(.init(400, 200));
+            openRoot(u);
+            u.textInput(
+                .{ .id = "name", .width = .fixed(100), .height = .fixed(100), .rotate = .degrees(degrees) },
+                .{},
+            );
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui, 90);
+    ui.setFocus("name");
+    ui.typeText("abc");
+    try frame(&ui, 90);
+
+    // Unturned the cursor would be (24, 0, 2, 16). A quarter turn clockwise
+    // about the middle, (50, 50), takes a point (x, y) to (100 - y, x), so
+    // the tall thin cursor lies down: sixteen across and two high.
+    const lying = ui.caret().?;
+    try testing.expectApproxEqAbs(@as(f32, 84), lying.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 24), lying.y, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 16), lying.width, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 2), lying.height, 0.001);
+
+    // An eighth of a turn leaves no side upright, so the box has to come
+    // from all four corners. From the middle they are (-26, -50), (-24, -50),
+    // (-26, -34) and (-24, -34), and the turn takes (x, y) to (x - y, x + y)
+    // over root two: across from 8 to 26 of those, and down from -76 to -58.
+    try frame(&ui, 45);
+    const leaning = ui.caret().?;
+    const unit = @sqrt(@as(f32, 0.5));
+    try testing.expectApproxEqAbs(50 + 8 * unit, leaning.x, 0.001);
+    try testing.expectApproxEqAbs(50 - 76 * unit, leaning.y, 0.001);
+    try testing.expectApproxEqAbs(18 * unit, leaning.width, 0.001);
+    try testing.expectApproxEqAbs(18 * unit, leaning.height, 0.001);
 }
 
 test "a selection is washed over exactly the characters it covers" {

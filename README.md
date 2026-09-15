@@ -1034,6 +1034,26 @@ binding is right for both; `.text_start` and `.text_end` are Ctrl+Home and
 Ctrl+End. Copy and cut hand the selected text back rather than reaching for a
 clipboard, because there is no clipboard to reach for.
 
+**Where the cursor is goes the other way**, to the platform's text input.
+`wantsKeyboard` says somebody is typing, which is what raises a phone's
+keyboard; `caret` says where, which is what puts an input method's composition
+and its candidates beside the text rather than over it.
+
+```zig
+try window.setTextInput(ui.wantsKeyboard());
+if (ui.caret()) |at| try window.setTextInputArea(.{
+    .x = @intFromFloat(at.x),
+    .y = @intFromFloat(at.y),
+    .width = @intFromFloat(@ceil(at.width)),
+    .height = @intFromFloat(@ceil(at.height)),
+});
+```
+
+It is the box the cursor is drawn in, in the surface's pixels, as the last
+frame drew it - and still there while the blink has the cursor hidden, because
+an input method wants the place and not the pixels. It is null when nothing is
+being typed into, from the moment the focus leaves rather than a frame later.
+
 ### What it does, and where it differs
 
 Ply's plain editing model, ported whole: character, word and line movement with
@@ -1175,7 +1195,7 @@ than from memory.
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus` and `on_unfocus`, called when the frame is over |
 | **The focus from a keyboard or a pad** | `.focus` on a declaration, a Tab order with `tab_index`, the arrows and a pad's d-pad going to a named neighbour or the nearest element that way, a held direction that repeats on `tick`'s clock, a key that presses what has the focus the way a click does, and a click that focuses the button rather than its label |
 | **Floating** | out of the flow, anchored to a parent, an element by name, or the surface, with an offset, a z-index and optional clipping |
-| **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup |
+| **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup, and the caret's place for an input method |
 | **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text, and a pass that can draw over a scene rather than instead of it |
 
 ### Only in Ply
@@ -1195,7 +1215,7 @@ the order it is worth doing in.
 | **A debug view** | `set_debug_mode`: Ply draws the tree beside the interface with every box and its numbers. |
 | **Culling** | `set_culling`: dropping commands that fall outside the surface before they reach the renderer. |
 | **A measure cache** | Ply remembers the width of words it has measured. This measures every time, which is the same answer more slowly. |
-| **Input methods** | Composing Japanese or Chinese needs preedit events this library never sees. `text_input.Action` has room for them. |
+| **Input methods** | Where the caret is, for the platform to open an input method's window beside, is [here already](#the-keyboard-is-the-programs). What is missing is the composition drawn inline, in the field, while Japanese or Chinese is being composed: that needs preedit events this library never sees, and `text_input.Action` has room for them. |
 | **Accessibility, networking, audio, storage, jobs** | Out of scope by decision, not by accident. Ply's are bound to its own subsystems; these belong to the fluxion ones. |
 
 Two deliberate departures worth knowing about, both explained where they are
