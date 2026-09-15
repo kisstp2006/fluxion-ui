@@ -5604,6 +5604,49 @@ test "two newlines in a row are a blank line" {
     try testing.expectEqual(2, drawn.len);
 }
 
+test "spaces a run starts with are an indentation in every mode" {
+    // Zero bytes of word, like a newline, and once taken for one: the spaces
+    // went, and where lines break there was a blank line above the text.
+    for ([_]text_mod.WrapMode{ .none, .newline, .words }) |wrap| {
+        var ui = withText(testing.allocator);
+        defer ui.deinit();
+
+        ui.begin(.init(800, 600));
+        openRoot(&ui);
+        {
+            ui.open(.{ .id = "block", .width = .fit, .height = .fit });
+            defer ui.close();
+            ui.text("  cd", .{ .font_size = 16, .color = paint, .wrap = wrap });
+        }
+        ui.close();
+        const drawn = try ui.end();
+
+        try testing.expectEqual(1, drawn.len);
+        try testing.expectEqualStrings("  cd", drawn[0].config.text.text);
+        try testing.expectEqual(@as(f32, 32), drawn[0].bounding_box.width);
+        try testing.expectEqual(@as(f32, 16), ui.boxOf("block").?.height);
+    }
+}
+
+test "a line after a newline keeps its indentation" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "block", .width = .fit, .height = .fit });
+        defer ui.close();
+        ui.text("ab\n  cd", sixteen);
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    try testing.expectEqual(2, drawn.len);
+    try testing.expectEqualStrings("  cd", drawn[1].config.text.text);
+    try testing.expectEqual(@as(f32, 32), ui.boxOf("block").?.height);
+}
+
 test "wrapping can be turned off, and then nothing breaks" {
     var ui = withText(testing.allocator);
     defer ui.deinit();

@@ -157,17 +157,19 @@ pub const Measurer = struct {
 pub const Word = struct {
     /// Where it starts in the run.
     start: u32,
-    /// How many bytes it is. Zero for a newline, which is a break and not a
-    /// word.
+    /// How many bytes it is: zero for a newline, and for the spaces a run
+    /// starts with, which come before its first word.
     len: u32,
     /// How wide it is on its own, without the space after it.
     width: f32,
     /// How wide the space after it is - zero at the end of a run, and at a
     /// newline.
     space: f32,
+    /// A newline: the one break the text asks for itself.
+    newline: bool = false,
 
     pub inline fn isBreak(self: Word) bool {
-        return self.len == 0;
+        return self.newline;
     }
 };
 
@@ -199,7 +201,7 @@ pub const Words = struct {
         if (self.run[self.at] == '\n') {
             const at = self.at;
             self.at += 1;
-            return .{ .start = at, .len = 0, .width = 0, .space = 0 };
+            return .{ .start = at, .len = 0, .width = 0, .space = 0, .newline = true };
         }
 
         // Leading spaces belong to the word that follows, as the space
@@ -338,6 +340,17 @@ test "a newline is a zero-length word, and it is a break" {
     const after = words.next().?;
     try testing.expectEqual(2, after.len);
     try testing.expect(!after.isBreak());
+}
+
+test "the spaces a run starts with are the gap before its first word, not a break" {
+    // Zero long like a newline, but an indentation: taking it for a break
+    // dropped the spaces and, where lines break, left a blank line above.
+    var words: Words = .init("  cd", plain, mono);
+    const indent = words.next().?;
+    try testing.expectEqual(0, indent.len);
+    try testing.expect(!indent.isBreak());
+    try testing.expectEqual(@as(f32, 16), indent.space);
+    try testing.expectEqual(2, words.next().?.start);
 }
 
 test "the widest word is what a paragraph can be squeezed to" {

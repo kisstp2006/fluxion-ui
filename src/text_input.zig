@@ -1674,6 +1674,25 @@ test "a multiline input breaks at newlines and then at words" {
     try testing.expectEqual(@as(usize, 4), found[0].next);
 }
 
+test "an indented line is one line, spaces and all" {
+    // The spaces before a line's first word are a zero-length word, like a
+    // newline, and were once taken for one: the first space broke the line.
+    var lines: std.ArrayList(VisualLine) = .empty;
+    defer lines.deinit(testing.allocator);
+
+    const measurer: text_mod.Measurer = .monospace(0.5, 1.0);
+    const style: text_mod.TextStyle = .{ .font_size = 16 };
+    const run = "  one\n  two";
+    const found = try wrapLines(&lines, testing.allocator, run, 400, true, style, measurer);
+
+    try testing.expectEqual(@as(usize, 2), found.len);
+    try testing.expectEqualStrings("  one", found[0].text(run));
+    try testing.expectEqualStrings("  two", found[1].text(run));
+    // A cursor between the two spaces is on the first line, not a line of
+    // its own.
+    try testing.expectEqual(@as(usize, 0), locate(found, 1).line);
+}
+
 test "a word wider than the box overflows instead of looping" {
     var lines: std.ArrayList(VisualLine) = .empty;
     defer lines.deinit(testing.allocator);
