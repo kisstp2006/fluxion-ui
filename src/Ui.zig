@@ -4625,8 +4625,15 @@ pub fn list(self: *Ui) commands.List {
     return .{ .items = self.output.items };
 }
 
-/// The box an element ended up in, by name. Null if there is no such element,
-/// or the frame has not finished yet.
+/// The box an element ended up in, by name: where this frame put it once `end`
+/// has run, and where the last frame did while this one is being declared.
+/// Null if it was not on the page.
+///
+/// The last frame's, because that is when the question is asked. Where a
+/// float, a drop line or a scroll to the caret goes is decided while the tree
+/// is declared, and this frame's boxes are not known until it is finished -
+/// the ones being declared are all zero, and answering with those put every
+/// such thing in the top-left corner. `hovered` answers from the same place.
 ///
 /// Every element is findable this way, not only the ones that painted
 /// something: a transparent container is where the layout put it, and a
@@ -4634,8 +4641,8 @@ pub fn list(self: *Ui) commands.List {
 /// to find out.
 pub fn boxOf(self: *Ui, name: []const u8) ?BoundingBox {
     const wanted = identify(name);
-    for (self.elements.items) |element| {
-        if (element.id == wanted) return element.box;
+    for (self.hits.items) |hit| {
+        if (hit.id == wanted) return hit.box;
     }
     return null;
 }
@@ -4677,6 +4684,32 @@ test "a fixed size is what it says" {
     _ = try ui.end();
 
     try testing.expectEqual(BoundingBox.init(0, 0, 200, 100), ui.boxOf("a").?);
+}
+
+test "a box asked for while the frame is declared is the last frame's" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    for (0..2) |frame| {
+        ui.begin(.init(800, 600));
+        {
+            ui.open(.{ .width = .grow, .height = .grow });
+            defer ui.close();
+            leaf(&ui, "spacer", .{ .width = .fixed(30), .height = .fixed(10) });
+            leaf(&ui, "a", .{ .width = .fixed(200), .height = .fixed(100) });
+
+            // Declared, but not laid out: nothing to go on the first time,
+            // and where it went last time after that - never zeros.
+            if (frame == 0) {
+                try testing.expectEqual(null, ui.boxOf("a"));
+            } else {
+                try testing.expectEqual(BoundingBox.init(30, 0, 200, 100), ui.boxOf("a").?);
+            }
+        }
+        _ = try ui.end();
+
+        try testing.expectEqual(BoundingBox.init(30, 0, 200, 100), ui.boxOf("a").?);
+    }
 }
 
 test "the root takes the surface, whatever it asked for" {
