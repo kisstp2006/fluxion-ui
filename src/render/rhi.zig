@@ -115,7 +115,9 @@ const quad_vertices = [8]f32{ 0, 0, 1, 0, 0, 1, 1, 1 };
 pub const Renderer = struct {
     gpa: Allocator,
     device: *rhi.Device,
-    face: *const font.Font,
+    /// What a text command's `font` is an index into, the default first. The
+    /// faces are borrowed; the table is this renderer's own. See `setFaces`.
+    faces: std.ArrayList(*const font.Font),
 
     atlas: Atlas,
     atlas_texture: rhi.types.Texture,
@@ -156,7 +158,13 @@ pub const Renderer = struct {
     /// alphabets at the sizes an interface uses.
     const atlas_size: u32 = 1024;
 
+    /// Make a renderer that draws every run in `face`. A program with more
+    /// than one font says so afterwards, with `setFaces`.
     pub fn init(gpa: Allocator, device: *rhi.Device, face: *const font.Font) Error!Renderer {
+        var faces: std.ArrayList(*const font.Font) = .empty;
+        errdefer faces.deinit(gpa);
+        try faces.append(gpa, face);
+
         var atlas: Atlas = try .init(gpa, atlas_size, atlas_size);
         errdefer atlas.deinit();
 
@@ -252,7 +260,7 @@ pub const Renderer = struct {
         return .{
             .gpa = gpa,
             .device = device,
-            .face = face,
+            .faces = faces,
             .atlas = atlas,
             .atlas_texture = atlas_texture,
             .sampler = sampler,
@@ -279,6 +287,59 @@ pub const Renderer = struct {
         self.textures = textures;
     }
 
+    /// Say which fonts text is drawn in: a text command's `font` is an index
+    /// into `faces`.
+    ///
+    /// ```zig
+    /// try renderer.setFaces(&.{ &interface_face, &code_face }); // .font = 1 is code
+    /// ```
+    ///
+    /// The first is the default, and a run whose index is past the end is
+    /// drawn in it - a font that is not there looks like the wrong font, not
+    /// like missing text. An empty table draws no text at all. Until this is
+    /// called the table is `init`'s one face. The measurer the layout used
+    /// has to measure each run in the same face, or lines break where the
+    /// text is not.
+    ///
+    /// The faces are borrowed and must outlive the frames drawn in them; the
+    /// table is copied. A slot that holds a different face from last time,
+    /// or none, has its glyphs forgotten, so putting another font at an index
+    /// draws that font. A font read again in place keeps its pointer, and
+    /// nothing here can see that it changed: say so with `forgetFace`.
+    pub fn setFaces(self: *Renderer, faces: []const *const font.Font) Allocator.Error!void {
+        // Room first, so a failure leaves the old table as it was.
+        try self.faces.ensureTotalCapacity(self.gpa, faces.len);
+
+        for (self.faces.items, 0..) |old, slot| {
+            // A `font` index is sixteen bits, so a slot past that holds
+            // nothing a command can name.
+            if (slot > std.math.maxInt(u16)) break;
+            if (slot >= faces.len or faces[slot] != old) self.atlas.forget(@intCast(slot));
+        }
+
+        self.faces.clearRetainingCapacity();
+        self.faces.appendSliceAssumeCapacity(faces);
+    }
+
+    /// Forget the glyphs drawn in one face, so they are rasterised again from
+    /// whatever that face is now.
+    ///
+    /// For a font read again in place, which keeps its pointer: `setFaces`
+    /// compares pointers and cannot tell. The other faces keep their glyphs.
+    /// The room the forgotten ones took is given back the next time the atlas
+    /// fills - see `build`.
+    pub fn forgetFace(self: *Renderer, slot: u16) void {
+        self.atlas.forget(slot);
+    }
+
+    /// Which slot a run's `font` index is drawn from: its own, or the first
+    /// for an index past the end - whose glyphs are the first face's too,
+    /// since that is the face they were drawn in. Null with no faces at all.
+    fn slotFor(self: *Renderer, wanted: u16) ?u16 {
+        if (self.faces.items.len == 0) return null;
+        return if (wanted < self.faces.items.len) wanted else 0;
+    }
+
     /// Say what time it is, in seconds.
     ///
     /// Only the animated markup styles read it, and a program that uses none
@@ -298,6 +359,7 @@ pub const Renderer = struct {
         self.clocks.deinit(self.gpa);
         self.device.destroyTexture(self.atlas_texture);
         self.atlas.deinit();
+        self.faces.deinit(self.gpa);
         self.instances.deinit(self.gpa);
         self.batches.deinit(self.gpa);
         self.clips.deinit(self.gpa);
@@ -382,7 +444,27 @@ pub const Renderer = struct {
     /// Separated from `draw` so a test can look at what would be drawn
     /// without a device that draws anything - which is what the tests at the
     /// bottom of this file do.
+    ///
+    /// **A frame that does not fit in the atlas empties it and is built
+    /// again.** The atlas only ever fills: glyphs at sizes nothing draws any
+    /// more stay, and so does the room a forgotten face's took, so a program
+    /// that runs long enough would run out on glyphs it will never draw
+    /// again and fail every frame after. Emptied, it holds what this frame
+    /// needs and nothing else. A frame that does not fit an empty atlas is
+    /// too much text for one, and says so rather than going round again.
     pub fn build(self: *Renderer, commands: []const ui.RenderCommand, size: ui.Dimensions) Error!void {
+        self.buildOnce(commands, size) catch |err| switch (err) {
+            error.AtlasFull => {
+                self.atlas.clear();
+                try self.buildOnce(commands, size);
+            },
+            else => return err,
+        };
+    }
+
+    /// One try at `build`. Starts from nothing, so a second try after the
+    /// atlas was emptied leaves none of the first behind.
+    fn buildOnce(self: *Renderer, commands: []const ui.RenderCommand, size: ui.Dimensions) Error!void {
         self.instances.clearRetainingCapacity();
         self.batches.clearRetainingCapacity();
         self.clips.clearRetainingCapacity();
@@ -614,12 +696,17 @@ pub const Renderer = struct {
 
     /// One instance per glyph of a line.
     fn addText(self: *Renderer, command: ui.RenderCommand, run: ui.commands.Text) Error!void {
+        // Everything below is the run's own face: the scale, the baseline,
+        // which glyph a character is, the kerning, and the glyphs themselves.
+        const slot = self.slotFor(run.font) orelse return;
+        const face = self.faces.items[slot];
+
         const turn = turnOf(command.transform);
         const size: u16 = run.font_size;
-        const scale = self.face.scaleFor(@floatFromInt(size));
+        const scale = face.scaleFor(@floatFromInt(size));
 
         // The command's box is the line; the baseline is one ascent down it.
-        const baseline = command.bounding_box.y + self.face.at(@floatFromInt(size)).ascent();
+        const baseline = command.bounding_box.y + face.at(@floatFromInt(size)).ascent();
         var pen = command.bounding_box.x;
         var previous: ?u16 = null;
 
@@ -628,14 +715,14 @@ pub const Renderer = struct {
 
         var letters = (std.unicode.Utf8View.init(run.text) catch return).iterator();
         while (letters.nextCodepoint()) |codepoint| {
-            const index = self.face.glyphFor(codepoint);
+            const index = face.glyphFor(codepoint);
             if (previous) |left| {
-                pen += @as(f32, @floatFromInt(self.face.kern(left, index) catch 0)) * scale;
+                pen += @as(f32, @floatFromInt(face.kern(left, index) catch 0)) * scale;
             }
             previous = index;
             defer at += 1;
 
-            const entry = try self.atlas.glyph(self.face, index, size);
+            const entry = try self.atlas.glyph(face, slot, index, size);
             if (entry.isBlank()) {
                 pen += entry.advance;
                 continue;
@@ -799,12 +886,16 @@ const shader_source = @embedFile("shaders/ui.fxs");
 // on a machine with no GPU, no window and no driver.
 
 fn systemFont(gpa: Allocator) !?[]u8 {
-    const candidates = [_][]const u8{
+    return fontFile(gpa, &.{
         "C:/Windows/Fonts/consola.ttf",
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    };
+    });
+}
+
+/// The first of these that can be read, or null if none can.
+fn fontFile(gpa: Allocator, candidates: []const []const u8) !?[]u8 {
     for (candidates) |path| {
         return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(32 << 20)) catch continue;
     }
@@ -949,6 +1040,209 @@ test "a space moves the pen and adds no instance" {
     // But the space was paid for, so the `b` is further along than it would
     // be if the space had been skipped entirely.
     try testing.expect(instances[1].rect[0] > instances[0].rect[0] + 8);
+}
+
+/// An "A" in face zero and another in face one.
+fn inTwoFaces(renderer: *Renderer) !void {
+    try renderer.build(&.{
+        .{
+            .bounding_box = .init(0, 0, 200, 20),
+            .config = .{ .text = .{ .text = "A", .color = .white, .font_size = 16 } },
+        },
+        .{
+            .bounding_box = .init(0, 20, 200, 20),
+            .config = .{ .text = .{ .text = "A", .color = .white, .font_size = 16, .font = 1 } },
+        },
+    }, page);
+}
+
+test "a run is drawn from the face its index names" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    // The same font twice is enough to tell two slots apart: each keeps its
+    // own glyphs, and a run takes them from the slot it names.
+    const code: font.Font = try .init(fixture.bytes);
+    try fixture.renderer.setFaces(&.{ &fixture.face, &code });
+
+    try fixture.renderer.build(&.{.{
+        .bounding_box = .init(0, 0, 200, 20),
+        .config = .{ .text = .{ .text = "H", .color = .white, .font_size = 16, .font = 1 } },
+    }}, page);
+
+    const atlas = &fixture.renderer.atlas;
+    try testing.expectEqual(1, atlas.count());
+    const entry = atlas.entries.get(.{ .face = 1, .glyph = code.glyphFor('H'), .size = 16 }) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(
+        [4]f32{ entry.u0, entry.v0, entry.u1, entry.v1 },
+        fixture.renderer.instances.items[0].uv,
+    );
+}
+
+test "an index past the table is drawn in the first face" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    // Face seven of a table of one. Drawn, and from face zero's glyphs - the
+    // face it is drawn in, and so the one whose forgetting has to reach it.
+    try fixture.renderer.build(&.{.{
+        .bounding_box = .init(0, 0, 200, 20),
+        .config = .{ .text = .{ .text = "H", .color = .white, .font_size = 16, .font = 7 } },
+    }}, page);
+
+    const atlas = &fixture.renderer.atlas;
+    try testing.expectEqual(1, fixture.renderer.instances.items.len);
+    try testing.expectEqual(1, atlas.count());
+    try testing.expect(atlas.entries.contains(.{ .face = 0, .glyph = fixture.face.glyphFor('H'), .size = 16 }));
+}
+
+test "no faces at all draws no text, and everything else as before" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    try fixture.renderer.setFaces(&.{});
+    try fixture.renderer.build(&.{
+        .{ .bounding_box = .init(0, 0, 10, 10), .config = .{ .rectangle = .{ .color = .white } } },
+        .{
+            .bounding_box = .init(0, 20, 200, 20),
+            .config = .{ .text = .{ .text = "Hi", .color = .white, .font_size = 16 } },
+        },
+    }, page);
+
+    try testing.expectEqual(1, fixture.renderer.instances.items.len);
+    try testing.expectEqual(0, fixture.renderer.atlas.count());
+}
+
+test "another face at a slot is drawn fresh, and the other slots keep their glyphs" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const code: font.Font = try .init(fixture.bytes);
+    const other: font.Font = try .init(fixture.bytes);
+    const atlas = &fixture.renderer.atlas;
+    const kept: Atlas.Key = .{ .face = 0, .glyph = fixture.face.glyphFor('A'), .size = 16 };
+
+    try fixture.renderer.setFaces(&.{ &fixture.face, &code });
+    try inTwoFaces(&fixture.renderer);
+    try testing.expectEqual(2, atlas.count());
+
+    // The same table again is no change at all.
+    try fixture.renderer.setFaces(&.{ &fixture.face, &code });
+    try testing.expectEqual(2, atlas.count());
+
+    // Another face in slot one: its glyphs go, and slot zero's stay.
+    try fixture.renderer.setFaces(&.{ &fixture.face, &other });
+    try testing.expectEqual(1, atlas.count());
+    try testing.expect(atlas.entries.contains(kept));
+
+    // A table that no longer has a slot one forgets it as well.
+    try inTwoFaces(&fixture.renderer);
+    try testing.expectEqual(2, atlas.count());
+    try fixture.renderer.setFaces(&.{&fixture.face});
+    try testing.expectEqual(1, atlas.count());
+    try testing.expect(atlas.entries.contains(kept));
+}
+
+test "forgetting a face draws it again, for a font read again in place" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const code: font.Font = try .init(fixture.bytes);
+    const atlas = &fixture.renderer.atlas;
+
+    try fixture.renderer.setFaces(&.{ &fixture.face, &code });
+    try inTwoFaces(&fixture.renderer);
+    try testing.expectEqual(2, atlas.count());
+
+    // The same pointer with another font behind it: only the program knows.
+    fixture.renderer.forgetFace(1);
+    try testing.expectEqual(1, atlas.count());
+    try testing.expect(atlas.entries.contains(.{ .face = 0, .glyph = fixture.face.glyphFor('A'), .size = 16 }));
+}
+
+test "a frame that does not fit the atlas empties it and is built again" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    // An atlas with no room left, however it got that way: a glyph at a size
+    // nothing draws any more, and the pen at the bottom edge.
+    const atlas = &fixture.renderer.atlas;
+    const stale: Atlas.Key = .{ .face = 0, .glyph = fixture.face.glyphFor('W'), .size = 64 };
+    _ = try atlas.glyph(&fixture.face, stale.face, stale.glyph, stale.size);
+    atlas.pen_y = atlas.height;
+
+    try fixture.renderer.build(&.{.{
+        .bounding_box = .init(0, 0, 200, 20),
+        .config = .{ .text = .{ .text = "Hi", .color = .white, .font_size = 16 } },
+    }}, page);
+
+    // Drawn, from an atlas holding this frame's two glyphs and not the old one.
+    try testing.expectEqual(2, fixture.renderer.instances.items.len);
+    try testing.expectEqual(2, atlas.count());
+    try testing.expect(!atlas.entries.contains(stale));
+}
+
+test "a frame too big for an empty atlas still fails" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    // Eight pixels square, and a letter sixty-four tall: emptying cannot make
+    // room, so the error comes back after the one try.
+    fixture.renderer.atlas.deinit();
+    fixture.renderer.atlas = try .init(testing.allocator, 8, 8);
+
+    try testing.expectError(error.AtlasFull, fixture.renderer.build(&.{.{
+        .bounding_box = .init(0, 0, 200, 80),
+        .config = .{ .text = .{ .text = "W", .color = .white, .font_size = 64 } },
+    }}, page));
+}
+
+test "a run is placed by its own face's measurements" {
+    // Two fonts whose ascents differ, so a run drawn in the second but put on
+    // the first one's baseline would sit at the wrong height.
+    const sans_bytes = try fontFile(testing.allocator, &.{
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    }) orelse return error.SkipZigTest;
+    defer testing.allocator.free(sans_bytes);
+    const mono_bytes = try fontFile(testing.allocator, &.{
+        "C:/Windows/Fonts/consola.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    }) orelse return error.SkipZigTest;
+    defer testing.allocator.free(mono_bytes);
+
+    const sans: font.Font = try .init(sans_bytes);
+    const mono: font.Font = try .init(mono_bytes);
+    const faces = [_]*const font.Font{ &sans, &mono };
+    if (sans.at(40).ascent() == mono.at(40).ascent()) return error.SkipZigTest;
+
+    var device: rhi.Device = try .init(testing.allocator, .{ .backend = .none });
+    defer device.deinit();
+    var renderer: Renderer = try .init(testing.allocator, &device, &sans);
+    defer renderer.deinit();
+    try renderer.setFaces(&faces);
+
+    try renderer.build(&.{
+        .{
+            .bounding_box = .init(0, 100, 400, 50),
+            .config = .{ .text = .{ .text = "H", .color = .white, .font_size = 40 } },
+        },
+        .{
+            .bounding_box = .init(0, 100, 400, 50),
+            .config = .{ .text = .{ .text = "H", .color = .white, .font_size = 40, .font = 1 } },
+        },
+    }, page);
+
+    try testing.expectEqual(2, renderer.instances.items.len);
+    for (faces, renderer.instances.items, 0..) |face, instance, slot| {
+        const entry = renderer.atlas.entries.get(.{ .face = @intCast(slot), .glyph = face.glyphFor('H'), .size = 40 }) orelse
+            return error.TestUnexpectedResult;
+        // One ascent down the line, less how far above the baseline the
+        // glyph's top row is - both in the run's own face.
+        const top = 100 + face.at(40).ascent() - @as(f32, @floatFromInt(entry.top));
+        try testing.expectApproxEqAbs(top, instance.rect[1], 0.001);
+    }
 }
 
 test "a scissor pair splits the frame into batches" {

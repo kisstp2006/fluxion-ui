@@ -1113,9 +1113,24 @@ clamped to zero and one is a one-pixel antialiased edge that needs no
 multisampling and no extra geometry. A border is the same field twice, with
 the inner one subtracted.
 
-Glyphs live in one `r8_unorm` atlas, packed on shelves and keyed by glyph *and*
-size together - the same letter at 12 pixels and at 13 is two different
+Glyphs live in one `r8_unorm` atlas, packed on shelves and keyed by face, glyph
+*and* size together - the same letter at 12 pixels and at 13 is two different
 pictures, and there is no scaling one into the other that does not look wrong.
+An atlas that fills up is emptied and the frame built again, so glyphs at sizes
+nothing draws any more cannot run it out of room for good.
+
+**More than one font.** A text run's `font` is an index into the renderer's
+faces, which are `init`'s one until `setFaces` says otherwise:
+
+```zig
+try renderer.setFaces(&.{ &interface_face, &code_face });   // .font = 1 is code
+```
+
+The first is the default, and an index past the end is drawn in it. Putting
+another face at a slot forgets that slot's glyphs; a font read again in place
+keeps its pointer, so it says so with `renderer.forgetFace(slot)`. The measurer
+the layout used has to measure each run in the same face - the same table in
+the same order - or lines break where the text is not.
 
 Both dependencies are lazy. A program that only lays out, or that brings its
 own renderer, fetches neither.

@@ -55,7 +55,9 @@ pub const TextStyle = struct {
     /// Where a line sits when the others are wider than it.
     alignment: AlignX = .left,
     /// Which font, as an index into whatever table the measurer was built
-    /// with. Zero is the default one.
+    /// with. Zero is the default one. The renderer has to have the same
+    /// table in the same order, or a run is measured in one face and drawn
+    /// in another.
     font: u16 = 0,
 
     /// The three lengths multiplied by an interface scale.

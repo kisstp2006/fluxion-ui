@@ -85,8 +85,9 @@ pub const Text = struct {
     font_size: u16,
     letter_spacing: u16 = 0,
     line_height: u16 = 0,
-    /// Which font, as an index into whatever table the caller registered.
-    /// Zero is "the default one".
+    /// Which font, as an index into whatever table the caller registered -
+    /// `Renderer.setFaces`, for the ready-made renderer. Zero is "the default
+    /// one".
     font: u16 = 0,
 
     /// What moves, tints or hides the glyphs of this run, and how many

@@ -8,10 +8,13 @@
 //! into a shared image, and drawn from there for the life of the program -
 //! which turns the whole of a frame's text into one instanced draw.
 //!
-//! **Keyed by glyph and size together.** The same letter at 12 pixels and at
-//! 13 is two different pictures, and there is no scaling one into the other
-//! that does not look wrong. A UI that uses four sizes ends up with four
-//! copies of its alphabet, which is a few hundred kilobytes and worth it.
+//! **Keyed by face, glyph and size together.** The same letter at 12 pixels
+//! and at 13 is two different pictures, and there is no scaling one into the
+//! other that does not look wrong. A UI that uses four sizes ends up with
+//! four copies of its alphabet, which is a few hundred kilobytes and worth
+//! it. And glyph 43 of one font is not glyph 43 of another, so the face is in
+//! the key too - as the slot it has in the renderer's table, which is also
+//! what a face that changed is forgotten by.
 //!
 //! Packed on shelves: a row is opened as tall as the first glyph put in it,
 //! filled left to right, and closed when the next glyph will not fit. Not the
@@ -23,7 +26,7 @@
 //! var atlas: Atlas = try .init(gpa, 1024, 1024);
 //! defer atlas.deinit();
 //!
-//! const entry = try atlas.glyph(&face, face.glyphFor('H'), 16);
+//! const entry = try atlas.glyph(&face, 0, face.glyphFor('H'), 16);
 //! // entry.u0, entry.v0, entry.u1, entry.v1 are where it is in the texture.
 //! ```
 
@@ -65,8 +68,10 @@ pub const Entry = struct {
     }
 };
 
-/// A glyph at a size. The two together, because they have to be.
+/// A glyph of a face at a size. All three, because they have to be.
 pub const Key = struct {
+    /// Which face, as its slot in the renderer's table.
+    face: u16,
     glyph: u16,
     size: u16,
 };
@@ -109,12 +114,15 @@ pub fn deinit(self: *Atlas) void {
 
 /// Where a glyph is, rasterising and packing it if this is the first time.
 ///
+/// `slot` is which face this is, and is part of the key: the atlas never
+/// compares fonts, so two faces given the same slot share their glyphs.
+///
 /// The size is in whole pixels per em. Rounding it here rather than at the
 /// call site is deliberate: a layout that animates a font size through
 /// fractional values would otherwise fill the atlas with a hundred nearly
 /// identical alphabets.
-pub fn glyph(self: *Atlas, face: *const font.Font, index: u16, size: u16) Error!Entry {
-    const key: Key = .{ .glyph = index, .size = size };
+pub fn glyph(self: *Atlas, face: *const font.Font, slot: u16, index: u16, size: u16) Error!Entry {
+    const key: Key = .{ .face = slot, .glyph = index, .size = size };
     if (self.entries.get(key)) |found| return found;
 
     var rendered = try face.render(self.gpa, index, face.scaleFor(@floatFromInt(size)));
@@ -189,6 +197,37 @@ pub inline fn count(self: Atlas) u32 {
     return self.entries.count();
 }
 
+/// Forget every glyph of one face, so each is rasterised again the next time
+/// it is asked for - from whatever the face in that slot is by then.
+///
+/// **The room they took is not given back.** Shelves cannot be packed again
+/// around a hole, so the pixels stay where they are until `clear` starts the
+/// atlas over. Forgetting is for the rare thing, a font swapped or read again
+/// in place, and a renderer that runs out of room clears.
+pub fn forget(self: *Atlas, slot: u16) void {
+    var walk = self.entries.iterator();
+    while (walk.next()) |entry| {
+        // Safe while walking: a removal only marks the slot the walk has
+        // just passed as deleted, and moves nothing.
+        if (entry.key_ptr.face == slot) self.entries.removeByPtr(entry.key_ptr);
+    }
+}
+
+/// Throw every glyph away and start again at the top left.
+///
+/// The pixels are cleared as well as the entries. A glyph packed later lands
+/// on top of old ink, and its one pixel of padding is only padding if it is
+/// empty - otherwise the sampler reaches into what was there before, and the
+/// new letter grows the old one's edges.
+pub fn clear(self: *Atlas) void {
+    self.entries.clearRetainingCapacity();
+    @memset(self.pixels, 0);
+    self.pen_x = padding;
+    self.pen_y = padding;
+    self.shelf_height = 0;
+    self.dirty = true;
+}
+
 /// Say the texture has been uploaded. See `dirty`.
 pub inline fn markClean(self: *Atlas) void {
     self.dirty = false;
@@ -219,14 +258,14 @@ test "a glyph is rasterised once and found again after that" {
     var atlas: Atlas = try .init(testing.allocator, 256, 256);
     defer atlas.deinit();
 
-    const first = try atlas.glyph(&face, face.glyphFor('H'), 16);
+    const first = try atlas.glyph(&face, 0, face.glyphFor('H'), 16);
     try testing.expectEqual(1, atlas.count());
     try testing.expect(!first.isBlank());
     try testing.expect(first.advance > 0);
 
     // The second ask is the same entry and adds nothing - which is the whole
     // point of an atlas.
-    const again = try atlas.glyph(&face, face.glyphFor('H'), 16);
+    const again = try atlas.glyph(&face, 0, face.glyphFor('H'), 16);
     try testing.expectEqual(1, atlas.count());
     try testing.expectEqual(first.u0, again.u0);
     try testing.expectEqual(first.v0, again.v0);
@@ -240,8 +279,8 @@ test "the same letter at two sizes is two pictures" {
     var atlas: Atlas = try .init(testing.allocator, 256, 256);
     defer atlas.deinit();
 
-    const small = try atlas.glyph(&face, face.glyphFor('H'), 12);
-    const large = try atlas.glyph(&face, face.glyphFor('H'), 24);
+    const small = try atlas.glyph(&face, 0, face.glyphFor('H'), 12);
+    const large = try atlas.glyph(&face, 0, face.glyphFor('H'), 24);
 
     try testing.expectEqual(2, atlas.count());
     try testing.expect(large.height > small.height);
@@ -258,7 +297,7 @@ test "a space takes an entry and no room" {
     defer atlas.deinit();
 
     const before = atlas.pen_x;
-    const space = try atlas.glyph(&face, face.glyphFor(' '), 16);
+    const space = try atlas.glyph(&face, 0, face.glyphFor(' '), 16);
 
     // The advance is on it, so the pen still moves; there is nothing to draw,
     // so the shelf did not.
@@ -278,7 +317,7 @@ test "glyphs go onto shelves, and a new shelf starts below the last" {
 
     var lowest: f32 = 0;
     for ("abcdefghijklmnop") |character| {
-        const entry = try atlas.glyph(&face, face.glyphFor(character), 16);
+        const entry = try atlas.glyph(&face, 0, face.glyphFor(character), 16);
         lowest = @max(lowest, entry.v1);
     }
 
@@ -298,7 +337,7 @@ test "an atlas too small to hold a glyph says so rather than overrunning" {
     defer atlas.deinit();
 
     // A 64-pixel letter into an eight-pixel atlas.
-    try testing.expectError(error.AtlasFull, atlas.glyph(&face, face.glyphFor('W'), 64));
+    try testing.expectError(error.AtlasFull, atlas.glyph(&face, 0, face.glyphFor('W'), 64));
 }
 
 test "adding a glyph marks the texture as needing an upload" {
@@ -310,7 +349,7 @@ test "adding a glyph marks the texture as needing an upload" {
     defer atlas.deinit();
 
     try testing.expect(!atlas.dirty);
-    _ = try atlas.glyph(&face, face.glyphFor('A'), 16);
+    _ = try atlas.glyph(&face, 0, face.glyphFor('A'), 16);
     try testing.expect(atlas.dirty);
 
     atlas.markClean();
@@ -318,7 +357,7 @@ test "adding a glyph marks the texture as needing an upload" {
 
     // A glyph already in it changes nothing, so a frame that draws only what
     // it drew last frame uploads nothing.
-    _ = try atlas.glyph(&face, face.glyphFor('A'), 16);
+    _ = try atlas.glyph(&face, 0, face.glyphFor('A'), 16);
     try testing.expect(!atlas.dirty);
 }
 
@@ -330,7 +369,7 @@ test "the pixels of a glyph actually reach the atlas" {
     var atlas: Atlas = try .init(testing.allocator, 256, 256);
     defer atlas.deinit();
 
-    const entry = try atlas.glyph(&face, face.glyphFor('H'), 32);
+    const entry = try atlas.glyph(&face, 0, face.glyphFor('H'), 32);
 
     // Somewhere inside the letter there is ink. A packer that computed the
     // right rectangle and copied nothing would pass every test above this
@@ -344,4 +383,72 @@ test "the pixels of a glyph actually reach the atlas" {
         }
     }
     try testing.expect(ink > 10);
+}
+
+test "the same glyph in two faces is two pictures" {
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const face: font.Font = try .init(bytes);
+
+    var atlas: Atlas = try .init(testing.allocator, 256, 256);
+    defer atlas.deinit();
+
+    // One font in two slots is enough to see it: the slot is in the key, so
+    // the second is rasterised again rather than taken for the first - which
+    // is what stops glyph 43 of one font being drawn as glyph 43 of another.
+    const first = try atlas.glyph(&face, 0, face.glyphFor('H'), 16);
+    const second = try atlas.glyph(&face, 1, face.glyphFor('H'), 16);
+
+    try testing.expectEqual(2, atlas.count());
+    try testing.expect(first.u0 != second.u0 or first.v0 != second.v0);
+}
+
+test "forgetting a face drops its glyphs and keeps the other faces'" {
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const face: font.Font = try .init(bytes);
+
+    var atlas: Atlas = try .init(testing.allocator, 256, 256);
+    defer atlas.deinit();
+
+    for ([_]u16{ 0, 1 }) |slot| {
+        for ("ABC") |character| _ = try atlas.glyph(&face, slot, face.glyphFor(character), 16);
+    }
+    try testing.expectEqual(6, atlas.count());
+
+    atlas.forget(1);
+    try testing.expectEqual(3, atlas.count());
+
+    // The first face's are still there, so asking adds nothing; the
+    // forgotten face's are rasterised again when they are next asked for.
+    _ = try atlas.glyph(&face, 0, face.glyphFor('A'), 16);
+    try testing.expectEqual(3, atlas.count());
+    _ = try atlas.glyph(&face, 1, face.glyphFor('A'), 16);
+    try testing.expectEqual(4, atlas.count());
+}
+
+test "clearing an atlas starts it again, pixels and all" {
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const face: font.Font = try .init(bytes);
+
+    var atlas: Atlas = try .init(testing.allocator, 256, 256);
+    defer atlas.deinit();
+
+    const before = try atlas.glyph(&face, 0, face.glyphFor('H'), 32);
+    _ = try atlas.glyph(&face, 0, face.glyphFor('W'), 32);
+    atlas.markClean();
+
+    atlas.clear();
+    try testing.expectEqual(0, atlas.count());
+    try testing.expectEqual(0, atlas.shelf_height);
+    // Blank, because old ink under the next glyph's padding would bleed into
+    // it - and marked, so the blank texture is what gets uploaded.
+    try testing.expect(std.mem.allEqual(u8, atlas.pixels, 0));
+    try testing.expect(atlas.dirty);
+
+    // The next glyph goes back to the top left, where the first one was.
+    const after = try atlas.glyph(&face, 0, face.glyphFor('H'), 32);
+    try testing.expectEqual(before.u0, after.u0);
+    try testing.expectEqual(before.v0, after.v0);
 }
