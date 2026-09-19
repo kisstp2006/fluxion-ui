@@ -18,8 +18,8 @@
         // here rather than imported by the library: a layout asks how wide a
         // run of text is and does not care who answers - see `text.Measurer`.
         .fluxion_font = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-font#38615f1e07dcb7ddaa0959ef4ea27a1ea115ac2d",
-            .hash = "fluxion_font-0.1.0-f3pT4n3pAwChQk8rk88uwmL4cZDTLTwWBXcu-VUqvM5K",
+            .url = "git+https://github.com/kisstp2006/fluxion-font#f666e62f498e5bfe04361c7f1bf6531334a51dbf",
+            .hash = "fluxion_font-0.1.0-f3pT4rn1AwBbbEom4emICxRn1vGPQvsRhUc0_lCawLB8",
             .lazy = true,
         },
 
@@ -28,8 +28,8 @@
         // program with its own renderer never fetches this. Pinned to a commit
         // that draws in browsers and on Android.
         .fluxion_rhi = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-rhi#5ba39058c8334cee35f3b209a648c634c6776cf3",
-            .hash = "fluxion_rhi-0.1.0--pvwD-e8BADncd8vWuzTWsJoN-iTu-CcJmysypgstbuQ",
+            .url = "git+https://github.com/kisstp2006/fluxion-rhi#fcacf7bdb59fe17bebba3931457dbc50ce33e554",
+            .hash = "fluxion_rhi-0.1.0--pvwDyreBAD3zimVoEHTTd5BhOtXewjOEF_1D75nhG9o",
             .lazy = true,
         },
 
@@ -39,16 +39,16 @@
         // repository three times, in three languages, drifting apart.
         // Pinned to a commit that writes GLSL ES 3.00 as well.
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#929418fd6bcdd887414d3cda2328684b50368bd8",
-            .hash = "fluxion_shader-0.1.0-FqFMEmaMAwA0kjWxXizOFk30I7U5UDuPgk-063ElX_5X",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#bc1e8ba69ad815f0b3b2a390bf9503f426eda8fc",
+            .hash = "fluxion_shader-0.1.0-FqFMEuiMAwAGGD5JIj6FQ0kr2OC3Z_f1uhrxHuCBT_Ob",
             .lazy = true,
         },
 
         // The window one example opens. Lazy, and the library imports it
         // nowhere: a layout engine has no business opening windows.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#f59b5bc8c504a1abb0fc0e1e5807f9cc364dc39a",
-            .hash = "fluxion_platform-0.1.0-WsOjUZ3mEwCC2n9VdBIhaYA07ujr8aTEpynZq4CSOmeR",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#65f360fa3484c241438def3856c5b48b4a3e8cc9",
+            .hash = "fluxion_platform-0.1.0-WsOjUR1ZFwANXOiIAk3n_vA70LebrBMH_PV2d4GPkjyB",
             .lazy = true,
         },
     },
