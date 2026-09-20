@@ -410,6 +410,7 @@ pub const Declaration = struct {
         out.clip = self.clip.scaled(by);
         if (self.border) |line| out.border = line.scaled(by);
         if (self.floating) |float| out.floating = float.scaled(by);
+        if (self.image) |picture| out.image = picture.scaled(by);
         return out;
     }
 };
@@ -745,7 +746,43 @@ pub const Image = struct {
     /// tints it - which is how one white icon becomes every colour of icon.
     /// Also not in Ply.
     tint: Color = .white,
+    nine_slice: ?NineSlice = null,
+
+    pub fn scaled(self: Image, by: f32) Image {
+        var out = self;
+        if (self.nine_slice) |slice| out.nine_slice = slice.scaled(by);
+        return out;
+    }
 };
+
+/// Four fixed borders around a stretchable centre. Source borders are
+/// fractions of `Image.source`; destination borders are interface pixels.
+pub const NineSlice = struct {
+    source_left: f32,
+    source_right: f32,
+    source_top: f32,
+    source_bottom: f32,
+    border: geometry.Padding,
+
+    pub fn scaled(self: NineSlice, by: f32) NineSlice {
+        var out = self;
+        out.border = self.border.scaled(by);
+        return out;
+    }
+};
+
+test "a nine-slice scales only its destination border" {
+    const slice: NineSlice = .{
+        .source_left = 0.25,
+        .source_right = 0.25,
+        .source_top = 0.25,
+        .source_bottom = 0.25,
+        .border = .all(8),
+    };
+    const scaled = slice.scaled(1.5);
+    try testing.expectEqual(geometry.Padding.all(12), scaled.border);
+    try testing.expectEqual(@as(f32, 0.25), scaled.source_left);
+}
 
 /// An element positioned against another one rather than laid out in the
 /// flow. Ply's `FloatingConfig`.

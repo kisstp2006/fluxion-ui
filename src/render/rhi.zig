@@ -550,21 +550,16 @@ pub const Renderer = struct {
                     }
                     bound = wanted;
 
-                    try self.instances.append(self.gpa, .{
-                        .rect = boxArray(command.bounding_box),
-                        .color = picture.tint.array(),
-                        .radii = picture.corner_radius.array(),
-                        .uv = .{
-                            picture.source.x,
-                            picture.source.y,
-                            picture.source.right(),
-                            picture.source.bottom(),
-                        },
-                        .motion = turn.motion,
-                        .border = 0,
-                        .textured = Instance.Kind.image,
-                        .origin = turn.origin,
-                    });
+                    if (picture.nine_slice) |slice| {
+                        try self.addNineSlice(command.bounding_box, picture, slice, turn.motion, turn.origin);
+                    } else try self.instances.append(self.gpa, imageInstance(
+                        boxArray(command.bounding_box),
+                        .{ picture.source.x, picture.source.y, picture.source.right(), picture.source.bottom() },
+                        turn.motion,
+                        turn.origin,
+                        picture.tint,
+                        picture.corner_radius.array(),
+                    ));
                 },
                 .none => {},
             }
@@ -740,16 +735,7 @@ pub const Renderer = struct {
             };
 
             if (run.effects.len == 0) {
-                try self.instances.append(self.gpa, .{
-                    .rect = box,
-                    .color = run.color.array(),
-                    .radii = @splat(0),
-                    .uv = .{ entry.u0, entry.v0, entry.u1, entry.v1 },
-                    .motion = turn.motion,
-                    .border = 0,
-                    .textured = Instance.Kind.glyph,
-                    .origin = turn.origin,
-                });
+                try self.addGlyph(box, .{ entry.u0, entry.v0, entry.u1, entry.v1 }, turn.motion, turn.origin, run.color, run.outline);
                 continue;
             }
 
@@ -784,17 +770,75 @@ pub const Renderer = struct {
             };
             const both = turnOf(glyph.then(command.transform));
 
-            try self.instances.append(self.gpa, .{
-                .rect = box,
-                .color = colour.array(),
-                .radii = @splat(0),
-                .uv = .{ entry.u0, entry.v0, entry.u1, entry.v1 },
-                .motion = both.motion,
-                .border = 0,
-                .textured = Instance.Kind.glyph,
-                .origin = both.origin,
-            });
+            try self.addGlyph(box, .{ entry.u0, entry.v0, entry.u1, entry.v1 }, both.motion, both.origin, colour, run.outline);
         }
+    }
+
+    fn addGlyph(
+        self: *Renderer,
+        box: [4]f32,
+        uv: [4]f32,
+        motion: [4]f32,
+        origin: [2]f32,
+        color: ui.Color,
+        outline: ?ui.TextOutline,
+    ) Allocator.Error!void {
+        if (outline) |stroke| {
+            if (stroke.width > 0 and !stroke.color.invisible()) {
+                const width: f32 = @floatFromInt(stroke.width);
+                const offsets = [_][2]f32{
+                    .{ -width, -width }, .{ 0, -width },    .{ width, -width },
+                    .{ -width, 0 },      .{ width, 0 },     .{ -width, width },
+                    .{ 0, width },       .{ width, width },
+                };
+                for (offsets) |offset| {
+                    var shifted = box;
+                    shifted[0] += offset[0];
+                    shifted[1] += offset[1];
+                    try self.instances.append(self.gpa, glyphInstance(shifted, uv, motion, origin, stroke.color));
+                }
+            }
+        }
+        try self.instances.append(self.gpa, glyphInstance(box, uv, motion, origin, color));
+    }
+
+    fn addNineSlice(
+        self: *Renderer,
+        box: ui.BoundingBox,
+        picture: ui.commands.Image,
+        slice: ui.NineSlice,
+        motion: [4]f32,
+        origin: [2]f32,
+    ) Allocator.Error!void {
+        const x = splitAxis(box.x, box.width, slice.border.left, slice.border.right);
+        const y = splitAxis(box.y, box.height, slice.border.top, slice.border.bottom);
+        const source = picture.source;
+        const u = splitSpan(
+            source.x,
+            source.width,
+            source.width * std.math.clamp(slice.source_left, 0, 1),
+            source.width * std.math.clamp(slice.source_right, 0, 1),
+        );
+        const v = splitSpan(
+            source.y,
+            source.height,
+            source.height * std.math.clamp(slice.source_top, 0, 1),
+            source.height * std.math.clamp(slice.source_bottom, 0, 1),
+        );
+
+        for (0..3) |row| for (0..3) |column| {
+            const width = x[column + 1] - x[column];
+            const height = y[row + 1] - y[row];
+            if (width <= 0 or height <= 0) continue;
+            try self.instances.append(self.gpa, imageInstance(
+                .{ x[column], y[row], width, height },
+                .{ u[column], v[row], u[column + 1], v[row + 1] },
+                motion,
+                origin,
+                picture.tint,
+                nineSliceRadii(picture.corner_radius.array(), column, row),
+            ));
+        };
     }
 
     fn closeBatch(
@@ -833,6 +877,70 @@ pub const Renderer = struct {
         self.instance_capacity = capacity;
     }
 };
+
+fn glyphInstance(
+    box: [4]f32,
+    uv: [4]f32,
+    motion: [4]f32,
+    origin: [2]f32,
+    color: ui.Color,
+) Instance {
+    return .{
+        .rect = box,
+        .color = color.array(),
+        .radii = @splat(0),
+        .uv = uv,
+        .motion = motion,
+        .border = 0,
+        .textured = Instance.Kind.glyph,
+        .origin = origin,
+    };
+}
+
+fn imageInstance(
+    box: [4]f32,
+    uv: [4]f32,
+    motion: [4]f32,
+    origin: [2]f32,
+    tint: ui.Color,
+    radii: [4]f32,
+) Instance {
+    return .{
+        .rect = box,
+        .color = tint.array(),
+        .radii = radii,
+        .uv = uv,
+        .motion = motion,
+        .border = 0,
+        .textured = Instance.Kind.image,
+        .origin = origin,
+    };
+}
+
+fn splitAxis(start: f32, length: f32, first: u16, last: u16) [4]f32 {
+    return splitSpan(start, length, @floatFromInt(first), @floatFromInt(last));
+}
+
+fn splitSpan(start: f32, length: f32, first: f32, last: f32) [4]f32 {
+    var before = first;
+    var after = last;
+    const total = before + after;
+    if (total > length and total > 0) {
+        const scale = length / total;
+        before *= scale;
+        after *= scale;
+    }
+    return .{ start, start + before, start + length - after, start + length };
+}
+
+fn nineSliceRadii(radii: [4]f32, column: usize, row: usize) [4]f32 {
+    var out: [4]f32 = @splat(0);
+    if (column == 0 and row == 0) out[0] = radii[0];
+    if (column == 2 and row == 0) out[1] = radii[1];
+    if (column == 2 and row == 2) out[2] = radii[2];
+    if (column == 0 and row == 2) out[3] = radii[3];
+    return out;
+}
 
 inline fn boxArray(box: ui.BoundingBox) [4]f32 {
     return .{ box.x, box.y, box.width, box.height };
@@ -1021,6 +1129,27 @@ test "text becomes one instance per glyph, advancing along the line" {
     // And the glyphs went into the atlas, so the texture needs uploading.
     try testing.expect(fixture.renderer.atlas.dirty);
     try testing.expectEqual(2, fixture.renderer.atlas.count());
+}
+
+test "a text outline is drawn behind the glyph" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    try fixture.renderer.build(&.{.{
+        .bounding_box = .init(20, 30, 200, 20),
+        .config = .{ .text = .{
+            .text = "A",
+            .color = .white,
+            .font_size = 16,
+            .outline = .{ .color = .black, .width = 2 },
+        } },
+    }}, page);
+
+    const instances = fixture.renderer.instances.items;
+    try testing.expectEqual(@as(usize, 9), instances.len);
+    try testing.expectEqual(ui.Color.black.array(), instances[0].color);
+    try testing.expectEqual(ui.Color.white.array(), instances[8].color);
+    try testing.expect(instances[0].rect[0] < instances[8].rect[0]);
 }
 
 test "a space moves the pen and adds no instance" {
@@ -1686,6 +1815,43 @@ test "a picture is one instance, tinted, with the source rectangle as its uv" {
     // And the batch asks for that texture rather than the atlas.
     try testing.expectEqual(@as(usize, 1), fixture.renderer.batches.items.len);
     try testing.expect(fixture.renderer.batches.items[0].texture != null);
+}
+
+test "a nine-slice keeps its borders and stretches its centre" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const texture = try fixture.device.createTexture(.{ .width = 12, .height = 12, .usage = .{ .sampled = true } });
+    defer fixture.device.destroyTexture(texture);
+    fixture.renderer.setTextures(&.{texture});
+
+    try fixture.renderer.build(&.{.{
+        .bounding_box = .init(10, 20, 100, 60),
+        .config = .{ .image = .{
+            .texture = 0,
+            .corner_radius = .all(4),
+            .nine_slice = .{
+                .source_left = 0.25,
+                .source_right = 0.25,
+                .source_top = 0.25,
+                .source_bottom = 0.25,
+                .border = .all(12),
+            },
+        } },
+    }}, .init(200, 200));
+
+    const instances = fixture.renderer.instances.items;
+    try testing.expectEqual(@as(usize, 9), instances.len);
+    try testing.expectEqual([4]f32{ 10, 20, 12, 12 }, instances[0].rect);
+    try testing.expectEqual([4]f32{ 4, 0, 0, 0 }, instances[0].radii);
+    try testing.expectEqual([4]f32{ 22, 32, 76, 36 }, instances[4].rect);
+    try testing.expectEqual([4]f32{ 0.25, 0.25, 0.75, 0.75 }, instances[4].uv);
+    try testing.expectEqual([4]f32{ 98, 68, 12, 12 }, instances[8].rect);
+    try testing.expectEqual(@as(usize, 1), fixture.renderer.batches.items.len);
+}
+
+test "nine-slice borders meet instead of crossing" {
+    try testing.expectEqual([4]f32{ 10, 15, 15, 20 }, splitSpan(10, 10, 8, 8));
 }
 
 test "the background of an image is a rectangle under it" {

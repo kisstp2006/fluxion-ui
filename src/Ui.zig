@@ -2252,6 +2252,7 @@ fn emitPiece(
             .letter_spacing = style.letter_spacing,
             .line_height = @intFromFloat(@round(box.height)),
             .font = style.font,
+            .outline = style.outline,
             .effects = effects,
             .first = first,
         } },
@@ -2524,6 +2525,7 @@ fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
                 .texture = picture.texture,
                 .source = picture.source,
                 .tint = picture.tint,
+                .nine_slice = picture.nine_slice,
             } },
         });
         return;

@@ -68,6 +68,7 @@ pub const Clip = layout.Clip;
 pub const Scrollbar = layout.Scrollbar;
 pub const CursorShape = layout.CursorShape;
 pub const Focus = layout.Focus;
+pub const NineSlice = layout.NineSlice;
 
 pub const AlignX = geometry.AlignX;
 pub const AlignY = geometry.AlignY;
@@ -78,6 +79,7 @@ pub const Navigation = input.Navigation;
 pub const Repeat = input.Repeat;
 
 pub const TextStyle = text.TextStyle;
+pub const TextOutline = text.Outline;
 pub const Measurer = text.Measurer;
 pub const WrapMode = text.WrapMode;
 

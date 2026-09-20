@@ -41,9 +41,21 @@ pub const WrapMode = enum {
     none,
 };
 
+pub const Outline = struct {
+    color: Color = .black,
+    width: u16 = 1,
+
+    pub inline fn scaled(self: Outline, by: f32) Outline {
+        var out = self;
+        out.width = geometry.scaleWhole(self.width, by);
+        return out;
+    }
+};
+
 /// How a run of text is drawn. Ply's `TextConfig`, under Ply's names.
 pub const TextStyle = struct {
     color: Color = .white,
+    outline: ?Outline = null,
     /// The em size, in pixels.
     font_size: u16 = 16,
     /// Extra pixels between one character and the next.
@@ -72,6 +84,7 @@ pub const TextStyle = struct {
         out.font_size = geometry.scaleWhole(self.font_size, by);
         out.letter_spacing = geometry.scaleWhole(self.letter_spacing, by);
         out.line_height = geometry.scaleWhole(self.line_height, by);
+        if (self.outline) |outline| out.outline = outline.scaled(by);
         return out;
     }
 };
@@ -304,6 +317,11 @@ test "letter spacing widens every character" {
 test "the style can override the line height, and zero means ask the font" {
     try testing.expectEqual(@as(f32, 16), mono.lineHeight(plain));
     try testing.expectEqual(@as(f32, 24), mono.lineHeight(.{ .font_size = 16, .line_height = 24 }));
+}
+
+test "an outline scales with the rest of its text" {
+    const style: TextStyle = .{ .outline = .{ .color = .black, .width = 2 } };
+    try testing.expectEqual(@as(u16, 3), style.scaled(1.5).outline.?.width);
 }
 
 test "words come out with their spaces measured separately" {

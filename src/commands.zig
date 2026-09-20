@@ -42,6 +42,7 @@ const testing = std.testing;
 const geometry = @import("geometry.zig");
 const markup = @import("markup.zig");
 const layout = @import("layout.zig");
+const text_mod = @import("text.zig");
 
 const BoundingBox = geometry.BoundingBox;
 const Color = @import("color.zig").Color;
@@ -89,6 +90,7 @@ pub const Text = struct {
     /// `Renderer.setFaces`, for the ready-made renderer. Zero is "the default
     /// one".
     font: u16 = 0,
+    outline: ?text_mod.Outline = null,
 
     /// What moves, tints or hides the glyphs of this run, and how many
     /// characters into the whole run its first glyph is.
@@ -120,6 +122,7 @@ pub const Image = struct {
     source: BoundingBox = .init(0, 0, 1, 1),
     /// Multiplied into the image. White leaves it alone.
     tint: Color = .white,
+    nine_slice: ?layout.NineSlice = null,
 };
 
 /// What a command actually asks for.
