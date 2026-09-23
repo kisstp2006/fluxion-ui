@@ -4113,6 +4113,16 @@ pub fn navigate(self: *Ui, to: input.Navigation) bool {
     return self.focus != before;
 }
 
+/// Whether the focus is on something that takes it - a button, a field,
+/// anything declared with `.focus` - rather than on whatever a press last
+/// landed on. The arrow keys and a pad move the focus on from the one, and
+/// are the program's own on the other: a game walks its character with them
+/// until a menu has the focus, and an editor walks its lists.
+pub fn navigable(self: *Ui) bool {
+    const at = self.focusedHit() orelse return false;
+    return self.hits.items[at].focus != null;
+}
+
 /// Say which way a pad is held, once a frame, before `begin` - or null when
 /// it is not held at all.
 ///
@@ -10953,6 +10963,22 @@ test "Tab walks what takes the focus in the order it was declared, and comes rou
     try testing.expect(ui.isFocused("name"));
     _ = ui.navigate(.previous);
     try testing.expect(ui.isFocused("quit"));
+}
+
+test "the focus is navigable on what takes it, and not on what a press only landed on" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    try focusMenu(&ui);
+
+    try testing.expect(!ui.navigable());
+    ui.setFocus("spacer");
+    try testing.expect(!ui.navigable());
+    ui.setFocus("options");
+    try testing.expect(ui.navigable());
+    ui.setFocus("name");
+    try testing.expect(ui.navigable());
+    ui.clearFocus();
+    try testing.expect(!ui.navigable());
 }
 
 test "Shift+Tab from nothing starts at the end" {
