@@ -343,6 +343,15 @@ pub const Declaration = struct {
     /// Turn only this element's own box, leaving its children where they
     /// were. Ply's `rotate_shape`.
     rotate_shape: ?Rotation = null,
+    /// Grow or shrink this element **and everything inside it**, about a
+    /// point of its box, as `rotate` turns it: the layout does not change,
+    /// and neither do the boxes beside it. What a button that pops in is
+    /// drawn with. See `Scale`.
+    scale: ?Scale = null,
+    /// How much of this element **and everything inside it** shows: every
+    /// colour's alpha, times this, times its parent's. What a panel fading in
+    /// is drawn with. The pointer finds it all the same.
+    opacity: f32 = 1,
 
     /// Whether the pointer stops here rather than reaching what is behind.
     /// Ply's `.capture()`, and what a button inside a draggable panel wants:
@@ -714,6 +723,44 @@ pub const Rotation = struct {
             self.flip_x,
             self.flip_y,
         );
+    }
+};
+
+/// A size, about a point: what `Declaration.scale` grows an element by.
+///
+/// ```zig
+/// .scale = .by(1.2),                                  // about its middle
+/// .scale = .{ .factor = 0.5, .pivot = .{ .x = 0, .y = 0 } },
+/// ```
+///
+/// One factor for both axes: a stretch would make a rounded corner an oval
+/// and the pointer's way back into the box a division by two numbers.
+pub const Scale = struct {
+    factor: f32 = 1,
+    /// Where it grows from, in fractions of the element's own box. The
+    /// middle by default, as a turn's pivot is.
+    pivot: geometry.Vec2 = .{ .x = 0.5, .y = 0.5 },
+
+    pub inline fn by(factor: f32) Scale {
+        return .{ .factor = factor };
+    }
+
+    /// Whether it leaves everything the size it was.
+    pub inline fn isNone(self: Scale) bool {
+        return self.factor == 1;
+    }
+
+    /// The motion this is, for an element with this box.
+    pub fn motion(self: Scale, box: geometry.BoundingBox) geometry.Transform {
+        const pivot: geometry.Vec2 = .{
+            .x = box.x + box.width * self.pivot.x,
+            .y = box.y + box.height * self.pivot.y,
+        };
+        return .{
+            .x_axis = .{ .x = self.factor, .y = 0 },
+            .y_axis = .{ .x = 0, .y = self.factor },
+            .origin = .{ .x = pivot.x - self.factor * pivot.x, .y = pivot.y - self.factor * pivot.y },
+        };
     }
 };
 

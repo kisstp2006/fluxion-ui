@@ -676,9 +676,10 @@ second.
 
 **The pointer follows.** A rotated button is clickable where it was drawn,
 because the hit test moves the *pointer* into the element's frame rather than
-trying to test a point against a turned rectangle. That is a transpose and a
-subtraction, and it is only the inverse because a `Transform` here is a rigid
-motion - a turn, a mirror and a move, with no scale in it anywhere.
+trying to test a point against a turned rectangle. That is a transpose over the
+square of the scale and a subtraction, and it is only the inverse because a
+`Transform` here is a turn, a mirror, one scale for both axes and a move - no
+shear and no stretch anywhere.
 
 One thing does not turn: **a scissor**. Clipping is axis-aligned in every
 graphics API there is, so a rotated element that clips clips by its unturned
@@ -690,6 +691,29 @@ is still measured in the box's own frame, so a turned rounded corner is still
 round and its edge is still one pixel wide. Ply instead renders the subtree to
 an offscreen target and draws that target rotated, which costs a pass and
 resamples the text; this costs neither.
+
+## Size and opacity
+
+```zig
+.scale = .by(1.2),       // this element and everything in it, about its middle
+.opacity = 0.5,          // this element and everything in it, half there
+```
+
+Two more that go the way `rotate` does: onto what an element and everything
+inside it draws, and never into the layout. **A size** grows or shrinks about
+a `pivot` in fractions of the box, the middle by default, and composes with a
+turn and with the sizes and turns around it; the pointer still finds the
+element where it was drawn, and one shrunk to nothing is found nowhere. One
+factor for both axes, so a rounded corner stays round - its antialiased edge
+grows with it. **An opacity** multiplies the alpha of every colour the element
+and its children draw, its border and its text among them, times its
+ancestors'; at nought nothing of it reaches the list, though the pointer still
+finds it. It is worked into the colours as the commands are made, so a
+renderer draws a fading panel without knowing it fades.
+
+A float declared inside an element - `attach = .parent` - is inside it on
+screen as well, so it turns, grows and fades with it. One attached to the
+root, or to another element by id, does not.
 
 ## Images
 
@@ -1201,6 +1225,7 @@ than from memory.
 | **Painting** | background colours, corner radii, borders on any side with three positions, z-index |
 | **Images** | a texture number, a source rectangle for sheets, a tint, and the same rounded box a rectangle gets |
 | **Rotation** | of an element and its children or of its own box alone, with a pivot and flips, nesting, and a hit test that follows |
+| **Size and opacity** | of an element and its children, about a pivot, nesting with turns, carried to the floats inside it |
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
 | **Animated text** | all nine of Ply's: `wave`, `pulse`, `swing`, `jitter`, `transform`, `gradient`, `type`, `fade` and `scale` |

@@ -29,14 +29,15 @@ const math = @import("fluxion_math");
 /// rest of that library.
 pub const Vec2 = math.Vec2;
 
-/// Where a quad ends up, when something rotated it.
+/// Where a quad ends up, when something turned or grew it.
 ///
-/// A **rigid motion** and nothing more: a turn, a mirror, and where the origin
-/// lands. Not a general matrix - there is no scale and no shear in it, and two
-/// things depend on that. The inverse is the transpose, which is what lets the
-/// pointer be moved into a rotated element's own frame without a division. And
-/// a distance field measured in the element's own space is still measured in
-/// pixels after the motion, so an antialiased edge stays one pixel wide.
+/// A turn, a mirror, **one** scale for both axes, and where the origin lands.
+/// Not a general matrix - there is no shear and no stretch in it, and two
+/// things depend on that. The inverse is the transpose over the square of the
+/// scale, which is what lets the pointer be moved into a turned element's own
+/// frame without solving anything. And a distance field measured in the
+/// element's own space is only scaled by the motion, so a rounded corner is
+/// still round - its antialiased edge is as many pixels wide as the scale.
 ///
 /// Kept as the two axes rather than as an angle and a pivot because that is
 /// what composes: a rotated card holding a rotated icon is one of these, and
@@ -68,14 +69,17 @@ pub const Transform = extern struct {
 
     /// Where a point *came from*: the motion undone.
     ///
-    /// The transpose and a subtraction, which is only the inverse because
-    /// there is no scale in here. What the hit test uses to ask a rotated
-    /// button whether the pointer is on it.
+    /// The transpose over the square of the scale, and a subtraction, which
+    /// is only the inverse because the scale is the same on both axes. What
+    /// the hit test uses to ask a turned button whether the pointer is on
+    /// it. A motion that shrank everything to nothing came from nowhere.
     pub fn unapply(self: Transform, point: Vec2) Vec2 {
+        const squared = self.x_axis.x * self.x_axis.x + self.x_axis.y * self.x_axis.y;
+        if (squared == 0) return .{ .x = std.math.inf(f32), .y = std.math.inf(f32) };
         const moved: Vec2 = .{ .x = point.x - self.origin.x, .y = point.y - self.origin.y };
         return .{
-            .x = self.x_axis.x * moved.x + self.x_axis.y * moved.y,
-            .y = self.y_axis.x * moved.x + self.y_axis.y * moved.y,
+            .x = (self.x_axis.x * moved.x + self.x_axis.y * moved.y) / squared,
+            .y = (self.y_axis.x * moved.x + self.y_axis.y * moved.y) / squared,
         };
     }
 

@@ -155,6 +155,13 @@ const Element = struct {
     /// applied to its own box alone. See `layout.Rotation`.
     rotate: ?layout.Rotation = null,
     rotate_shape: ?layout.Rotation = null,
+    /// A size applied to this element and everything inside it. See
+    /// `layout.Scale`.
+    scale: ?layout.Scale = null,
+    /// Its own `opacity`, and what it comes to once its ancestors' is
+    /// multiplied in: what every colour it draws is faded by.
+    opacity: f32 = 1,
+    fade: f32 = 1,
     /// What was in force when this element was drawn, which is what the hit
     /// test undoes to ask whether the pointer is on it.
     motion: geometry.Transform = .identity,
@@ -604,6 +611,8 @@ const Frame = struct {
     /// What everything in this element is turned by, inherited from its
     /// ancestors and its own `rotate`.
     motion: geometry.Transform = .identity,
+    /// What everything in it is faded by, the same way.
+    fade: f32 = 1,
 
     /// For a wrapping element: the line being placed, how many of it are
     /// down, and where the *next* line starts across the main axis.
@@ -689,6 +698,8 @@ painted: u32 = 0,
 /// emits. Set by `positionAndEmit` and read by the six emitters, which is a
 /// great deal less threading than passing it to all of them.
 stamp: geometry.Transform = .identity,
+/// What its colours are faded by, the same way: see `layout.Declaration.opacity`.
+fade: f32 = 1,
 
 /// What each text input holds, kept between frames.
 ///
@@ -1082,6 +1093,8 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
         .image = declaration.image,
         .rotate = declaration.rotate,
         .rotate_shape = declaration.rotate_shape,
+        .scale = declaration.scale,
+        .opacity = declaration.opacity,
     });
 
     // The new element is a child of whatever is open, unless it is the root -
@@ -1484,7 +1497,7 @@ pub fn end(self: *Ui) Error![]const RenderCommand {
 
     self.painted = 0;
     self.bars.clearRetainingCapacity();
-    try self.positionAndEmit(0, .{ .x = safe.x, .y = safe.y });
+    try self.positionAndEmit(0, .{ .x = safe.x, .y = safe.y }, .{});
     try self.placeFloats();
     try self.measureScroll();
     try self.recordHits();
@@ -2239,7 +2252,10 @@ fn emitPiece(
     effects: []const markup_mod.Effect,
     first: u32,
 ) Error!void {
-    if (piece.len == 0 or ink.invisible()) return;
+    const shown = self.inked(ink);
+    if (piece.len == 0 or shown.invisible()) return;
+    var outline = style.outline;
+    if (outline) |*line| line.color = self.inked(line.color);
     try self.output.append(self.gpa, .{
         .bounding_box = box,
         .id = element.id,
@@ -2247,12 +2263,12 @@ fn emitPiece(
         .transform = self.stamp,
         .config = .{ .text = .{
             .text = piece,
-            .color = ink,
+            .color = shown,
             .font_size = style.font_size,
             .letter_spacing = style.letter_spacing,
             .line_height = @intFromFloat(@round(box.height)),
             .font = style.font,
-            .outline = style.outline,
+            .outline = outline,
             .effects = effects,
             .first = first,
         } },
@@ -2268,7 +2284,15 @@ fn emitPiece(
 /// Depth first with children in order is what puts the list in back-to-front
 /// order without anything having to sort it: a parent's background is written
 /// before its children are visited, and its border after they are done.
-fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
+/// What a tree being drawn is under: nothing for the root, and for a float
+/// declared inside an element, that element's motion and fade - it is inside
+/// it on screen too, so a panel that turns, grows or fades takes it along.
+const Above = struct {
+    motion: geometry.Transform = .identity,
+    fade: f32 = 1,
+};
+
+fn positionAndEmit(self: *Ui, root: u32, at: Point, above: Above) Error!void {
     self.walk.clearRetainingCapacity();
     try self.walk.append(self.gpa, .{
         .element = root,
@@ -2280,10 +2304,14 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
     self.elements.items[root].paint = self.painted;
     self.painted += 1;
 
-    const root_motion = self.turnOf(root, .identity);
+    const root_motion = self.turnOf(root, above.motion);
     self.walk.items[0].motion = root_motion;
     self.elements.items[root].motion = root_motion;
     self.stamp = self.ownTurnOf(root, root_motion);
+    const root_fade = above.fade * self.elements.items[root].opacity;
+    self.walk.items[0].fade = root_fade;
+    self.elements.items[root].fade = root_fade;
+    self.fade = root_fade;
 
     try self.emitBackground(root, self.elements.items[root].box);
     try self.emitText(root, self.elements.items[root].box);
@@ -2308,6 +2336,7 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
             // every side, which looks like a rounding bug and is not.
             if (element.clip.clips()) try self.emitScissor(.scissor_end, element.box);
             self.stamp = self.ownTurnOf(frame.element, frame.motion);
+            self.fade = frame.fade;
             try self.emitBorder(frame.element, element.box);
             try self.emitScrollbars(frame.element, element.box);
             _ = self.walk.pop();
@@ -2394,6 +2423,9 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
         const inherited = self.turnOf(child_index, running.motion);
         self.elements.items[child_index].motion = inherited;
         self.stamp = self.ownTurnOf(child_index, inherited);
+        const child_fade = running.fade * child.opacity;
+        self.elements.items[child_index].fade = child_fade;
+        self.fade = child_fade;
 
         try self.emitBackground(child_index, self.elements.items[child_index].box);
         try self.emitText(child_index, self.elements.items[child_index].box);
@@ -2412,6 +2444,7 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point) Error!void {
             .next_child = self.startOffset(child),
             .line_cross_at = self.crossLeadOf(child),
             .motion = inherited,
+            .fade = child_fade,
         });
     }
 }
@@ -2422,12 +2455,19 @@ fn crossLeadOf(self: *Ui, element: Element) f32 {
     return self.leadOf(element, !element.config.direction.isMainAxisX());
 }
 
-/// What an element and everything inside it is turned by.
+/// What an element and everything inside it is turned and grown by: its
+/// own scale, then its own turn, then what it is inside.
 fn turnOf(self: *Ui, index: u32, inherited: geometry.Transform) geometry.Transform {
     const element = self.elements.items[index];
-    const turn = element.rotate orelse return inherited;
-    if (turn.isNone()) return inherited;
-    return turn.motion(element.box).then(inherited);
+    var own: geometry.Transform = .identity;
+    if (element.scale) |size| {
+        if (!size.isNone()) own = size.motion(element.box);
+    }
+    if (element.rotate) |turn| {
+        if (!turn.isNone()) own = own.then(turn.motion(element.box));
+    }
+    if (own.isIdentity()) return inherited;
+    return own.then(inherited);
 }
 
 /// What an element's **own** drawing is turned by: the above, and then its
@@ -2517,21 +2557,22 @@ fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
             .z_index = element.z_index,
             .transform = self.stamp,
             .config = .{ .image = .{
-                .background_color = if (picture.background_color.invisible())
+                .background_color = self.inked(if (picture.background_color.invisible())
                     element.background_color
                 else
-                    picture.background_color,
+                    picture.background_color),
                 .corner_radius = element.corner_radius.clampTo(box.width, box.height),
                 .texture = picture.texture,
                 .source = picture.source,
-                .tint = picture.tint,
+                .tint = self.inked(picture.tint),
                 .nine_slice = picture.nine_slice,
             } },
         });
         return;
     }
 
-    if (element.background_color.invisible()) return;
+    const fill = self.inked(element.background_color);
+    if (fill.invisible()) return;
 
     try self.output.append(self.gpa, .{
         .bounding_box = box,
@@ -2539,7 +2580,7 @@ fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
         .z_index = element.z_index,
         .transform = self.stamp,
         .config = .{ .rectangle = .{
-            .color = element.background_color,
+            .color = fill,
             .corner_radius = element.corner_radius.clampTo(box.width, box.height),
         } },
     });
@@ -2548,7 +2589,8 @@ fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
 fn emitBorder(self: *Ui, index: u32, box: BoundingBox) Error!void {
     const element = self.elements.items[index];
     const border = element.border orelse return;
-    if (border.color.invisible() or border.width.isNone() or box.empty()) return;
+    const line = self.inked(border.color);
+    if (line.invisible() or border.width.isNone() or box.empty()) return;
 
     try self.output.append(self.gpa, .{
         .bounding_box = box,
@@ -2556,7 +2598,7 @@ fn emitBorder(self: *Ui, index: u32, box: BoundingBox) Error!void {
         .z_index = element.z_index,
         .transform = self.stamp,
         .config = .{ .border = .{
-            .color = border.color,
+            .color = line,
             .width = border.width,
             .position = border.position,
             .corner_radius = element.corner_radius.clampTo(box.width, box.height),
@@ -2698,7 +2740,7 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
                     .z_index = element.z_index,
                     .transform = self.stamp,
                     .config = .{ .rectangle = .{
-                        .color = config.selection_color,
+                        .color = self.inked(config.selection_color),
                         .corner_radius = .sharp,
                     } },
                 });
@@ -2751,7 +2793,7 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
             .z_index = element.z_index,
             .transform = self.stamp,
             .config = .{ .rectangle = .{
-                .color = config.cursor_color,
+                .color = self.inked(config.cursor_color),
                 .corner_radius = .sharp,
             } },
         });
@@ -2882,7 +2924,11 @@ fn placeFloats(self: *Ui) Error!void {
         self.elements.items[float.element].float_visible = if (config.clip) against else null;
 
         if (config.clip) try self.emitScissor(.scissor_start, against);
-        try self.positionAndEmit(float.element, at);
+        const above: Above = if (config.attach == .parent and target != null) .{
+            .motion = self.elements.items[target.?].motion,
+            .fade = self.elements.items[target.?].fade,
+        } else .{};
+        try self.positionAndEmit(float.element, at, above);
         if (config.clip) try self.emitScissor(.scissor_end, against);
     }
 }
@@ -2971,6 +3017,11 @@ fn visibility(config: layout.Scrollbar, idle: f32) f32 {
     return std.math.clamp(1 - through, 0, 1);
 }
 
+/// A colour of the element being drawn, faded as it and its ancestors ask.
+fn inked(self: *const Ui, ink: Color) Color {
+    return if (self.fade >= 1) ink else faded(ink, self.fade);
+}
+
 /// The same colour, dimmed by the fade.
 fn faded(base: Color, alpha: f32) Color {
     var out = base;
@@ -3035,7 +3086,7 @@ fn emitBar(
             .z_index = element.z_index,
             .transform = self.stamp,
             .config = .{ .rectangle = .{
-                .color = faded(track, alpha),
+                .color = self.inked(faded(track, alpha)),
                 .corner_radius = radius.clampTo(bar.track.width, bar.track.height),
             } },
         });
@@ -3047,7 +3098,7 @@ fn emitBar(
         .z_index = element.z_index,
         .transform = self.stamp,
         .config = .{ .rectangle = .{
-            .color = faded(config.thumb_color, alpha),
+            .color = self.inked(faded(config.thumb_color, alpha)),
             .corner_radius = radius.clampTo(bar.thumb.width, bar.thumb.height),
         } },
     });
@@ -9241,6 +9292,152 @@ test "text inside a turned element is turned with it" {
         return;
     }
     try testing.expect(false);
+}
+
+// A size and an opacity go the way a turn does: onto what an element and
+// everything inside it draws, and never into the layout.
+
+/// The first fill belonging to this element.
+fn fillOf(drawn: []const commands.RenderCommand, name: []const u8) ?commands.RenderCommand {
+    const wanted = identify(name);
+    for (drawn) |command| {
+        if (command.id == wanted and std.meta.activeTag(command.config) == .rectangle) return command;
+    }
+    return null;
+}
+
+test "a size grows the drawing about its middle and leaves the layout alone" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui, size: ?layout.Scale) ![]const commands.RenderCommand {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            {
+                u.open(.{ .id = "row", .width = .fit, .height = .fit, .gap = 10 });
+                defer u.close();
+                u.empty(.{ .id = "pop", .width = .fixed(40), .height = .fixed(40), .background_color = paint, .scale = size });
+                leaf(u, "after", .{ .width = .fixed(40), .height = .fixed(40) });
+            }
+            u.close();
+            return try u.end();
+        }
+    }.run;
+
+    _ = try frame(&ui, null);
+    const straight = ui.boxOf("pop").?;
+    const beside = ui.boxOf("after").?;
+
+    const drawn = try frame(&ui, .by(2));
+    try testing.expectEqual(straight, ui.boxOf("pop").?);
+    try testing.expectEqual(beside, ui.boxOf("after").?);
+    // Twice as big about (20, 20): the top left corner goes to (-20, -20).
+    const motion = motionIn(drawn, "pop").?;
+    const corner = motion.apply(.{ .x = 0, .y = 0 });
+    try testing.expectApproxEqAbs(@as(f32, -20), corner.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -20), corner.y, 0.001);
+    try testing.expect(motionIn(drawn, "after").?.isIdentity());
+
+    // A size of one is no size at all.
+    try testing.expect(motionIn(try frame(&ui, .by(1)), "pop").?.isIdentity());
+}
+
+test "the pointer finds a grown element where it was drawn, and a shrunk-away one nowhere" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui, factor: f32) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            u.empty(.{ .id = "pop", .width = .fixed(40), .height = .fixed(40), .background_color = paint, .scale = .by(factor), .rotate = .degrees(90) });
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    // Twice as big and turned: drawn from (-20, -20) to (60, 60), so past
+    // the box it was laid out in.
+    try frame(&ui, 2);
+    ui.setPointer(50, 50, false);
+    try frame(&ui, 2);
+    try testing.expect(ui.isPointerOver("pop"));
+    ui.setPointer(70, 20, false);
+    try frame(&ui, 2);
+    try testing.expect(!ui.isPointerOver("pop"));
+
+    // Shrunk to nothing, it is nowhere, not everywhere.
+    try frame(&ui, 0);
+    ui.setPointer(20, 20, false);
+    try frame(&ui, 0);
+    try testing.expect(!ui.isPointerOver("pop"));
+}
+
+test "opacity fades an element and everything inside it, and none draws nothing" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "panel", .width = .fit, .height = .fit, .background_color = paint, .opacity = 0.5, .border = .all(paint, 1) });
+        defer ui.close();
+        ui.empty(.{ .id = "inside", .width = .fixed(10), .height = .fixed(10), .background_color = paint, .opacity = 0.5 });
+        ui.text("faded", sixteen);
+    }
+    ui.empty(.{ .id = "beside", .width = .fixed(10), .height = .fixed(10), .background_color = paint });
+    ui.empty(.{ .id = "gone", .width = .fixed(10), .height = .fixed(10), .background_color = paint, .opacity = 0 });
+    ui.close();
+    const drawn = try ui.end();
+
+    try testing.expectEqual(@as(f32, 0.5), fillOf(drawn, "panel").?.config.rectangle.color.a);
+    try testing.expectEqual(@as(f32, 0.25), fillOf(drawn, "inside").?.config.rectangle.color.a);
+    try testing.expectEqual(@as(f32, 1), fillOf(drawn, "beside").?.config.rectangle.color.a);
+    try testing.expect(fillOf(drawn, "gone") == null);
+    var texts: usize = 0;
+    var borders: usize = 0;
+    for (drawn) |command| switch (command.config) {
+        .text => |run| {
+            try testing.expectEqual(@as(f32, 0.5), run.color.a);
+            texts += 1;
+        },
+        .border => |line| {
+            // The panel's outline, drawn after what is in it, is faded too.
+            try testing.expectEqual(@as(f32, 0.5), line.color.a);
+            borders += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), texts);
+    try testing.expectEqual(@as(usize, 1), borders);
+}
+
+test "a float declared inside a faded, grown element is faded and grown with it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "card", .width = .fixed(100), .height = .fixed(100), .background_color = paint, .opacity = 0.5, .scale = .by(2) });
+        defer ui.close();
+        ui.empty(.{ .id = "pin", .width = .fixed(10), .height = .fixed(10), .background_color = paint, .floating = .{} });
+        ui.empty(.{ .id = "tip", .width = .fixed(10), .height = .fixed(10), .background_color = paint, .floating = .{ .attach = .root } });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    const pin = fillOf(drawn, "pin").?;
+    try testing.expectEqual(@as(f32, 0.5), pin.config.rectangle.color.a);
+    // The card grows about (50, 50), and the pin at its top left with it.
+    const corner = pin.transform.apply(.{ .x = 0, .y = 0 });
+    try testing.expectApproxEqAbs(@as(f32, -50), corner.x, 0.001);
+
+    // One attached to the root is not inside the card on screen.
+    const tip = fillOf(drawn, "tip").?;
+    try testing.expectEqual(@as(f32, 1), tip.config.rectangle.color.a);
+    try testing.expect(tip.transform.isIdentity());
 }
 
 // -------------------------------------------------------------------------

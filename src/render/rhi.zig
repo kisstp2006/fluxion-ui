@@ -742,7 +742,10 @@ pub const Renderer = struct {
             const moved = self.moveGlyph(run.effects, @floatFromInt(at), em);
             if (moved.hidden) continue;
 
-            var colour = moved.color orelse run.color;
+            // An effect's colour takes the run's alpha along, which is how a
+            // faded element fades its rainbow too.
+            var colour = run.color;
+            if (moved.color) |tint| colour = .{ .r = tint.r, .g = tint.g, .b = tint.b, .a = tint.a * run.color.a };
             colour.a = std.math.clamp(colour.a * moved.opacity, 0, 1);
             if (colour.invisible()) continue;
 
