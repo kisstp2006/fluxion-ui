@@ -39,8 +39,8 @@
         // repository three times, in three languages, drifting apart.
         // Pinned to a commit that writes GLSL ES 3.00 as well.
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#136fd7dbe3fcbd1aa669c3123229c5260e3cf592",
-            .hash = "fluxion_shader-0.1.0-FqFMEoI3BwAuAQBSzIJwkCrwrVFRJp5SuxDvzmTcziUF",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#2f6ebe660304cab735e1c2669663ebd0dd68d40f",
+            .hash = "fluxion_shader-0.1.0-FqFMEvtOBwDYCkbQOVR1PHrJ4A6IVjdh5FDnMNgeOh8f",
             .lazy = true,
         },
 
