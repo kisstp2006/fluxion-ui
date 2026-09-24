@@ -247,7 +247,7 @@ Five ways to be a size, and the list is the algorithm:
 | | What it means |
 | --- | --- |
 | `.fixed(n)` | This many pixels, and nothing argues. |
-| `.percent(f)` | This fraction of the parent's *inside* - after its padding. |
+| `.percent(f)` | This fraction of the parent's *inside* - after its padding. `.percentPlus(f, px)` adds `px` to it, or takes it away: a share with a margin. |
 | `.fit` | As small as the children allow. The default. |
 | `.grow` | As large as the parent allows, sharing what is spare. |
 | `.ratio(r)` | This multiple of the other axis, once that axis is known. |
@@ -653,6 +653,30 @@ writing is wanted more often than escaping one, and Ply buys the choice by
 giving the cursor an extra position for every closing brace - at the price of a
 right arrow that sometimes does not appear to move.
 
+### Rich text
+
+```zig
+ui.richText("{size=28|{b|Credits}}\nMade by {color=#72A7E8|us}, with {img=heart|} ", .{ .font_size = 16 }, .{
+    .image = .{ .context = &pictures, .find = Pictures.find },
+    .visible = shown,
+});
+```
+
+Everything `markup` reads, and three tags more: `{b|...}` sets a stretch
+heavier, `{size=24|...}` sets it at that many pixels to the em, and
+`{img=name|}` puts a picture a line tall where it stands - the whole of what
+follows `img=` is its name, underscores and slashes and all, and `find`
+answers it. **Each word is a run of its own**, in its own size and font, in
+rows that wrap: a paragraph breaks between words however each is set, and a
+line's end starts the next one. Words of different sizes sit on a common
+bottom, and a wave or a gradient still travels along the whole text.
+
+A heavy stretch is set in `bold_font` where there is one; where there is
+not, it is struck twice, the second a pixel or so to the right, which reads
+as heavier in any font at any size. **`visible`** says how many characters
+show - the rest keep their room and are not drawn - which is dialogue
+arriving letter by letter without the words before it moving.
+
 ## Rotation
 
 ```zig
@@ -835,6 +859,12 @@ top left onto the target's bottom left; `above`, `after`, `before` and
 .anchor = .{ .element_x = .right, .parent_x = .right, .parent_y = .bottom }
 ```
 
+**Or anywhere along the two**, as fractions: `.fractions = .{ .element_x =
+0.5, .target_x = 0.25 }` puts the element's middle a quarter of the way
+across its target. With `.width = .percentPlus(0.5, -20)` that is a box held
+between two points of its parent, a margin inside them - what a game's
+anchors come to.
+
 **What it attaches to** is `.parent` (the element it was declared inside),
 `.root` (the whole surface, for a modal), or `.id` with a name. A name is
 resolved once the whole tree is laid out, so it may point at something declared
@@ -961,6 +991,13 @@ see. A text input takes the focus without being told to.
 ends. `.focus = .{ .tab_index = 2 }` puts an element before all of those
 without one, lowest number first - Ply's rule, and the browsers'. From a
 panel somebody clicked, Tab goes on from where the panel was declared.
+
+**Tab can go where the focus names**, too: `.focus = .{ .next = "first" }`
+sends the last field of a form back to its first rather than on, and
+`.previous` is Shift+Tab's. **`.tab_stop = false`** keeps an element out of
+Tab's walk and the arrows' - it takes the focus from a press on it, or from
+`setFocus`, and from nothing else: a list whose rows are clicked and walked
+with the list's own keys.
 
 **The arrows go to the element that way.** The one the focus names, if it
 names one - `.focus = .{ .down = "quit" }`, Ply's `focus_down`, read as it is
@@ -1228,13 +1265,14 @@ than from memory.
 | **Size and opacity** | of an element and its children, about a pivot, nesting with turns, carried to the floats inside it |
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
+| **Rich text** | words in their own sizes and weights, pictures among them, rows that wrap between words, and as many characters shown as asked |
 | **Animated text** | all nine of Ply's: `wave`, `pulse`, `swing`, `jitter`, `transform`, `gradient`, `type`, `fade` and `scale` |
 | **Clipping and scrolling** | per axis, by wheel - by name or by whatever is under the pointer - by dragging the content, and by the bar, with momentum and with the position remembered between frames |
 | **Scrollbars** | a draggable thumb, an optional track, a minimum thumb size, and a fade after a quiet spell |
 | **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, clip-aware picking, `wantsPointer` for a program that has its own use for a click, and a cursor shape to hand the window |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus` and `on_unfocus`, called when the frame is over |
 | **The focus from a keyboard or a pad** | `.focus` on a declaration, a Tab order with `tab_index`, the arrows and a pad's d-pad going to a named neighbour or the nearest element that way, a held direction that repeats on `tick`'s clock, a key that presses what has the focus the way a click does, and a click that focuses the button rather than its label |
-| **Floating** | out of the flow, anchored to a parent, an element by name, or the surface, with an offset, a z-index and optional clipping |
+| **Floating** | out of the flow, anchored to a parent, an element by name, or the surface - at an edge, the middle, or any fraction along - with an offset, a z-index and optional clipping |
 | **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup, and the caret's place for an input method |
 | **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text, and a pass that can draw over a scene rather than instead of it |
 

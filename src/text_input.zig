@@ -735,7 +735,7 @@ pub const TextEdit = struct {
         self.marks.clearRetainingCapacity();
         self.spans.clearRetainingCapacity();
         self.effects_list.clearRetainingCapacity();
-        _ = try markup.parse(&self.visible, &self.spans, &self.marks, &self.effects_list, gpa, self.text.items);
+        _ = try markup.parse(&self.visible, &self.spans, &self.marks, &self.effects_list, gpa, self.text.items, null);
     }
 
     /// Where in the raw string an insertion at this visible offset belongs.

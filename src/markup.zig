@@ -25,6 +25,9 @@
 //! | `{opacity=0.5\|...}` | multiplied through nesting, not replaced |
 //! | `{hide\|...}` | takes up its room and is not drawn |
 //! | `{shadow_color=black_offset=-0.3,0.3\|...}` | offset in ems, so it scales with the size |
+//! | `{b\|...}` | heavier: see `Ui.richText` |
+//! | `{size=24\|...}` | this many pixels to the em, for `Ui.richText` |
+//! | `{img=name\|}` | a picture a line tall, for `Ui.richText`; the whole of what follows `img=` is its name |
 //!
 //! One command per tag, as in Ply - `{color=red|{opacity=0.5|x}}` rather than
 //! one tag saying both. Nesting is how they combine, and it is also what
@@ -216,6 +219,10 @@ pub const Span = struct {
     /// Still takes up its room, and is not drawn. Ply's `hide`.
     hidden: bool = false,
     shadow: ?Shadow = null,
+    /// Set heavier, and in a size of its own: what `Ui.richText` reads, and
+    /// a run of `markup` does not.
+    bold: bool = false,
+    size: ?f32 = null,
     /// Where this span's effects are in the list they were parsed into.
     ///
     /// A range rather than a slice for the same reason a run of text is an
@@ -235,7 +242,23 @@ pub const Span = struct {
     /// out as one of these, and the emitter can take the plain path.
     pub fn plain(self: Span) bool {
         return self.color == null and self.opacity == 1 and !self.hidden and
-            self.shadow == null and self.effects_len == 0;
+            self.shadow == null and self.effects_len == 0 and !self.bold and self.size == null;
+    }
+};
+
+/// A picture in the text: `{img=name|}`, at a place in the stripped text.
+pub const Inline = struct {
+    /// Bytes into the stripped text it stands before.
+    at: u32,
+    /// Where its name is in the raw string parsed.
+    name_start: u32,
+    name_end: u32,
+    /// The size the tags round it set, if one did: a picture is a line of
+    /// that size tall.
+    size: ?f32 = null,
+
+    pub fn name(self: Inline, raw: []const u8) []const u8 {
+        return raw[self.name_start..self.name_end];
     }
 };
 
@@ -505,6 +528,8 @@ const Fold = struct {
     opacity: f32 = 1,
     hidden: bool = false,
     shadow: ?Shadow = null,
+    bold: bool = false,
+    size: ?f32 = null,
     /// The effects of every tag open here, outermost first. Carried by value
     /// so that closing a tag is a copy back rather than any bookkeeping -
     /// which is the whole reason the fold is a value and not a stack.
@@ -527,6 +552,13 @@ const Fold = struct {
             if (arguments.get("")) |value| out.opacity *= parseNumber(value);
         } else if (std.mem.eql(u8, command, "hide")) {
             out.hidden = true;
+        } else if (std.mem.eql(u8, command, "b")) {
+            out.bold = true;
+        } else if (std.mem.eql(u8, command, "size")) {
+            if (arguments.get("")) |value| {
+                const size = parseNumber(value);
+                if (size > 0) out.size = size;
+            }
         } else if (effectOf(body)) |effect| {
             if (out.effect_count < max_effects) {
                 out.effects[out.effect_count] = effect;
@@ -556,6 +588,8 @@ const Fold = struct {
             .opacity = self.opacity,
             .hidden = self.hidden,
             .shadow = self.shadow,
+            .bold = self.bold,
+            .size = self.size,
             .effects_start = effects_start,
             .effects_len = self.effect_count,
         };
@@ -579,6 +613,7 @@ pub fn parse(
     out_effects: ?*std.ArrayList(Effect),
     gpa: std.mem.Allocator,
     raw: []const u8,
+    out_inlines: ?*std.ArrayList(Inline),
 ) std.mem.Allocator.Error!Parsed {
     const text_from = out_text.items.len;
     const spans_from = out_spans.items.len;
@@ -667,6 +702,13 @@ pub fn parse(
                     depth += 1;
                     current = current.with(header.items);
                     span_start = here;
+                    // A picture, which is its name and no text: the name is
+                    // all of the header after `img=`, underscores and all, so
+                    // a path reads whole.
+                    if (out_inlines) |pictures| if (std.mem.startsWith(u8, header.items, "img=")) {
+                        const name_start = header_at.? + 1 + "img=".len;
+                        try pictures.append(gpa, .{ .at = @intCast(here), .name_start = @intCast(name_start), .name_end = @intCast(i), .size = current.size });
+                    };
                     header_at = null;
                 }
             },
@@ -833,7 +875,7 @@ const Fixture = struct {
     spans: std.ArrayList(Span) = .empty,
 
     fn run(self: *Fixture, gpa: std.mem.Allocator, raw: []const u8) !Parsed {
-        return parse(&self.text, &self.spans, null, null, gpa, raw);
+        return parse(&self.text, &self.spans, null, null, gpa, raw, null);
     }
 
     fn deinit(self: *Fixture, gpa: std.mem.Allocator) void {
@@ -1055,7 +1097,7 @@ test "the map says where each visible byte came from" {
 
     //           0123456789...
     const raw = "a{color=red|bc}d";
-    const parsed = try parse(&text, &spans, &marks, null, testing.allocator, raw);
+    const parsed = try parse(&text, &spans, &marks, null, testing.allocator, raw, null);
     try testing.expectEqualStrings("abcd", parsed.text);
     try testing.expectEqual(parsed.text.len, parsed.marks.len);
 
@@ -1078,7 +1120,7 @@ test "an escaped brace is one visible byte from two raw ones" {
     var marks: std.ArrayList(Mark) = .empty;
     defer marks.deinit(testing.allocator);
 
-    const parsed = try parse(&text, &spans, &marks, null, testing.allocator, "a\\{b");
+    const parsed = try parse(&text, &spans, &marks, null, testing.allocator, "a\\{b", null);
     try testing.expectEqualStrings("a{b", parsed.text);
 
     // The mark for the brace is two bytes wide, so deleting the character
@@ -1120,7 +1162,7 @@ fn effectsOf(gpa: std.mem.Allocator, raw: []const u8, out: *std.ArrayList(Effect
     var spans: std.ArrayList(Span) = .empty;
     defer spans.deinit(gpa);
 
-    const parsed = try parse(&text, &spans, null, out, gpa, raw);
+    const parsed = try parse(&text, &spans, null, out, gpa, raw, null);
     return parsed.effects;
 }
 
@@ -1211,7 +1253,7 @@ test "nested effects both reach the span they cover" {
     var spans: std.ArrayList(Span) = .empty;
     defer spans.deinit(testing.allocator);
 
-    const parsed = try parse(&text, &spans, null, &out, testing.allocator, "{wave|{swing|both}}");
+    const parsed = try parse(&text, &spans, null, &out, testing.allocator, "{wave|{swing|both}}", null);
     try testing.expectEqualStrings("both", parsed.text);
 
     // One span, two effects on it, outermost first.
@@ -1231,7 +1273,7 @@ test "an effect makes a span anything but plain" {
     var spans: std.ArrayList(Span) = .empty;
     defer spans.deinit(testing.allocator);
 
-    const parsed = try parse(&text, &spans, null, &out, testing.allocator, "{wave|x}");
+    const parsed = try parse(&text, &spans, null, &out, testing.allocator, "{wave|x}", null);
     try testing.expect(!parsed.spans[0].plain());
 }
 

@@ -71,6 +71,10 @@ pub const Sizing = struct {
     /// For `.percent`, the fraction of the parent. For `.ratio`, the multiple
     /// of the other axis. Unused otherwise.
     fraction: f32 = 0,
+    /// For `.percent`, pixels added to the share - or, below nought, taken
+    /// from it: a box as wide as its parent less a margin of ten each side is
+    /// `.percentPlus(1, -20)`. Unused otherwise.
+    extra: f32 = 0,
     /// For `.grow`, this element's share of the spare space relative to its
     /// siblings. Two children at `1` split it evenly; one at `2` beside one
     /// at `1` takes two thirds.
@@ -91,6 +95,7 @@ pub const Sizing = struct {
         var out = self;
         out.min = geometry.scaleLength(self.min, by);
         out.max = geometry.scaleLength(self.max, by);
+        out.extra = self.extra * by;
         return out;
     }
 
@@ -110,6 +115,18 @@ pub const Sizing = struct {
     /// This fraction of the parent's inner size. `0.5` is half.
     pub inline fn percent(of_parent: f32) Sizing {
         return .{ .kind = .percent, .fraction = of_parent };
+    }
+
+    /// This fraction of the parent's inner size and `pixels` more: a share
+    /// with a margin, as a box held between two points of its parent is.
+    pub inline fn percentPlus(of_parent: f32, pixels: f32) Sizing {
+        return .{ .kind = .percent, .fraction = of_parent, .extra = pixels };
+    }
+
+    /// What a `.percent` comes to in a parent `inner` across: its share and
+    /// its extra, never below nought.
+    pub inline fn percentOf(self: Sizing, inner: f32) f32 {
+        return @max(0, inner * self.fraction + self.extra);
     }
 
     /// The bounds and share `fitWith` and `growWith` take. Between them they
@@ -624,6 +641,16 @@ pub const Focus = struct {
     down: ?[]const u8 = null,
     left: ?[]const u8 = null,
     right: ?[]const u8 = null,
+    /// Where Tab and Shift+Tab go from here, by name, over the Tab order: a
+    /// form whose last field goes back to its first rather than on to the
+    /// page after it.
+    next: ?[]const u8 = null,
+    previous: ?[]const u8 = null,
+
+    /// Whether Tab and the arrows come to it at all. Off, it takes the focus
+    /// only from a press on it or from `Ui.setFocus`: a list whose rows are
+    /// clicked, which the keyboard walks with the list's own keys.
+    tab_stop: bool = true,
 };
 
 /// Something to call when an element is pointed at or focused. Ply's
@@ -864,6 +891,12 @@ pub const Floating = struct {
     to: ?[]const u8 = null,
     /// Which point of this element goes on which point of the target.
     anchor: Anchor = .{},
+    /// The same, anywhere along the two rather than at an edge or the middle:
+    /// the point `element_x` of the way across and `element_y` down this
+    /// element goes on the point `target_x` across and `target_y` down what
+    /// it hangs off. Over `anchor` when given. A box pinned a quarter of the
+    /// way into its parent, or one whose middle is on the parent's third.
+    fractions: ?Fractions = null,
     /// Moved by this much afterwards, in pixels. The gap between a button and
     /// the menu under it.
     offset: geometry.Vec2 = .{ .x = 0, .y = 0 },
@@ -878,6 +911,15 @@ pub const Floating = struct {
     /// Whether to cut it off at the edge of what it is attached to. Ply's
     /// `clip_by_parent`.
     clip: bool = false,
+
+    /// See `fractions`. Nought is the left or the top, one the right or the
+    /// bottom.
+    pub const Fractions = struct {
+        element_x: f32 = 0,
+        element_y: f32 = 0,
+        target_x: f32 = 0,
+        target_y: f32 = 0,
+    };
 
     pub const Attach = enum {
         /// The element it was declared inside. The usual one.

@@ -223,6 +223,9 @@ const Focusing = struct {
     down: ?u32 = null,
     left: ?u32 = null,
     right: ?u32 = null,
+    next: ?u32 = null,
+    previous: ?u32 = null,
+    tab_stop: bool = true,
 
     fn of(asked: layout.Focus) Focusing {
         return .{
@@ -231,6 +234,9 @@ const Focusing = struct {
             .down = if (asked.down) |name| identify(name) else null,
             .left = if (asked.left) |name| identify(name) else null,
             .right = if (asked.right) |name| identify(name) else null,
+            .next = if (asked.next) |name| identify(name) else null,
+            .previous = if (asked.previous) |name| identify(name) else null,
+            .tab_stop = asked.tab_stop,
         };
     }
 
@@ -241,10 +247,18 @@ const Focusing = struct {
             .down => self.down,
             .left => self.left,
             .right => self.right,
-            .next, .previous => null,
+            .next => self.next,
+            .previous => self.previous,
         };
     }
 };
+
+/// Whether Tab and the arrows may bring the focus to a hit: one that takes
+/// it, and not only from a press. See `layout.Focus.tab_stop`.
+fn walkable(focus: ?Focusing) bool {
+    const held = focus orelse return false;
+    return held.tab_stop;
+}
 
 /// Where an element could be brought into view - and so where an arrow key
 /// may go looking for it. See `Ui.stepToward`.
@@ -577,6 +591,9 @@ const TextRun = struct {
     /// and comes out as exactly the commands it always did.
     spans_start: u32 = 0,
     spans_len: u32 = 0,
+    /// Characters of the text it is a word of before it: see `richText`. So
+    /// a wave travels along a sentence and not word by word.
+    along: u32 = 0,
 };
 
 /// One line of a wrapped run.
@@ -1182,7 +1199,7 @@ pub fn markup(self: *Ui, raw: []const u8, style: text_mod.TextStyle) void {
 fn markupChecked(self: *Ui, raw: []const u8, style: text_mod.TextStyle) Error!void {
     const start: u32 = @intCast(self.strings.items.len);
     const spans_start: u32 = @intCast(self.spans.items.len);
-    const parsed = try markup_mod.parse(&self.strings, &self.spans, null, &self.effects, self.gpa, raw);
+    const parsed = try markup_mod.parse(&self.strings, &self.spans, null, &self.effects, self.gpa, raw, null);
     try self.addRun(
         start,
         @intCast(parsed.text.len),
@@ -1250,6 +1267,182 @@ fn addRun(
     // A text element is somebody's child, and never the root: text at the top
     // level has nothing to be measured against.
     if (self.open_stack.items.len > 0) try self.pending.append(self.gpa, index);
+}
+
+/// What `richText` is told beside the style.
+pub const RichText = struct {
+    /// The font a `{b|...}` stretch is set in, by its place in the table.
+    /// Null draws it in the run's own font twice, the second a pixel or so to
+    /// the right: heavier in any font, and still legible at any size.
+    bold_font: ?u16 = null,
+    /// How many characters show, counted in the text the reader sees, a
+    /// line's end among them. The rest keep their room and are not drawn,
+    /// so letters arriving one by one do not move the ones before them.
+    /// Null for all of them.
+    visible: ?usize = null,
+    /// The picture an `{img=name|}` names, drawn a line tall and square - or
+    /// null to leave it out.
+    image: ?Pictures = null,
+
+    pub const Pictures = struct {
+        context: ?*anyopaque = null,
+        find: *const fn (context: ?*anyopaque, name: []const u8) ?layout.Image,
+    };
+};
+
+/// A paragraph of markup whose stretches may differ in size and weight, and
+/// hold pictures: everything `markup` reads, and `{b|heavy}`,
+/// `{size=24|large}` and `{img=name|}` beside it.
+///
+/// ```zig
+/// ui.richText("{size=28|Credits}\nMade by {b|us}, with {img=heart|} ", .{ .font_size = 16 }, .{ .image = pictures });
+/// ```
+///
+/// **A word is a run of its own**, set in its own size and font, and the
+/// words wait in rows that wrap: a paragraph breaks between words however
+/// each is set, and a line's end starts the next paragraph. Words of
+/// different sizes sit on a common bottom. A word longer than the row is not
+/// broken. A wave or a gradient still travels along the whole text: each
+/// word knows how far into it it is.
+///
+/// As wide as its parent, and as tall as its rows.
+pub fn richText(self: *Ui, raw: []const u8, style: text_mod.TextStyle, options: RichText) void {
+    self.richTextChecked(raw, style, options) catch |err| self.remember(err);
+}
+
+fn richTextChecked(self: *Ui, raw: []const u8, style: text_mod.TextStyle, options: RichText) Error!void {
+    var stripped: std.ArrayList(u8) = .empty;
+    defer stripped.deinit(self.gpa);
+    var spans: std.ArrayList(markup_mod.Span) = .empty;
+    defer spans.deinit(self.gpa);
+    var pictures: std.ArrayList(markup_mod.Inline) = .empty;
+    defer pictures.deinit(self.gpa);
+    const parsed = try markup_mod.parse(&stripped, &spans, null, &self.effects, self.gpa, raw, &pictures);
+    const content = parsed.text;
+    const visible = options.visible orelse std.math.maxInt(usize);
+
+    try self.openChecked(.{ .width = .grow, .direction = .top_to_bottom });
+    const row: layout.Declaration = .{
+        .width = .grow,
+        .wrap = true,
+        .align_x = style.alignment,
+        .align_y = .bottom,
+    };
+    try self.openChecked(row);
+    var row_empty = true;
+
+    var at: usize = 0;
+    var span_at: usize = 0;
+    var picture_at: usize = 0;
+    // Characters before `at`: how far along a wave is, and whether it shows.
+    var along: usize = 0;
+    while (true) {
+        while (picture_at < pictures.items.len and pictures.items[picture_at].at <= at) : (picture_at += 1) {
+            const lookup = options.image orelse continue;
+            const found = lookup.find(lookup.context, pictures.items[picture_at].name(raw)) orelse continue;
+            const side: f32 = pictures.items[picture_at].size orelse @floatFromInt(style.font_size);
+            var picture = found;
+            picture.background_color = .transparent;
+            // Not there yet, and holding its place.
+            if (along >= visible) picture.tint.a = 0;
+            try self.openChecked(.{ .width = .fixed(side), .height = .fixed(side), .image = picture });
+            try self.closeChecked();
+            row_empty = false;
+        }
+        if (at >= content.len) break;
+
+        if (content[at] == '\n') {
+            // An empty paragraph is a line tall all the same.
+            if (row_empty) try self.richPiece(" ", style, options, 0, 0, 0, true);
+            try self.closeChecked();
+            try self.openChecked(row);
+            row_empty = true;
+            at += 1;
+            along += 1;
+            continue;
+        }
+
+        // A piece runs to the stop of a word and the spaces after it, and no
+        // further than a change of size or weight, a picture, a line's stop or
+        // the last character that shows.
+        const first = spanAt(parsed.spans, &span_at, at).?;
+        var stop = at;
+        var in_spaces = false;
+        var count: usize = 0;
+        while (stop < content.len) {
+            const byte = content[stop];
+            if (byte == '\n') break;
+            if (byte == ' ' or byte == '\t') {
+                in_spaces = true;
+            } else if (in_spaces) break;
+            if (stop > at) {
+                const here = spanAt(parsed.spans, &span_at, stop).?;
+                if (here.bold != first.bold or !std.meta.eql(here.size, first.size)) break;
+                if (picture_at < pictures.items.len and pictures.items[picture_at].at == stop) break;
+                if (along + count == visible) break;
+            }
+            const width = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+            stop = @min(stop + width, content.len);
+            count += 1;
+        }
+
+        // The spans over the piece, from its own start.
+        const spans_start: u32 = @intCast(self.spans.items.len);
+        const hidden = along >= visible;
+        for (parsed.spans) |span| {
+            if (span.end <= at or span.start >= stop) continue;
+            var cut = span;
+            cut.start = @intCast(@max(span.start, at) - at);
+            cut.end = @intCast(@min(span.end, stop) - at);
+            if (hidden) cut.hidden = true;
+            try self.spans.append(self.gpa, cut);
+        }
+        try self.richPiece(content[at..stop], style, options, spans_start, @intCast(self.spans.items.len - spans_start), @intCast(along), false);
+        row_empty = false;
+        along += count;
+        at = stop;
+    }
+    try self.closeChecked();
+    try self.closeChecked();
+}
+
+/// The span over byte `at` of a run, moving on from where the last one was
+/// found: spans are in order, and the pieces are asked for in order.
+fn spanAt(spans: []const markup_mod.Span, from: *usize, at: usize) ?markup_mod.Span {
+    if (spans.len == 0) return null;
+    if (from.* >= spans.len or spans[from.*].start > at) from.* = 0;
+    while (from.* + 1 < spans.len and spans[from.*].end <= at) from.* += 1;
+    return spans[from.*];
+}
+
+/// One piece of a rich paragraph as a run of its own, in the size and weight
+/// its spans say.
+fn richPiece(self: *Ui, piece: []const u8, base: text_mod.TextStyle, options: RichText, spans_start: u32, spans_len: u32, along: u32, blank: bool) Error!void {
+    var style = base;
+    style.wrap = .none;
+    style.alignment = .left;
+    if (spans_len > 0) {
+        const first = self.spans.items[spans_start];
+        if (first.size) |size| style.font_size = @intFromFloat(@round(@max(size, 1)));
+        if (first.bold) {
+            if (options.bold_font) |font| {
+                style.font = font;
+            } else {
+                // Struck twice: a shadow of its own colour, a twentieth of
+                // an em across and never less than a pixel.
+                const em: f32 = @floatFromInt(@max(style.font_size, 1));
+                for (self.spans.items[spans_start..][0..spans_len]) |*span| {
+                    if (span.shadow != null) continue;
+                    span.shadow = .{ .color = span.colorOver(base.color), .offset = .{ .x = @max(1 / em, 0.05), .y = 0 } };
+                }
+            }
+        }
+    }
+    const start: u32 = @intCast(self.strings.items.len);
+    try self.strings.appendSlice(self.gpa, piece);
+    try self.addRun(start, @intCast(piece.len), style, spans_start, spans_len);
+    self.runs.items[self.runs.items.len - 1].along = along;
+    if (blank) self.runs.items[self.runs.items.len - 1].style.color = .transparent;
 }
 
 /// An element with no children: `open` and `close` in one call.
@@ -1567,7 +1760,7 @@ fn sizeAlongAxis(self: *Ui, x_axis: bool, from: u32) Error!void {
             const child = &self.elements.items[child_index];
             const wanted = child.config.sizing.onAxis(x_axis);
             if (wanted.kind != .percent) continue;
-            setSize(child, x_axis, wanted.clamp(inner * wanted.fraction));
+            setSize(child, x_axis, wanted.clamp(wanted.percentOf(inner)));
         }
 
         if (config.direction.isMainAxisX() == x_axis) {
@@ -2166,6 +2359,7 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
             x,
             y,
             line_height,
+            run.along,
         );
     }
 }
@@ -2191,6 +2385,7 @@ fn emitSpanned(
     x: f32,
     y: f32,
     line_height: f32,
+    along_from: u32,
 ) Error!void {
     const measurer = self.measurer orelse return;
     var pen = x;
@@ -2205,7 +2400,7 @@ fn emitSpanned(
         // How many characters of the whole run come before this piece, so a
         // wave travels along a sentence rather than restarting at every
         // change of colour.
-        const along: u32 = @intCast(text_input.characters(content[0..first]));
+        const along: u32 = along_from + @as(u32, @intCast(text_input.characters(content[0..first])));
         const width = measurer.measure(piece, style).width;
         defer pen += width;
         if (span.hidden) continue;
@@ -2771,6 +2966,7 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
                     origin_x,
                     line_y,
                     step,
+                    0,
                 );
             }
         }
@@ -2844,7 +3040,7 @@ fn sizeFloats(self: *Ui, x_axis: bool) Error!void {
         const wanted = element.config.sizing.onAxis(x_axis);
         const size = switch (wanted.kind) {
             .grow => room,
-            .percent => room * wanted.fraction,
+            .percent => wanted.percentOf(room),
             // `fit` was worked out when it closed, and `fixed` is fixed.
             else => element.dimensions.onAxis(x_axis),
         };
@@ -2911,7 +3107,10 @@ fn placeFloats(self: *Ui) Error!void {
             self.safeBox();
 
         const size = self.elements.items[float.element].dimensions;
-        const at: Point = .{
+        const at: Point = if (config.fractions) |f| .{
+            .x = against.x + against.width * f.target_x - size.width * f.element_x + config.offset.x,
+            .y = against.y + against.height * f.target_y - size.height * f.element_y + config.offset.y,
+        } else .{
             .x = against.x + geometry.leadingSpaceX(against.width, config.anchor.parent_x) -
                 geometry.leadingSpaceX(size.width, config.anchor.element_x) + config.offset.x,
             .y = against.y + geometry.leadingSpaceY(against.height, config.anchor.parent_y) -
@@ -4235,6 +4434,7 @@ const TabPlace = struct {
 /// clicked - Tab goes on from where that element was declared. **From
 /// nothing**, it starts at the beginning, or at the end going backwards.
 fn stepTab(self: *Ui, forward: bool) void {
+    if (self.namedStep(if (forward) .next else .previous)) return;
     const here: ?TabPlace = if (self.focusedHit()) |at| .of(self.hits.items[at].focus, at) else null;
 
     // The nearest place past `here`, and the first one of all - or, going
@@ -4242,7 +4442,7 @@ fn stepTab(self: *Ui, forward: bool) void {
     var nearest: ?TabPlace = null;
     var first: ?TabPlace = null;
     for (self.hits.items, 0..) |hit, i| {
-        if (hit.focus == null) continue;
+        if (!walkable(hit.focus)) continue;
         const place: TabPlace = .of(hit.focus, i);
 
         if (first == null or ahead(place, first.?, forward)) first = place;
@@ -4254,6 +4454,21 @@ fn stepTab(self: *Ui, forward: bool) void {
 
     const chosen = nearest orelse first orelse return;
     self.focus = self.hits.items[chosen.index].id;
+}
+
+/// The neighbour the focus names that way, when it names one that was on
+/// the page last frame. Whether the focus went there.
+fn namedStep(self: *Ui, to: input.Navigation) bool {
+    const at = self.focusedHit() orelse return false;
+    const focus = self.hits.items[at].focus orelse return false;
+    const named = focus.toward(to) orelse return false;
+    for (self.hits.items) |hit| {
+        if (hit.id != named) continue;
+        self.focus = named;
+        return true;
+    }
+    // Not on the page last frame, so the search decides after all.
+    return false;
 }
 
 /// Whether `a` comes before `b`, walking the Tab order this way round.
@@ -4303,22 +4518,12 @@ fn stepToward(self: *Ui, to: input.Navigation) void {
         return;
     };
     const from = self.hits.items[at];
-
-    if (from.focus) |focus| {
-        if (focus.toward(to)) |named| {
-            for (self.hits.items) |hit| {
-                if (hit.id != named) continue;
-                self.focus = named;
-                return;
-            }
-            // Not on the page last frame, so the search decides after all.
-        }
-    }
+    if (self.namedStep(to)) return;
 
     const start: Seen = .of(drawnBox(from.motion, from.box), to);
     var best: ?Candidate = null;
     for (self.hits.items, 0..) |hit, i| {
-        if (hit.focus == null or hit.id == from.id) continue;
+        if (!walkable(hit.focus) or hit.id == from.id) continue;
         const box = drawnBox(hit.motion, hit.box);
         if (!hit.reach.meets(box)) continue;
 
@@ -5554,6 +5759,104 @@ fn withText(gpa: std.mem.Allocator) Ui {
 /// `end` rather than with a `defer`, which would fire after it.
 fn openRoot(ui: *Ui) void {
     ui.open(.{ .width = .grow, .height = .grow });
+}
+
+/// The text commands a frame drew, in order.
+fn textsOf(drawn: []const commands.RenderCommand, into: []commands.RenderCommand) []commands.RenderCommand {
+    var count: usize = 0;
+    for (drawn) |command| {
+        if (command.config != .text or count == into.len) continue;
+        into[count] = command;
+        count += 1;
+    }
+    return into[0..count];
+}
+
+/// A rich paragraph `width` wide, laid out and drawn.
+fn richFrame(ui: *Ui, raw: []const u8, width: f32, options: RichText) ![]const commands.RenderCommand {
+    ui.begin(.init(400, 300));
+    openRoot(ui);
+    ui.open(.{ .id = "box", .width = .fixed(width), .direction = .top_to_bottom });
+    ui.richText(raw, sixteen, options);
+    ui.close();
+    ui.close();
+    return try ui.end();
+}
+
+test "rich text sets each word in its own size and weight, wraps between words, and starts a row at a line's end" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    const drawn = try richFrame(&ui, "{size=32|Big} {b|bold} words\nnext", 100, .{});
+    var found: [8]commands.RenderCommand = undefined;
+    const texts = textsOf(drawn, &found);
+    try testing.expectEqual(@as(usize, 5), texts.len);
+
+    // Three characters at thirty-two drawn - the space after them keeps its
+    // room and is not drawn - and the row as tall.
+    try testing.expectEqualStrings("Big", texts[0].config.text.text);
+    try testing.expectEqual(@as(u16, 32), texts[0].config.text.font_size);
+    try testing.expectEqual(BoundingBox.init(0, 0, 48, 32), texts[0].bounding_box);
+    // After the space - which is outside the tag, so eight wide - and on
+    // the row's bottom; heavier with no bold font given: struck twice, the
+    // second a pixel to the right of the first.
+    try testing.expectEqualStrings("bold", texts[1].config.text.text);
+    try testing.expectEqualStrings("bold", texts[2].config.text.text);
+    try testing.expectEqual(@as(f32, 56), texts[2].bounding_box.x);
+    try testing.expectEqual(@as(f32, 16), texts[2].bounding_box.y);
+    try testing.expectEqual(@as(f32, 57), texts[1].bounding_box.x);
+    // Past the hundred, so on the next row, struck once.
+    try testing.expectEqualStrings("words", texts[3].config.text.text);
+    try testing.expectEqual(BoundingBox.init(0, 32, 40, 16), texts[3].bounding_box);
+    // And a line's end is a row of its own.
+    try testing.expectEqualStrings("next", texts[4].config.text.text);
+    try testing.expectEqual(@as(f32, 48), texts[4].bounding_box.y);
+
+    // A bold font, where there is one.
+    const again = try richFrame(&ui, "{b|bold}", 100, .{ .bold_font = 3 });
+    try testing.expectEqual(@as(u16, 3), textsOf(again, &found)[0].config.text.font);
+}
+
+test "rich text shows as many characters as it is told, and the rest keep their room" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    var found: [8]commands.RenderCommand = undefined;
+
+    const all = textsOf(try richFrame(&ui, "ab cd", 200, .{}), &found);
+    try testing.expectEqual(@as(usize, 2), all.len);
+
+    // Three: the first word and its space.
+    const three = textsOf(try richFrame(&ui, "ab cd", 200, .{ .visible = 3 }), &found);
+    try testing.expectEqual(@as(usize, 1), three.len);
+    try testing.expectEqualStrings("ab", three[0].config.text.text);
+
+    // One: half a word, cut where it stops, with the rest where it was.
+    const one = textsOf(try richFrame(&ui, "{color=red|ab} cd", 200, .{ .visible = 1 }), &found);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqualStrings("a", one[0].config.text.text);
+    try testing.expectEqual(@as(f32, 8), ui.boxOf("box").?.height / 2);
+}
+
+test "a picture in rich text is found by its whole name and drawn a line tall" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    const Pictures = struct {
+        var asked: [32]u8 = undefined;
+        var asked_len: usize = 0;
+        fn find(_: ?*anyopaque, name: []const u8) ?layout.Image {
+            @memcpy(asked[0..name.len], name);
+            asked_len = name.len;
+            return .{ .texture = 7 };
+        }
+    };
+    const drawn = try richFrame(&ui, "a {size=24|{img=res://icons/big_key.png|}} b", 200, .{ .image = .{ .find = Pictures.find } });
+    try testing.expectEqualStrings("res://icons/big_key.png", Pictures.asked[0..Pictures.asked_len]);
+    var picture: ?commands.RenderCommand = null;
+    for (drawn) |command| {
+        if (command.config == .image) picture = command;
+    }
+    try testing.expectEqual(@as(u32, 7), picture.?.config.image.texture);
+    try testing.expectEqual(@as(f32, 24), picture.?.bounding_box.width);
+    try testing.expectEqual(@as(f32, 24), picture.?.bounding_box.height);
 }
 
 test "text is as wide as it measures and one line tall" {
@@ -8250,6 +8553,35 @@ test "a floating element is placed where its anchor says" {
     // tall centred on forty is ten *out*.
     _ = try withMenu(&ui, .{ .anchor = .centered }, .fixed(80));
     try testing.expectEqual(BoundingBox.init(10, -10, 80, 60), ui.boxOf("menu").?);
+}
+
+test "a floating element is put anywhere along what it hangs off by fractions, and sized as a share and pixels more" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Its middle on the point a quarter across and three quarters down the
+    // button: a hundred by forty.
+    _ = try withMenu(&ui, .{ .fractions = .{ .element_x = 0.5, .element_y = 0.5, .target_x = 0.25, .target_y = 0.75 } }, .fixed(80));
+    try testing.expectEqual(BoundingBox.init(25 - 40, 30 - 30, 80, 60), ui.boxOf("menu").?);
+
+    // As wide as the button less ten each side, and ten in from its left.
+    _ = try withMenu(&ui, .{ .fractions = .{}, .offset = .{ .x = 10, .y = 0 } }, .percentPlus(1, -20));
+    try testing.expectEqual(BoundingBox.init(10, 0, 80, 60), ui.boxOf("menu").?);
+
+    // Never below nought, however much is taken.
+    _ = try withMenu(&ui, .{ .fractions = .{} }, .percentPlus(0.5, -500));
+    try testing.expectEqual(@as(f32, 0), ui.boxOf("menu").?.width);
+}
+
+test "a share and pixels more holds in the flow too" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    leaf(&ui, "bar", .{ .width = .percentPlus(0.5, 12), .height = .fixed(10) });
+    ui.close();
+    _ = try ui.end();
+    try testing.expectEqual(@as(f32, 212), ui.boxOf("bar").?.width);
 }
 
 test "an offset moves it after the anchor has decided" {
@@ -10963,6 +11295,46 @@ test "Tab walks what takes the focus in the order it was declared, and comes rou
     try testing.expect(ui.isFocused("name"));
     _ = ui.navigate(.previous);
     try testing.expect(ui.isFocused("quit"));
+}
+
+test "Tab goes where the focus names, and passes over what only a press may focus" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    const Form = struct {
+        fn frame(u: *Ui) !void {
+            u.begin(.init(400, 400));
+            u.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom, .gap = 10 });
+            leaf(u, "first", .{ .width = .fixed(200), .height = .fixed(40), .focus = .{ .previous = "last" } });
+            leaf(u, "row", .{ .width = .fixed(200), .height = .fixed(40), .focus = .{ .tab_stop = false } });
+            leaf(u, "middle", .{ .width = .fixed(200), .height = .fixed(40), .focus = .{} });
+            leaf(u, "last", .{ .width = .fixed(200), .height = .fixed(40), .focus = .{ .next = "first" } });
+            leaf(u, "after", .{ .width = .fixed(200), .height = .fixed(40), .focus = .{} });
+            u.close();
+            _ = try u.end();
+        }
+    };
+    try Form.frame(&ui);
+
+    _ = ui.navigate(.next);
+    try testing.expect(ui.isFocused("first"));
+    // The row is Tab's to pass over, and the arrows' too.
+    _ = ui.navigate(.next);
+    try testing.expect(ui.isFocused("middle"));
+    _ = ui.navigate(.up);
+    try testing.expect(ui.isFocused("first"));
+    _ = ui.navigate(.down);
+    try testing.expect(ui.isFocused("middle"));
+    // The last goes back to the first rather than on, and the first back to
+    // the last.
+    _ = ui.navigate(.next);
+    try testing.expect(ui.isFocused("last"));
+    _ = ui.navigate(.next);
+    try testing.expect(ui.isFocused("first"));
+    _ = ui.navigate(.previous);
+    try testing.expect(ui.isFocused("last"));
+    // A press, or the program, still gives it the focus.
+    ui.setFocus("row");
+    try testing.expect(ui.isFocused("row"));
 }
 
 test "the focus is navigable on what takes it, and not on what a press only landed on" {
