@@ -108,6 +108,29 @@ const Batch = struct {
     /// one sheet stay one draw call, which is the whole reason the source
     /// rectangle exists.
     texture: ?rhi.types.Texture = null,
+    /// The command the program draws here itself, by its place in the list:
+    /// a batch of no instances, where `drawWith` hands over. See
+    /// `CustomDraw`.
+    custom: ?u32 = null,
+};
+
+/// What draws a frame's `custom` commands: the program's own drawing, handed
+/// the target between two of the renderer's passes.
+///
+/// The renderer ends its pass and submits what it has drawn so far, calls
+/// `draw` for the command - which begins and ends passes of its own, into
+/// the same target, loading what is there - and begins its own again after,
+/// so everything declared after the element is drawn over it.
+pub const CustomDraw = struct {
+    context: ?*anyopaque = null,
+    draw: *const fn (
+        context: ?*anyopaque,
+        command: ui.RenderCommand,
+        /// The clip the command is under, in the target's pixels, or null.
+        scissor: ?rhi.types.Rect,
+        target: rhi.types.RenderTarget,
+        size: ui.Dimensions,
+    ) anyerror!void,
 };
 
 const quad_vertices = [8]f32{ 0, 0, 1, 0, 0, 1, 1, 1 };
@@ -392,6 +415,21 @@ pub const Renderer = struct {
         /// nothing that only ever draws an interface has to say anything.
         clear: ?ui.Color,
     ) Error!void {
+        // With no program to hand them to, `custom` commands draw nothing,
+        // and nothing else can fail but what `Error` names.
+        self.drawWith(target, size, commands, clear, null) catch |err| return @errorCast(err);
+    }
+
+    /// `draw`, handing each `custom` command to `custom` where it falls in
+    /// the frame. See `CustomDraw`.
+    pub fn drawWith(
+        self: *Renderer,
+        target: rhi.types.RenderTarget,
+        size: ui.Dimensions,
+        commands: []const ui.RenderCommand,
+        clear: ?ui.Color,
+        custom: ?CustomDraw,
+    ) anyerror!void {
         try self.build(commands, size);
 
         if (self.atlas.dirty) {
@@ -411,19 +449,18 @@ pub const Renderer = struct {
         const frame: Frame = .{ .viewport = .{ size.width, size.height, 0, 0 } };
         try self.device.updateBuffer(self.frame_buffer, 0, std.mem.asBytes(&frame));
 
-        const list = self.device.begin();
-        try list.beginPass(.{ .color = .{
-            .target = target,
-            .load = if (clear == null) .load else .clear,
-            .clear_color = if (clear) |colour| colour.array() else .{ 0, 0, 0, 1 },
-        } });
-        try list.setViewport(.{ .width = size.width, .height = size.height });
-        try list.setPipeline(self.pipeline);
-        try list.setVertexBuffer(0, self.quad, 0);
-        try list.setUniformBuffer(0, self.frame_buffer);
-        try list.setTexture(0, self.atlas_texture, self.sampler);
+        var list = try self.beginPass(target, size, clear);
 
         for (self.batches.items) |batch| {
+            if (batch.custom) |index| {
+                const drawer = custom orelse continue;
+                try list.setScissor(null);
+                try list.endPass();
+                try self.device.submit();
+                try drawer.draw(drawer.context, commands[index], batch.scissor, target, size);
+                list = try self.beginPass(target, size, null);
+                continue;
+            }
             if (batch.count == 0) continue;
             try list.setScissor(batch.scissor);
             try list.setTexture(0, batch.texture orelse self.atlas_texture, self.sampler);
@@ -437,6 +474,23 @@ pub const Renderer = struct {
         try list.setScissor(null);
         try list.endPass();
         try self.device.submit();
+    }
+
+    /// Begin a pass into `target` with everything the batches share bound:
+    /// cleared to `clear`, or loading what is there with none.
+    fn beginPass(self: *Renderer, target: rhi.types.RenderTarget, size: ui.Dimensions, clear: ?ui.Color) Error!*rhi.CommandList {
+        const list = self.device.begin();
+        try list.beginPass(.{ .color = .{
+            .target = target,
+            .load = if (clear == null) .load else .clear,
+            .clear_color = if (clear) |colour| colour.array() else .{ 0, 0, 0, 1 },
+        } });
+        try list.setViewport(.{ .width = size.width, .height = size.height });
+        try list.setPipeline(self.pipeline);
+        try list.setVertexBuffer(0, self.quad, 0);
+        try list.setUniformBuffer(0, self.frame_buffer);
+        try list.setTexture(0, self.atlas_texture, self.sampler);
+        return list;
     }
 
     /// Turn the command list into instances and batches.
@@ -475,7 +529,7 @@ pub const Renderer = struct {
         // only shapes and could go either way.
         var bound: ?rhi.types.Texture = null;
 
-        for (commands) |command| {
+        for (commands, 0..) |command, index| {
             const turn = turnOf(command.transform);
             switch (command.config) {
                 .scissor_start => {
@@ -560,6 +614,18 @@ pub const Renderer = struct {
                         picture.tint,
                         picture.corner_radius.array(),
                     ));
+                },
+                .custom => {
+                    // Whatever the program draws goes between what came
+                    // before and what comes after, so both batches end here.
+                    try self.closeBatch(&batch_start, scissor, bound);
+                    try self.batches.append(self.gpa, .{
+                        .first = batch_start,
+                        .count = 0,
+                        .scissor = scissor,
+                        .custom = @intCast(index),
+                    });
+                    bound = null;
                 },
                 .none => {},
             }
@@ -1454,6 +1520,56 @@ test "a clip is held inside the surface" {
     try testing.expectEqual(500, clip.y);
     try testing.expectEqual(300, clip.width);
     try testing.expectEqual(100, clip.height);
+}
+
+test "a box the program draws splits the frame, and the program draws there" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const white: ui.commands.Rectangle = .{ .color = .white };
+    const frame = [_]ui.RenderCommand{
+        .{ .bounding_box = .init(0, 0, 10, 10), .config = .{ .rectangle = white } },
+        .{ .bounding_box = .init(100, 100, 200, 200), .config = .scissor_start },
+        .{ .bounding_box = .init(120, 120, 50, 40), .config = .{ .custom = .{ .data = 4 } } },
+        .{ .bounding_box = .init(0, 0, 10, 10), .config = .{ .rectangle = white } },
+        .{ .bounding_box = .zero, .config = .scissor_end },
+    };
+    try fixture.renderer.build(&frame, page);
+
+    // Before, the program's, and after: the one after still clipped.
+    const batches = fixture.renderer.batches.items;
+    try testing.expectEqual(3, batches.len);
+    try testing.expectEqual(null, batches[0].custom);
+    try testing.expectEqual(@as(?u32, 2), batches[1].custom);
+    try testing.expectEqual(0, batches[1].count);
+    try testing.expectEqual(100, batches[1].scissor.?.x);
+    try testing.expectEqual(1, batches[2].count);
+    try testing.expectEqual(100, batches[2].scissor.?.x);
+
+    // And drawn, the program is handed the command where it falls.
+    const Heard = struct {
+        calls: u32 = 0,
+        data: u32 = 0,
+        clipped: bool = false,
+
+        fn draw(context: ?*anyopaque, command: ui.RenderCommand, scissor: ?rhi.types.Rect, _: rhi.types.RenderTarget, _: ui.Dimensions) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            self.data = command.config.custom.data;
+            self.clipped = scissor != null;
+        }
+    };
+    var heard: Heard = .{};
+    const surface = try fixture.device.createSurface(.{ .width = 800, .height = 600 });
+    defer fixture.device.destroySurface(surface);
+    try fixture.renderer.drawWith(.{ .surface = surface }, page, &frame, .black, .{ .context = &heard, .draw = Heard.draw });
+    try testing.expectEqual(@as(u32, 1), heard.calls);
+    try testing.expectEqual(@as(u32, 4), heard.data);
+    try testing.expect(heard.clipped);
+
+    // With nobody to draw it, it is nothing.
+    try fixture.renderer.draw(.{ .surface = surface }, page, &frame, .black);
+    try testing.expectEqual(@as(u32, 1), heard.calls);
 }
 
 test "an empty frame draws nothing at all" {

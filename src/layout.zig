@@ -353,6 +353,11 @@ pub const Declaration = struct {
     /// A picture drawn in this element's box, instead of a plain fill. See
     /// `Image`.
     image: ?Image = null,
+    /// A box the program draws itself, known by this number: the element is
+    /// laid out as any other, its fill goes down, and then a `custom` command
+    /// with its box and this number, where the program draws whatever the
+    /// renderer has no command for. See `commands.Custom`.
+    custom: ?u32 = null,
 
     /// Turn this element **and everything inside it**. Ply's
     /// `rotate_visual`.

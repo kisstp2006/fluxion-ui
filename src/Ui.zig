@@ -151,6 +151,8 @@ const Element = struct {
     floating: ?layout.Floating = null,
     /// A picture drawn in its box instead of a plain fill. See `layout.Image`.
     image: ?layout.Image = null,
+    /// What the program draws in its box itself. See `layout.Declaration.custom`.
+    custom: ?u32 = null,
     /// A turn applied to this element and everything inside it, and one
     /// applied to its own box alone. See `layout.Rotation`.
     rotate: ?layout.Rotation = null,
@@ -1108,6 +1110,7 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
         .focus = if (declaration.focus) |asked| .of(asked) else null,
         .floating = declaration.floating,
         .image = declaration.image,
+        .custom = declaration.custom,
         .rotate = declaration.rotate,
         .rotate_shape = declaration.rotate_shape,
         .scale = declaration.scale,
@@ -2742,6 +2745,19 @@ fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
     const element = self.elements.items[index];
     if (box.empty()) return;
 
+    try self.emitFill(element, box);
+
+    // What the program draws itself goes over the fill, as a picture does.
+    if (element.custom) |data| try self.output.append(self.gpa, .{
+        .bounding_box = box,
+        .id = element.id,
+        .z_index = element.z_index,
+        .transform = self.stamp,
+        .config = .{ .custom = .{ .data = data, .tint = self.inked(.white) } },
+    });
+}
+
+fn emitFill(self: *Ui, element: Element, box: BoundingBox) Error!void {
     // An image takes the place of the fill rather than sitting on top of it:
     // the command carries the fill, so a renderer paints one rectangle and
     // one picture rather than being handed two of everything.
@@ -9254,6 +9270,44 @@ fn onlyImage(drawn: []const commands.RenderCommand) ?commands.Image {
         if (command.config == .image) return command.config.image;
     }
     return null;
+}
+
+test "a box the program draws is its fill, then its number" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    ui.open(.{ .id = "faded", .opacity = 0.5 });
+    ui.empty(.{
+        .id = "screen",
+        .width = .fixed(64),
+        .height = .fixed(32),
+        .background_color = paint,
+        .custom = 7,
+    });
+    ui.close();
+    ui.close();
+    const drawn = try ui.end();
+
+    const emitted: commands.List = .{ .items = drawn };
+    try testing.expectEqual(@as(usize, 1), emitted.count(.rectangle));
+    try testing.expectEqual(@as(usize, 1), emitted.count(.custom));
+    // The fill first, and what the program draws over it.
+    var fill_at: ?usize = null;
+    var custom_at: ?usize = null;
+    for (drawn, 0..) |command, index| switch (command.config) {
+        .rectangle => fill_at = index,
+        .custom => |custom| {
+            custom_at = index;
+            try testing.expectEqual(@as(u32, 7), custom.data);
+            // Faded with the element around it.
+            try testing.expectApproxEqAbs(@as(f32, 0.5), custom.tint.a, 0.01);
+            try testing.expectEqual(@as(f32, 64), command.bounding_box.width);
+        },
+        else => {},
+    };
+    try testing.expect(fill_at.? < custom_at.?);
 }
 
 test "an image takes the place of the fill rather than sitting on it" {

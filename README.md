@@ -782,6 +782,24 @@ of the atlas, pictures are four channels of a texture. What breaks a batch is
 the texture that has to be bound - so a page of shapes, labels and icons from
 one sheet is three draws rather than one per icon.
 
+### A box the program draws
+
+```zig
+ui.empty(.{ .width = .grow, .height = .fixed(120), .custom = crt_screen });
+```
+
+**What the renderer has no command for**, the program draws itself: a
+picture through a shader of its own, a view of another scene. The element is
+laid out as any other and its fill goes down; then comes a `custom` command
+with its box and the number it was declared with, and a `tint` that is white
+faded as the element is, for what is drawn there to fade with the rest.
+
+The ready-made renderer hands it over in its place with `drawWith`: it ends
+its pass, the program's `CustomDraw` draws into the same target - clipped as
+the command is, if it likes - and the renderer begins again after, so
+whatever is declared later is drawn over it. `draw` passes none, and a box
+nobody draws is its fill and nothing more.
+
 ## Wrapping
 
 ```zig
@@ -1261,6 +1279,7 @@ than from memory.
 | **The surface** | a scale that multiplies every length in the tree, and a safe area that keeps the root off the edges of a television |
 | **Painting** | background colours, corner radii, borders on any side with three positions, z-index |
 | **Images** | a texture number, a source rectangle for sheets, a tint, and the same rounded box a rectangle gets |
+| **Custom boxes** | laid out as any element and handed back by number, for the program to draw in between the renderer's passes |
 | **Rotation** | of an element and its children or of its own box alone, with a pivot and flips, nesting, and a hit test that follows |
 | **Size and opacity** | of an element and its children, about a pivot, nesting with turns, carried to the floats inside it |
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |

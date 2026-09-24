@@ -125,6 +125,21 @@ pub const Image = struct {
     nine_slice: ?layout.NineSlice = null,
 };
 
+/// A box the program draws itself: what a renderer has no command for - a
+/// picture through a shader of the program's own, a view of another scene.
+/// See `layout.Declaration.custom`.
+///
+/// It comes after the element's fill, in the element's place in the list, so
+/// what is declared after it is drawn over whatever the program puts there.
+pub const Custom = struct {
+    /// The number the element was declared with: what the program knows the
+    /// box by.
+    data: u32,
+    /// White, faded as the element and everything around it are: what
+    /// whatever is drawn there is multiplied by, so it fades with the rest.
+    tint: Color = .white,
+};
+
 /// What a command actually asks for.
 pub const Config = union(enum) {
     /// Lay this out but draw nothing. A spacer, or an element whose fill is
@@ -134,6 +149,7 @@ pub const Config = union(enum) {
     border: Border,
     text: Text,
     image: Image,
+    custom: Custom,
     /// Clip everything until the matching `scissor_end` to this command's
     /// bounding box. These nest, and a renderer keeps a stack.
     scissor_start,
@@ -181,7 +197,7 @@ pub const RenderCommand = struct {
             .rectangle => |r| !self.bounding_box.empty() and !r.color.invisible(),
             .border => |b| !self.bounding_box.empty() and !b.color.invisible() and !b.width.isNone(),
             .text => |t| !t.color.invisible() and t.text.len > 0,
-            .image => !self.bounding_box.empty(),
+            .image, .custom => !self.bounding_box.empty(),
         };
     }
 
