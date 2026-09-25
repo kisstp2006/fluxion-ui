@@ -321,6 +321,9 @@ pub const Declaration = struct {
     cover: ?f32 = null,
 
     background_color: Color = .transparent,
+    /// The fill fading from `background_color` to another colour, across or
+    /// down: a colour picker's square and its bars. Turned with the box.
+    gradient: ?Gradient = null,
     corner_radius: CornerRadius = .sharp,
     border: ?Border = null,
 
@@ -518,6 +521,15 @@ pub const Surface = struct {
 
 const Color = @import("color.zig").Color;
 const CornerRadius = geometry.CornerRadius;
+
+/// A fill from one colour to another in a straight line: from the element's
+/// `background_color` at its left or top edge to `to` at its right or bottom.
+pub const Gradient = struct {
+    to: Color,
+    toward: Toward = .right,
+
+    pub const Toward = enum { right, down };
+};
 
 /// A line around an element.
 pub const Border = struct {

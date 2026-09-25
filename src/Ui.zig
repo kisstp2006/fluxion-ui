@@ -114,6 +114,7 @@ const Element = struct {
     config: LayoutConfig,
 
     background_color: Color,
+    gradient: ?layout.Gradient = null,
     corner_radius: CornerRadius,
     border: ?layout.Border,
     z_index: i16,
@@ -1115,6 +1116,7 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
         .id = id,
         .config = declaration.layout(),
         .background_color = declaration.background_color,
+        .gradient = declaration.gradient,
         .corner_radius = declaration.corner_radius,
         .border = declaration.border,
         .z_index = declaration.z_index,
@@ -2803,7 +2805,8 @@ fn emitFill(self: *Ui, element: Element, box: BoundingBox) Error!void {
     }
 
     const fill = self.inked(element.background_color);
-    if (fill.invisible()) return;
+    const fade: ?layout.Gradient = if (element.gradient) |g| .{ .to = self.inked(g.to), .toward = g.toward } else null;
+    if (fill.invisible() and (fade == null or fade.?.to.invisible())) return;
 
     try self.output.append(self.gpa, .{
         .bounding_box = box,
@@ -2812,6 +2815,7 @@ fn emitFill(self: *Ui, element: Element, box: BoundingBox) Error!void {
         .transform = self.stamp,
         .config = .{ .rectangle = .{
             .color = fill,
+            .gradient = fade,
             .corner_radius = element.corner_radius.clampTo(box.width, box.height),
         } },
     });
@@ -8988,6 +8992,26 @@ test "the pointer goes through a veil that lets it, to the button under it, and 
     try frame(&ui, false);
     try testing.expect(ui.isPointerOver("veil"));
     try testing.expect(!ui.isPointerOver("button"));
+}
+
+test "a gradient is drawn as the rectangle, from its colour to the other, faded as it is" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    ui.begin(.init(200, 100));
+    openRoot(&ui);
+    ui.open(.{ .width = .fixed(100), .height = .fixed(20), .opacity = 0.5 });
+    ui.empty(.{ .width = .grow, .height = .grow, .background_color = .hex(0x000000), .gradient = .{ .to = .hex(0xFFFFFF), .toward = .down } });
+    ui.close();
+    ui.close();
+    const drawn = try ui.end();
+    var found = false;
+    for (drawn) |c| if (c.config == .rectangle) if (c.config.rectangle.gradient) |g| {
+        found = true;
+        try testing.expectEqual(layout.Gradient.Toward.down, g.toward);
+        // The fade reaches the far colour too.
+        try testing.expectApproxEqAbs(@as(f32, 0.5), g.to.a, 0.01);
+    };
+    try testing.expect(found);
 }
 
 test "the pointer is within a view on the floats it lays over itself, and not on a float of another's" {

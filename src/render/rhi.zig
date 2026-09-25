@@ -77,6 +77,9 @@ pub const Instance = extern struct {
     /// Where the origin lands after `motion`. Beside `border` and `textured`
     /// so the three of them are one `float4` attribute rather than two.
     origin: [2]f32,
+    /// The colour a shape fades to, along the corner coordinate its `uv`
+    /// weighs: (1, 0) across, (0, 1) down. Unread for anything else.
+    fade: [4]f32 = @splat(0),
 
     /// The three things one quad can be.
     pub const Kind = struct {
@@ -246,6 +249,7 @@ pub const Renderer = struct {
                 .{ .location = 4, .format = .float4, .offset = @offsetOf(Instance, "uv"), .buffer = 1 },
                 .{ .location = 5, .format = .float4, .offset = @offsetOf(Instance, "border"), .buffer = 1 },
                 .{ .location = 6, .format = .float4, .offset = @offsetOf(Instance, "motion"), .buffer = 1 },
+                .{ .location = 7, .format = .float4, .offset = @offsetOf(Instance, "fade"), .buffer = 1 },
             },
             .topology = .triangle_strip,
             // Straight alpha, because that is what a colour written as
@@ -552,11 +556,16 @@ pub const Renderer = struct {
                     .rect = boxArray(command.bounding_box),
                     .color = fill.color.array(),
                     .radii = fill.corner_radius.array(),
-                    .uv = @splat(0),
+                    // A shape samples nothing: its `uv` says which way it fades.
+                    .uv = if (fill.gradient) |g| switch (g.toward) {
+                        .right => .{ 1, 0, 0, 0 },
+                        .down => .{ 0, 1, 0, 0 },
+                    } else @splat(0),
                     .motion = turn.motion,
                     .border = 0,
                     .textured = Instance.Kind.shape,
                     .origin = turn.origin,
+                    .fade = if (fill.gradient) |g| g.to.array() else fill.color.array(),
                 }),
                 .border => |line| try self.instances.append(self.gpa, .{
                     .rect = boxArray(command.bounding_box),
@@ -1135,6 +1144,34 @@ test "a rectangle becomes one instance where the layout put it" {
     // One batch, no scissor.
     try testing.expectEqual(1, fixture.renderer.batches.items.len);
     try testing.expectEqual(null, fixture.renderer.batches.items[0].scissor);
+}
+
+test "a gradient is the rectangle's quad, fading to its other colour the way it says" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    try fixture.renderer.build(&.{
+        .{
+            .bounding_box = .init(0, 0, 100, 20),
+            .config = .{ .rectangle = .{ .color = .hex(0x000000), .gradient = .{ .to = .hex(0xFFFFFF) } } },
+        },
+        .{
+            .bounding_box = .init(0, 30, 20, 100),
+            .config = .{ .rectangle = .{ .color = .hex(0xFF0000), .gradient = .{ .to = .hex(0x0000FF), .toward = .down } } },
+        },
+        .{
+            .bounding_box = .init(0, 0, 10, 10),
+            .config = .{ .rectangle = .{ .color = .hex(0x00FF00) } },
+        },
+    }, page);
+
+    const instances = fixture.renderer.instances.items;
+    try testing.expectEqual(3, instances.len);
+    try testing.expectEqual([4]f32{ 1, 0, 0, 0 }, instances[0].uv);
+    try testing.expectEqual([4]f32{ 1, 1, 1, 1 }, instances[0].fade);
+    try testing.expectEqual([4]f32{ 0, 1, 0, 0 }, instances[1].uv);
+    // A plain fill weighs no corner: it stays its colour.
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, instances[2].uv);
 }
 
 test "a border becomes the same quad with a width on it" {
@@ -1795,6 +1832,61 @@ fn drawsTheSquare(device: *rhi.Device, bytes: []const u8) !void {
     // And the edge is where the padding put it.
     try testing.expect(channel(pixels, 30, 64, 0) > 200);
     try testing.expect(channel(pixels, 10, 64, 0) < 50);
+}
+
+test "a gradient fades across its box and down it, on every GPU backend" {
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    for (gpu_backends) |select| {
+        var device = try gpuDevice(select) orelse continue;
+        defer device.deinit();
+        try fadesAcrossAndDown(&device, bytes);
+    }
+}
+
+fn fadesAcrossAndDown(device: *rhi.Device, bytes: []const u8) !void {
+    const target = try device.createTexture(.{
+        .width = 128,
+        .height = 128,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    var face: font.Font = try .init(bytes);
+    var renderer: Renderer = try .init(testing.allocator, device, &face);
+    defer renderer.deinit();
+
+    const size: ui.Dimensions = .init(128, 128);
+    var layout: ui.Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(.monospace(0.5, 1.0));
+
+    layout.begin(.{ .size = size });
+    {
+        layout.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+        defer layout.close();
+        // Black to white across the top half; red to blue down the bottom.
+        layout.empty(.{ .width = .grow, .height = .grow, .background_color = .hex(0x000000), .gradient = .{ .to = .hex(0xFFFFFF) } });
+        layout.empty(.{ .width = .grow, .height = .grow, .background_color = .hex(0xFF0000), .gradient = .{ .to = .hex(0x0000FF), .toward = .down } });
+    }
+    const commands = try layout.end();
+    try renderer.draw(.{ .texture = target }, size, commands, .black);
+
+    const pixels = try device.readTexture(target, testing.allocator);
+    defer testing.allocator.free(pixels);
+    const channel = struct {
+        fn at(data: []const u8, x: usize, y: usize, index: usize) f32 {
+            return @floatFromInt(data[(y * 128 + x) * 4 + index]);
+        }
+    }.at;
+
+    // Across: dark on the left, light on the right, half way in the middle.
+    try testing.expect(channel(pixels, 2, 32, 1) < 20);
+    try testing.expect(channel(pixels, 125, 32, 1) > 235);
+    try testing.expectApproxEqAbs(128, channel(pixels, 64, 32, 1), 12);
+    // Down: red at its top, blue at its bottom.
+    try testing.expect(channel(pixels, 64, 66, 0) > 220 and channel(pixels, 64, 66, 2) < 35);
+    try testing.expect(channel(pixels, 64, 125, 2) > 220 and channel(pixels, 64, 125, 0) < 35);
 }
 
 test "the shader turns a box too, on every GPU backend" {

@@ -45,6 +45,8 @@ pub const layout = @import("layout.zig");
 pub const markup = @import("markup.zig");
 pub const text = @import("text.zig");
 pub const text_input = @import("text_input.zig");
+/// A colour picker to put in a popup: see `color_picker`.
+pub const ColorPicker = @import("color_picker.zig");
 
 /// The frame: open, close, and the three passes that follow. See `Ui`.
 pub const Ui = @import("Ui.zig");
@@ -95,5 +97,6 @@ test {
     _ = markup;
     _ = text;
     _ = text_input;
+    _ = ColorPicker;
     _ = Ui;
 }

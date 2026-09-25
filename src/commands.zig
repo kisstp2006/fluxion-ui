@@ -54,6 +54,10 @@ const CornerRadius = geometry.CornerRadius;
 /// honours the scissor commands already shows a recognisable interface.
 pub const Rectangle = struct {
     color: Color,
+    /// From `color` at the left or the top to another colour: see
+    /// `layout.Gradient`. A renderer that knows nothing of it fills with
+    /// `color`, which is where it starts.
+    gradient: ?layout.Gradient = null,
     corner_radius: CornerRadius = .sharp,
 };
 

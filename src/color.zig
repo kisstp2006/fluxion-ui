@@ -122,6 +122,51 @@ pub const Color = extern struct {
         return std.math.clamp(encoded, 0, 1);
     }
 
+    /// From hue, saturation and value, each from nought to one - the hue
+    /// round from red through yellow, green, cyan, blue and magenta - and an
+    /// alpha. What a colour picker holds.
+    pub fn hsv(h: f32, s: f32, v: f32, a: f32) Color {
+        const hue = @mod(h, 1) * 6;
+        const sat = std.math.clamp(s, 0, 1);
+        const val = std.math.clamp(v, 0, 1);
+        const sector: u32 = @min(@as(u32, @intFromFloat(@floor(hue))), 5);
+        const f = hue - @as(f32, @floatFromInt(sector));
+        const p = val * (1 - sat);
+        const q = val * (1 - sat * f);
+        const t = val * (1 - sat * (1 - f));
+        const rgb3: [3]f32 = switch (sector) {
+            0 => .{ val, t, p },
+            1 => .{ q, val, p },
+            2 => .{ p, val, t },
+            3 => .{ p, q, val },
+            4 => .{ t, p, val },
+            else => .{ val, p, q },
+        };
+        return .{ .r = rgb3[0], .g = rgb3[1], .b = rgb3[2], .a = std.math.clamp(a, 0, 1) };
+    }
+
+    /// Its hue, saturation and value, each from nought to one: the hue is
+    /// nought for a grey, which has none.
+    pub fn toHsv(self: Color) [3]f32 {
+        const r = std.math.clamp(self.r, 0, 1);
+        const g = std.math.clamp(self.g, 0, 1);
+        const b = std.math.clamp(self.b, 0, 1);
+        const most = @max(r, @max(g, b));
+        const least = @min(r, @min(g, b));
+        const spread = most - least;
+        const s = if (most > 0) spread / most else 0;
+        if (spread <= 0) return .{ 0, s, most };
+        var h: f32 = if (most == r)
+            (g - b) / spread
+        else if (most == g)
+            2 + (b - r) / spread
+        else
+            4 + (r - g) / spread;
+        h /= 6;
+        if (h < 0) h += 1;
+        return .{ h, s, most };
+    }
+
     /// The same colour at a different opacity. What a disabled control is.
     pub inline fn withAlpha(self: Color, a: f32) Color {
         return .{ .r = self.r, .g = self.g, .b = self.b, .a = a };

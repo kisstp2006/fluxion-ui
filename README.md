@@ -361,6 +361,14 @@ found, and the pointer is never over it itself.
 `.preserve_focus = true` leaves the keyboard where it is, for a toolbar button
 that should not take the caret out of the field beside it.
 
+**A float ends what the pointer is over**: `isPointerOver` climbs from the
+element on top to its ancestors and stops at a float, since what is above a
+float in the tree is not what is under it on the screen. `isPointerWithin`
+climbs past: whether what is on top under the pointer is the element or
+anything inside it, floats included - a text view that lays its rows and
+tooltips over itself as floats is still under the pointer on them, and a
+menu someone else floats over it is not inside it.
+
 ### Which element is which
 
 Everything that outlives a frame - hover, a press, the focus, a scroll
@@ -1280,6 +1288,29 @@ reach for because hex is what a designer hands over.
 ```zig
 .background_color = .hex(0x262220),
 .background_color = .oklch(0.7, 0.14, 250),   // same lightness at every hue
+.background_color = .hsv(0.6, 0.75, 0.8, 1),   // hue, saturation, value, alpha
+```
+
+**A fill can fade** from its colour to another, across or down, and turns
+with its box:
+
+```zig
+.background_color = .white,
+.gradient = .{ .to = .hex(0xFF0000) },                 // across
+.gradient = .{ .to = .black, .toward = .down },        // down
+```
+
+**`ColorPicker`** is a colour picker to put in a popup: a square of
+saturation and value beside a bar of hues, or a wheel of hues and
+saturations beside a bar of values; a bar of alpha over a checker; the
+colour it opened with beside the new one, a press on it going back; and
+fields for the hex, R G B A from 0 to 255, and H S V. It holds the colour as
+hue, saturation and value, so a colour made grey keeps its hue.
+
+```zig
+var picking: ui.ColorPicker.State = .init(tint);
+// each frame, inside the popup:
+if (ui.ColorPicker.picker(&layout, &picking, .{ .id = "tint" })) tint = picking.color();
 ```
 
 ## Where the origin is

@@ -7,6 +7,7 @@ attribute vec4 a_radii : 3;
 attribute vec4 a_uv : 4;
 attribute vec4 a_params : 5;
 attribute vec4 a_motion : 6;
+attribute vec4 a_fade : 7;
 
 varying vec2 v_local;
 varying vec2 v_half;
@@ -35,7 +36,9 @@ vertex {
                  a_motion.y * pixel.x + a_motion.w * pixel.y) + a_params.zw;
     v_local = (a_corner - 0.5) * a_rect.zw;
     v_half = a_rect.zw * 0.5;
-    v_color = a_color;
+    // A shape fades along the corner its uv weighs; the rest sample with it.
+    float t = (a_params.y < 0.5) ? dot(a_corner, a_uv.xy) : 0.0;
+    v_color = mix(a_color, a_fade, t);
     v_radii = a_radii;
     v_uv = mix(a_uv.xy, a_uv.zw, a_corner);
     v_border = a_params.x;
