@@ -173,6 +173,7 @@ the differences are the ones Zig forces, and there are three of them.
 | `.rotate_shape(\|r\| r.degrees(30))` | `.rotate_shape = .degrees(30)` |
 | `.on_press(\|\| ...)` | `.on_press = .{ .context = &state, .call = pressed }` |
 | `.capture()` | `.capture = true` |
+| `.passthrough()` | `.passthrough = true` |
 | `.text_input(\|t\| t.placeholder("Name"))` | `ui.textInput(.{ ... }, .{ .placeholder = "Name" })` |
 | `{color=red\|text}` in every string | `ui.markup("{color=red\|text}", style)` |
 | `ui.get_text_value(id)` | `ui.textValueOf("name")` |
@@ -353,6 +354,10 @@ list does not answer a click at the place it would have been.
 
 `.capture = true` stops the pointer reaching what is behind - a knob inside a
 draggable panel wants it, so dragging the knob does not also drag the panel.
+`.passthrough = true` is the other way: the pointer goes through the element
+to what is behind it, as if it were not there - a veil over the screen that
+fades in and out, a picture laid over buttons. What is inside it is still
+found, and the pointer is never over it itself.
 `.preserve_focus = true` leaves the keyboard where it is, for a toolbar button
 that should not take the caret out of the field beside it.
 
@@ -1324,7 +1329,6 @@ the order it is worth doing in.
 | | What it is, and what it needs |
 | --- | --- |
 | **The rest of keyboard navigation** | A ring drawn round the focus when the keyboard put it there; the arrow keys scrolling the list under the pointer when there is nowhere to move the focus; and PageUp, PageDown, Home and End scrolling it too. Tab, `tab_index`, the arrows and the key that presses are [here already](#the-focus-from-a-keyboard-or-a-pad). |
-| **`passthrough`** | The opposite of `capture`: an element the pointer goes straight through, so a decoration over a button does not swallow the click. |
 | **TinyVG** | Ply can hand a vector image straight to `.image(...)` and rasterise it. Here a picture is a texture, and turning TinyVG into one is somebody else's pass. |
 | **Shaders and effects** | `.effect(...)` and `.shader(...)`: a fragment shader per element, with Ply's own build step behind it. This renderer is one pipeline and one draw call by design, and a shader per element is a pipeline per element - so this is not a missing feature so much as a different renderer. A program that wants it can consume the command list itself. |
 | **Smooth scrolling** | Ply also animates *towards* a target over a duration, so a wheel notch glides rather than jumps. A flick coasts here; a notch still arrives at once. |

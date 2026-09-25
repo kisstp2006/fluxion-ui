@@ -189,6 +189,8 @@ const Element = struct {
     parent: u32 = 0,
     /// Whether the pointer stops here. See `layout.Declaration.capture`.
     capture: bool = false,
+    /// Whether the pointer goes through. See `layout.Declaration.passthrough`.
+    passthrough: bool = false,
     /// Whether a press here leaves the focus where it is. See
     /// `layout.Declaration.preserve_focus`.
     preserve_focus: bool = false,
@@ -362,6 +364,7 @@ const Hit = struct {
     /// frame. See `holds`.
     motion: geometry.Transform,
     capture: bool,
+    passthrough: bool,
     preserve_focus: bool,
     /// Whether this is a text input, which a press has more to do about.
     field: bool,
@@ -1114,6 +1117,7 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
         .clip = self.remembered(declaration, id),
         .parent = self.innermost(),
         .capture = declaration.capture,
+        .passthrough = declaration.passthrough,
         .preserve_focus = declaration.preserve_focus,
         .cursor = declaration.cursor,
         .focus = if (declaration.focus) |asked| .of(asked) else null,
@@ -3574,6 +3578,7 @@ fn recordHits(self: *Ui) Error!void {
             .parent = parent,
             .floating = element.floating != null,
             .capture = element.capture,
+            .passthrough = element.passthrough,
             .preserve_focus = element.preserve_focus,
             .field = element.field != null,
             .drag_select = if (element.field) |config| config.drag_select else false,
@@ -4020,7 +4025,9 @@ pub fn draggingScrollbar(self: *Ui) bool {
 /// Backwards through the hit list, because that is paint order: the last
 /// thing drawn is the thing on top, so the last box containing the point is
 /// the one being pointed at. Then up the tree from there, which gives the
-/// ancestors - and stops at anything that captures.
+/// ancestors - and stops at anything that captures. An element the pointer
+/// goes through is passed over both times: what is behind it is found, and
+/// it is never among what the pointer is over.
 fn chainUnder(self: *Ui, point: geometry.Vec2) Error!void {
     if (self.hits.items.len == 0) return;
 
@@ -4029,7 +4036,7 @@ fn chainUnder(self: *Ui, point: geometry.Vec2) Error!void {
     var topmost: ?u32 = null;
     var latest: u32 = 0;
     for (self.hits.items, 0..) |hit, i| {
-        if (!hit.holds(point)) continue;
+        if (hit.passthrough or !hit.holds(point)) continue;
         if (topmost == null or hit.paint > latest) {
             topmost = @intCast(i);
             latest = hit.paint;
@@ -4059,6 +4066,7 @@ fn chainUnder(self: *Ui, point: geometry.Vec2) Error!void {
     var back = depth;
     while (back > 0) {
         back -= 1;
+        if (self.hits.items[chain[back]].passthrough) continue;
         try self.over.append(self.gpa, self.hits.items[chain[back]].id);
     }
 }
@@ -8903,6 +8911,53 @@ test "z_index decides which float is on top, and ties keep their order" {
     ui.setPointer(50, 50, false);
     try two(&ui, 5, 0);
     try testing.expect(ui.isPointerOver("low"));
+}
+
+test "the pointer goes through a veil that lets it, to the button under it, and a veil that does not stops it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui, passthrough: bool) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            u.open(.{ .id = "button", .width = .fixed(100), .height = .fixed(40), .background_color = paint });
+            u.close();
+            // Over everything, drawn on top: a veil faded out.
+            u.open(.{
+                .id = "veil",
+                .width = .grow,
+                .height = .grow,
+                .background_color = paint,
+                .passthrough = passthrough,
+                .floating = .{ .attach = .root, .z_index = 100 },
+            });
+            u.open(.{ .id = "inside", .width = .fixed(50), .height = .fixed(50), .background_color = paint });
+            u.close();
+            u.close();
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    // On the button, under the veil.
+    try frame(&ui, true);
+    ui.setPointer(80, 20, false);
+    try frame(&ui, true);
+    try testing.expect(ui.isPointerOver("button"));
+    try testing.expect(!ui.isPointerOver("veil"));
+    // What is inside the veil is found as ever.
+    ui.setPointer(20, 20, false);
+    try frame(&ui, true);
+    try testing.expect(ui.isPointerOver("inside"));
+    try testing.expect(!ui.isPointerOver("veil"));
+
+    // A veil that keeps the pointer covers the button.
+    try frame(&ui, false);
+    ui.setPointer(80, 20, false);
+    try frame(&ui, false);
+    try testing.expect(ui.isPointerOver("veil"));
+    try testing.expect(!ui.isPointerOver("button"));
 }
 
 test "a float inside a higher one is placed after it, on it, and over what is between" {

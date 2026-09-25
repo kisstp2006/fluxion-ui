@@ -384,6 +384,11 @@ pub const Declaration = struct {
     /// Ply's `.capture()`, and what a button inside a draggable panel wants:
     /// dragging the button must not also drag the panel.
     capture: bool = false,
+    /// Whether the pointer goes through this element to what is behind it,
+    /// as if it were not there: a veil over the screen that fades in and out,
+    /// a picture laid over buttons. What is inside it is still found, and the
+    /// pointer is never over it itself.
+    passthrough: bool = false,
     /// Whether pressing here leaves the keyboard where it is. Ply's
     /// `.preserve_focus()`, for a toolbar control that should not take the
     /// caret out of the field beside it.
