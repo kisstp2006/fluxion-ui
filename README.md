@@ -716,11 +716,12 @@ round and its edge is still one pixel wide. Ply instead renders the subtree to
 an offscreen target and draws that target rotated, which costs a pass and
 resamples the text; this costs neither.
 
-## Size and opacity
+## Size, opacity and tint
 
 ```zig
 .scale = .by(1.2),       // this element and everything in it, about its middle
 .opacity = 0.5,          // this element and everything in it, half there
+.tint = .rgb(1, 0.8, 0.8), // this element and everything in it, warmer
 ```
 
 Two more that go the way `rotate` does: onto what an element and everything
@@ -732,11 +733,14 @@ factor for both axes, so a rounded corner stays round - its antialiased edge
 grows with it. **An opacity** multiplies the alpha of every colour the element
 and its children draw, its border and its text among them, times its
 ancestors'; at nought nothing of it reaches the list, though the pointer still
-finds it. It is worked into the colours as the commands are made, so a
-renderer draws a fading panel without knowing it fades.
+finds it. **A tint** is the same for every channel: each colour the element
+and its children draw is seen through it, times its ancestors', so a panel
+pulses warmer, words and all, and a tint's alpha fades as an opacity does.
+Both are worked into the colours as the commands are made, so a renderer
+draws a fading, tinted panel without knowing it is either.
 
 A float declared inside an element - `attach = .parent` - is inside it on
-screen as well, so it turns, grows and fades with it. One attached to the
+screen as well, so it turns, grows, fades and is tinted with it. One attached to the
 root, or to another element by id, does not.
 
 ## Images
@@ -898,6 +902,12 @@ which is what makes a dropdown the width of the control it drops from.
 within one, and the pointer finds it first. Ply's `clip_by_parent` is
 `.clip = true`, which cuts it off at the target's edge.
 
+**It is never under the float it hangs off.** One whose target is inside
+another float - or is one - takes that float's `z_index` when its own is
+lower, so it is placed after its target is and drawn over it: a layer at 20
+keeps a box pinned inside it at 20, above a panel at 10, and fading the
+layer fades the box.
+
 One thing worth knowing: **a floating element ends the chain the pointer walks
 up**. Standing on the menu does not count as standing on the button it hangs
 off, because on screen it is not inside it - the same reason `capture` stops
@@ -1043,6 +1053,12 @@ that, on the clock `tick` keeps - `setRepeat` changes both. Never more than
 one a frame, and a hitch in the game does not come back as a burst of rows.
 A keyboard repeats on its own, so every arrow key event, repeats and all, is
 one `navigate`.
+
+**An element can keep the focus and take the steps itself.** One that names
+itself as its neighbour - `.focus = .{ .left = "volume", .right = "volume" }`
+on `volume` - stays focused when that way is pressed, and `stepped()` says
+the way `holdNavigation` stepped this frame, repeats and all: a slider moves
+its value by it.
 
 **The key that presses is a level, not an event**, and it goes through the
 pointer's four states: `pressed()`, `justPressed()`, `justReleased()` and the
@@ -1281,7 +1297,7 @@ than from memory.
 | **Images** | a texture number, a source rectangle for sheets, a tint, and the same rounded box a rectangle gets |
 | **Custom boxes** | laid out as any element and handed back by number, for the program to draw in between the renderer's passes |
 | **Rotation** | of an element and its children or of its own box alone, with a pivot and flips, nesting, and a hit test that follows |
-| **Size and opacity** | of an element and its children, about a pivot, nesting with turns, carried to the floats inside it |
+| **Size, opacity and tint** | of an element and its children, about a pivot, nesting with turns, carried to the floats inside it |
 | **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
 | **Rich text** | words in their own sizes and weights, pictures among them, rows that wrap between words, and as many characters shown as asked |

@@ -146,6 +146,12 @@ pub const Color = extern struct {
         };
     }
 
+    /// Each channel times the other's: a colour seen through a tint. White
+    /// changes nothing, and a half-clear white halves the alpha alone.
+    pub inline fn times(self: Color, other: Color) Color {
+        return .{ .r = self.r * other.r, .g = self.g * other.g, .b = self.b * other.b, .a = self.a * other.a };
+    }
+
     /// The four floats, for a uniform or a vertex.
     pub inline fn array(self: Color) [4]f32 {
         return .{ self.r, self.g, self.b, self.a };

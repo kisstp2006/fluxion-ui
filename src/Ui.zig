@@ -160,10 +160,12 @@ const Element = struct {
     /// A size applied to this element and everything inside it. See
     /// `layout.Scale`.
     scale: ?layout.Scale = null,
-    /// Its own `opacity`, and what it comes to once its ancestors' is
-    /// multiplied in: what every colour it draws is faded by.
+    /// Its own `opacity` and `tint`, and what they come to once its
+    /// ancestors' are multiplied in: what every colour it draws is seen
+    /// through.
     opacity: f32 = 1,
-    fade: f32 = 1,
+    tint: Color = .white,
+    ink: Color = .white,
     /// What was in force when this element was drawn, which is what the hit
     /// test undoes to ask whether the pointer is on it.
     motion: geometry.Transform = .identity,
@@ -528,6 +530,10 @@ const Float = struct {
     /// trap `text` and the placeholder fell into first, in the one field that
     /// was still reading its string late.
     target: ?u32 = null,
+    /// Where it comes in the order the floats are placed and drawn: its own
+    /// `z_index`, or the one of the float it hangs off - through anything in
+    /// between - when that is higher. Set by `placeFloats`.
+    order: i16 = 0,
 };
 
 /// A press on a text input, waiting for the layout to say where it landed.
@@ -630,8 +636,8 @@ const Frame = struct {
     /// What everything in this element is turned by, inherited from its
     /// ancestors and its own `rotate`.
     motion: geometry.Transform = .identity,
-    /// What everything in it is faded by, the same way.
-    fade: f32 = 1,
+    /// What everything in it is seen through, the same way.
+    ink: Color = .white,
 
     /// For a wrapping element: the line being placed, how many of it are
     /// down, and where the *next* line starts across the main axis.
@@ -691,6 +697,8 @@ activation: input.PointerState = .idle,
 activated: u32 = 0,
 /// A direction held on a pad, and when it next steps. See `holdNavigation`.
 hold: Hold = .{},
+/// The way `holdNavigation` stepped this frame, if it did: see `stepped`.
+stepped_way: ?input.Navigation = null,
 /// How a held direction repeats. See `setRepeat`.
 repeat: input.Repeat = .{},
 
@@ -717,8 +725,9 @@ painted: u32 = 0,
 /// emits. Set by `positionAndEmit` and read by the six emitters, which is a
 /// great deal less threading than passing it to all of them.
 stamp: geometry.Transform = .identity,
-/// What its colours are faded by, the same way: see `layout.Declaration.opacity`.
-fade: f32 = 1,
+/// What its colours are seen through, the same way: see
+/// `layout.Declaration.opacity` and `tint`.
+ink: Color = .white,
 
 /// What each text input holds, kept between frames.
 ///
@@ -1115,6 +1124,7 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
         .rotate_shape = declaration.rotate_shape,
         .scale = declaration.scale,
         .opacity = declaration.opacity,
+        .tint = declaration.tint,
     });
 
     // The new element is a child of whatever is open, unless it is the root -
@@ -2483,11 +2493,12 @@ fn emitPiece(
 /// order without anything having to sort it: a parent's background is written
 /// before its children are visited, and its border after they are done.
 /// What a tree being drawn is under: nothing for the root, and for a float
-/// declared inside an element, that element's motion and fade - it is inside
-/// it on screen too, so a panel that turns, grows or fades takes it along.
+/// declared inside an element, that element's motion and ink - it is inside
+/// it on screen too, so a panel that turns, grows, fades or is tinted takes
+/// it along.
 const Above = struct {
     motion: geometry.Transform = .identity,
-    fade: f32 = 1,
+    ink: Color = .white,
 };
 
 fn positionAndEmit(self: *Ui, root: u32, at: Point, above: Above) Error!void {
@@ -2506,10 +2517,10 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point, above: Above) Error!void {
     self.walk.items[0].motion = root_motion;
     self.elements.items[root].motion = root_motion;
     self.stamp = self.ownTurnOf(root, root_motion);
-    const root_fade = above.fade * self.elements.items[root].opacity;
-    self.walk.items[0].fade = root_fade;
-    self.elements.items[root].fade = root_fade;
-    self.fade = root_fade;
+    const root_ink = above.ink.times(self.ownInk(self.elements.items[root]));
+    self.walk.items[0].ink = root_ink;
+    self.elements.items[root].ink = root_ink;
+    self.ink = root_ink;
 
     try self.emitBackground(root, self.elements.items[root].box);
     try self.emitText(root, self.elements.items[root].box);
@@ -2534,7 +2545,7 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point, above: Above) Error!void {
             // every side, which looks like a rounding bug and is not.
             if (element.clip.clips()) try self.emitScissor(.scissor_end, element.box);
             self.stamp = self.ownTurnOf(frame.element, frame.motion);
-            self.fade = frame.fade;
+            self.ink = frame.ink;
             try self.emitBorder(frame.element, element.box);
             try self.emitScrollbars(frame.element, element.box);
             _ = self.walk.pop();
@@ -2621,9 +2632,9 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point, above: Above) Error!void {
         const inherited = self.turnOf(child_index, running.motion);
         self.elements.items[child_index].motion = inherited;
         self.stamp = self.ownTurnOf(child_index, inherited);
-        const child_fade = running.fade * child.opacity;
-        self.elements.items[child_index].fade = child_fade;
-        self.fade = child_fade;
+        const child_ink = running.ink.times(self.ownInk(child));
+        self.elements.items[child_index].ink = child_ink;
+        self.ink = child_ink;
 
         try self.emitBackground(child_index, self.elements.items[child_index].box);
         try self.emitText(child_index, self.elements.items[child_index].box);
@@ -2642,7 +2653,7 @@ fn positionAndEmit(self: *Ui, root: u32, at: Point, above: Above) Error!void {
             .next_child = self.startOffset(child),
             .line_cross_at = self.crossLeadOf(child),
             .motion = inherited,
-            .fade = child_fade,
+            .ink = child_ink,
         });
     }
 }
@@ -3109,7 +3120,24 @@ fn floatTarget(self: *Ui, float: Float) ?u32 {
 /// After the whole flow has been placed, because that is when the boxes it
 /// anchors against exist. In `z_index` order, and in declaration order within
 /// one - the later of two menus at the same depth is the one on top.
+///
+/// A float is never below the float that carries what it hangs off: it
+/// takes that one's order when its own is lower. Its target is then placed
+/// before it is measured against, and it is drawn over it, taking on its
+/// fade - a layer at 20 keeps what is anchored inside it at 20.
 fn placeFloats(self: *Ui) Error!void {
+    // Declared in order, so what carries a float is ordered before it.
+    for (self.floats.items, 0..) |*float, at| {
+        const own = if (self.elements.items[float.element].floating) |config| config.z_index else 0;
+        float.order = own;
+        const carrier = self.carryingFloat(self.floatTarget(float.*) orelse continue) orelse continue;
+        for (self.floats.items[0..at]) |before| {
+            if (before.element == carrier) {
+                float.order = @max(own, before.order);
+                break;
+            }
+        }
+    }
     // Stable, so ties keep the order they were declared in. Ply bubble-sorts
     // its roots, which is stable too.
     std.sort.insertion(Float, self.floats.items, self, lowerFloat);
@@ -3141,17 +3169,26 @@ fn placeFloats(self: *Ui) Error!void {
         if (config.clip) try self.emitScissor(.scissor_start, against);
         const above: Above = if (config.attach == .parent and target != null) .{
             .motion = self.elements.items[target.?].motion,
-            .fade = self.elements.items[target.?].fade,
+            .ink = self.elements.items[target.?].ink,
         } else .{};
         try self.positionAndEmit(float.element, at, above);
         if (config.clip) try self.emitScissor(.scissor_end, against);
     }
 }
 
-fn lowerFloat(self: *Ui, a: Float, b: Float) bool {
-    const first = if (self.elements.items[a.element].floating) |config| config.z_index else 0;
-    const second = if (self.elements.items[b.element].floating) |config| config.z_index else 0;
-    return first < second;
+fn lowerFloat(_: *Ui, a: Float, b: Float) bool {
+    return a.order < b.order;
+}
+
+/// The float `element` is placed with: itself, or the nearest element it is
+/// inside that is out of the flow. Null when it is in the flow of the root.
+fn carryingFloat(self: *Ui, element: u32) ?u32 {
+    var at = element;
+    while (true) {
+        if (self.elements.items[at].floating != null) return at;
+        if (at == 0) return null;
+        at = self.elements.items[at].parent;
+    }
 }
 
 /// Where one scrollbar goes, and what a drag of it is worth.
@@ -3232,9 +3269,22 @@ fn visibility(config: layout.Scrollbar, idle: f32) f32 {
     return std.math.clamp(1 - through, 0, 1);
 }
 
-/// A colour of the element being drawn, faded as it and its ancestors ask.
+/// A colour of the element being drawn, seen through what it and its
+/// ancestors are faded and tinted by.
 fn inked(self: *const Ui, ink: Color) Color {
-    return if (self.fade >= 1) ink else faded(ink, self.fade);
+    const through = self.ink;
+    if (through.r >= 1 and through.g >= 1 and through.b >= 1 and through.a >= 1) return ink;
+    var out = ink.times(through);
+    out.a = std.math.clamp(out.a, 0, 1);
+    return out;
+}
+
+/// What one element's own `opacity` and `tint` see its colours through.
+fn ownInk(self: *const Ui, element: Element) Color {
+    _ = self;
+    var own = element.tint;
+    own.a *= element.opacity;
+    return own;
 }
 
 /// The same colour, dimmed by the fade.
@@ -4356,6 +4406,7 @@ pub fn navigable(self: *Ui) bool {
 /// menu to jump three rows. Without `tick` a hold steps once and then waits
 /// for ever, which is the honest answer for a library with no clock.
 pub fn holdNavigation(self: *Ui, held: ?input.Navigation) void {
+    self.stepped_way = null;
     const wanted = held orelse {
         self.hold.held = null;
         return;
@@ -4363,17 +4414,27 @@ pub fn holdNavigation(self: *Ui, held: ?input.Navigation) void {
 
     if (self.hold.held == null or self.hold.held.? != wanted) {
         self.hold = .{ .held = wanted, .next_at = self.now + @as(f64, self.repeat.delay) };
+        self.stepped_way = wanted;
         _ = self.navigate(wanted);
         return;
     }
 
     if (self.now < self.hold.next_at) return;
+    self.stepped_way = wanted;
     _ = self.navigate(wanted);
     // Kept to the schedule rather than to when this frame happened to land,
     // so the rate is right on average - but a schedule already behind is
     // started again from now, which is what stops the burst.
     self.hold.next_at += @as(f64, self.repeat.interval);
     if (self.hold.next_at <= self.now) self.hold.next_at = self.now + @as(f64, self.repeat.interval);
+}
+
+/// The way `holdNavigation` stepped the focus this frame - once as the
+/// direction was pressed, then at each repeat - or null. What an element that
+/// keeps the focus on its own sides moves by: a slider that names itself as
+/// its `left` and `right` neighbours stays focused, and steps its value.
+pub fn stepped(self: *const Ui) ?input.Navigation {
+    return self.stepped_way;
 }
 
 /// How a direction held with `holdNavigation` repeats. The defaults are a
@@ -8844,6 +8905,57 @@ test "z_index decides which float is on top, and ties keep their order" {
     try testing.expect(ui.isPointerOver("low"));
 }
 
+test "a float inside a higher one is placed after it, on it, and over what is between" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            // A layer at 20, off the corner, with a box pinned inside it.
+            u.open(.{
+                .id = "layer",
+                .width = .fixed(200),
+                .height = .fixed(100),
+                .background_color = paint,
+                .floating = .{ .attach = .root, .offset = .{ .x = 50, .y = 40 }, .z_index = 20 },
+            });
+            u.open(.{ .id = "row", .width = .fixed(80), .height = .fixed(20) });
+            u.open(.{
+                .id = "pinned",
+                .width = .fixed(40),
+                .height = .fixed(30),
+                .background_color = paint,
+                .floating = .{ .fractions = .{ .target_x = 1 }, .offset = .{ .x = 5, .y = 0 } },
+            });
+            u.close();
+            u.close();
+            u.close();
+            // Another float at 10 over the same place.
+            u.open(.{
+                .id = "between",
+                .width = .fixed(400),
+                .height = .fixed(300),
+                .background_color = paint,
+                .floating = .{ .attach = .root, .z_index = 10 },
+            });
+            u.close();
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+    const pinned = ui.boxOf("pinned").?;
+    // On the right of the row, which is where the layer put it.
+    try testing.expectEqual(@as(f32, 50 + 80 + 5), pinned.x);
+    try testing.expectEqual(@as(f32, 40), pinned.y);
+    ui.setPointer(pinned.x + 10, pinned.y + 10, false);
+    try frame(&ui);
+    try testing.expect(ui.isPointerOver("pinned"));
+}
+
 test "a float is not clipped by what it was declared in, unless it asks" {
     var ui = withText(testing.allocator);
     defer ui.deinit();
@@ -9807,6 +9919,34 @@ test "opacity fades an element and everything inside it, and none draws nothing"
     };
     try testing.expectEqual(@as(usize, 1), texts);
     try testing.expectEqual(@as(usize, 1), borders);
+}
+
+test "a tint colours an element and everything inside it, multiplied down, with its alpha an opacity" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "warm", .width = .fit, .height = .fit, .background_color = .white, .tint = .rgba(1, 0.5, 0.5, 1) });
+        defer ui.close();
+        ui.empty(.{ .id = "deeper", .width = .fixed(10), .height = .fixed(10), .background_color = .white, .tint = .rgba(0.5, 1, 1, 0.5), .opacity = 0.5 });
+        ui.text("warm words", .{ .font_size = 16, .color = .white });
+    }
+    ui.empty(.{ .id = "plain", .width = .fixed(10), .height = .fixed(10), .background_color = .white });
+    ui.close();
+    const drawn = try ui.end();
+
+    const warm = fillOf(drawn, "warm").?.config.rectangle.color;
+    try testing.expectEqual(Color.rgba(1, 0.5, 0.5, 1), warm);
+    // Its parent's tint, its own, and its own opacity, all at once.
+    const deeper = fillOf(drawn, "deeper").?.config.rectangle.color;
+    try testing.expectEqual(Color.rgba(0.5, 0.5, 0.5, 0.25), deeper);
+    try testing.expectEqual(Color.white, fillOf(drawn, "plain").?.config.rectangle.color);
+    for (drawn) |command| switch (command.config) {
+        .text => |run| try testing.expectEqual(Color.rgba(1, 0.5, 0.5, 1), run.color),
+        else => {},
+    };
 }
 
 test "a float declared inside a faded, grown element is faded and grown with it" {
@@ -11938,6 +12078,36 @@ test "a held direction steps at once, again after the delay, then every interval
     ui.tick(0.125);
     ui.holdNavigation(.up);
     try testing.expectEqual(@as(usize, 4), stepsTaken(&ui));
+}
+
+test "the way a held direction stepped is said on the frames it steps, and an element naming itself keeps the focus" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    ui.begin(.init(400, 400));
+    ui.open(.{ .width = .grow, .height = .grow, .direction = .top_to_bottom });
+    leaf(&ui, "slider", .{ .width = .fixed(200), .height = .fixed(30), .focus = .{ .left = "slider", .right = "slider" } });
+    leaf(&ui, "below", .{ .width = .fixed(200), .height = .fixed(30), .focus = .{} });
+    ui.close();
+    _ = try ui.end();
+    ui.setFocus("slider");
+    ui.setRepeat(.{ .delay = 0.5, .interval = 0.25 });
+
+    ui.tick(0.125);
+    ui.holdNavigation(.right);
+    try testing.expectEqual(@as(?input.Navigation, .right), ui.stepped());
+    try testing.expect(ui.isFocused("slider"));
+    // Held, but not yet due again: no step this frame.
+    ui.tick(0.125);
+    ui.holdNavigation(.right);
+    try testing.expect(ui.stepped() == null);
+    ui.tick(0.125);
+    ui.holdNavigation(null);
+    try testing.expect(ui.stepped() == null);
+    // Down it goes on, as it names no neighbour that way.
+    ui.tick(0.125);
+    ui.holdNavigation(.down);
+    try testing.expectEqual(@as(?input.Navigation, .down), ui.stepped());
+    try testing.expect(ui.isFocused("below"));
 }
 
 test "a held direction without a clock steps once and waits" {

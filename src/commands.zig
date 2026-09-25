@@ -135,8 +135,8 @@ pub const Custom = struct {
     /// The number the element was declared with: what the program knows the
     /// box by.
     data: u32,
-    /// White, faded as the element and everything around it are: what
-    /// whatever is drawn there is multiplied by, so it fades with the rest.
+    /// White, faded and tinted as the element and everything around it are:
+    /// what whatever is drawn there is multiplied by, so it goes with the rest.
     tint: Color = .white,
 };
 

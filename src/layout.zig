@@ -374,6 +374,11 @@ pub const Declaration = struct {
     /// colour's alpha, times this, times its parent's. What a panel fading in
     /// is drawn with. The pointer finds it all the same.
     opacity: f32 = 1,
+    /// What every colour of this element **and everything inside it** is
+    /// seen through: each channel times this, times its parent's. White
+    /// changes nothing; a reddish one warms a whole panel, words and all, and
+    /// its alpha fades as `opacity` does.
+    tint: Color = .white,
 
     /// Whether the pointer stops here rather than reaching what is behind.
     /// Ply's `.capture()`, and what a button inside a draggable panel wants:
