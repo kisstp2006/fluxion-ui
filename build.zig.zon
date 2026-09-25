@@ -28,8 +28,8 @@
         // program with its own renderer never fetches this. Pinned to a commit
         // that draws in browsers and on Android.
         .fluxion_rhi = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-rhi#7e9fa3fbb2b14371e8d6fb248739b63256301bd8",
-            .hash = "fluxion_rhi-0.1.0--pvwDyztDgCUkDdfoxajCpfsluu1VcPAojnDDqh2BJNk",
+            .url = "git+https://github.com/kisstp2006/fluxion-rhi#6db82f30ecf9fa03d8b41c910eebf1866669b021",
+            .hash = "fluxion_rhi-0.1.0--pvwD6yTDwDrhqQcFJicuttLlnSLQ5B1S_vCiHGiWicc",
             .lazy = true,
         },
 
@@ -39,16 +39,16 @@
         // repository three times, in three languages, drifting apart.
         // Pinned to a commit that writes GLSL ES 3.00 as well.
         .fluxion_shader = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-shader#2f6ebe660304cab735e1c2669663ebd0dd68d40f",
-            .hash = "fluxion_shader-0.1.0-FqFMEvtOBwDYCkbQOVR1PHrJ4A6IVjdh5FDnMNgeOh8f",
+            .url = "git+https://github.com/kisstp2006/fluxion-shader#44cdfeb8ff465a686648902617cae57945aa4630",
+            .hash = "fluxion_shader-0.1.0-FqFMEmBUBwDhmEqxZlq440f6AK4m9z_sT_A7iZYopwVo",
             .lazy = true,
         },
 
         // The window one example opens. Lazy, and the library imports it
         // nowhere: a layout engine has no business opening windows.
         .fluxion_platform = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-platform#a3f3707277d8a4fdc8100a6edd85bc779284de52",
-            .hash = "fluxion_platform-0.1.0-WsOjUUdvFwCsEYeB1XX5RhTBrRB3ElWncnw7VZ6cR99F",
+            .url = "git+https://github.com/kisstp2006/fluxion-platform#70464d7f4f07486bbdeecadb5b5af2d786416b14",
+            .hash = "fluxion_platform-0.1.0-WsOjUQpvFwAaRZAJe78KHp5AjgI4_aUARNR5KDkk-VmU",
             .lazy = true,
         },
     },
