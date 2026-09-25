@@ -685,6 +685,9 @@ hits: std.ArrayList(Hit),
 pointer: input.Pointer = .{},
 /// The elements under the pointer, outermost first. Ply's `pointer_over_ids`.
 over: std.ArrayList(u32),
+/// The element on top under the pointer and every one it is inside, up to
+/// the root, floats or not: what `isPointerWithin` asks.
+within: std.ArrayList(u32),
 /// The elements that were under it when the button went down, and still are
 /// as far as this is concerned - Ply keeps the whole chain until the button
 /// comes up, so dragging off a button and back does not lose the press.
@@ -871,6 +874,7 @@ pub fn init(gpa: Allocator) Ui {
         .field_boundaries = .empty,
         .bars = .empty,
         .over = .empty,
+        .within = .empty,
         .held = .empty,
         .scrolls = .empty,
         .runs = .empty,
@@ -901,6 +905,7 @@ pub fn deinit(self: *Ui) void {
     self.field_boundaries.deinit(self.gpa);
     self.bars.deinit(self.gpa);
     self.over.deinit(self.gpa);
+    self.within.deinit(self.gpa);
     self.held.deinit(self.gpa);
     self.scrolls.deinit(self.gpa);
     self.runs.deinit(self.gpa);
@@ -3743,6 +3748,7 @@ pub fn setPointer(self: *Ui, x: f32, y: f32, down: bool) void {
     // for hovering - the pointer resting on a bar still hovers the row
     // beneath, as it does in Ply. Only the press below is intercepted.
     self.over.clearRetainingCapacity();
+    self.within.clearRetainingCapacity();
     self.chainUnder(self.pointer.position) catch {};
 
     if (self.pointer.justPressed()) {
@@ -4045,6 +4051,15 @@ fn chainUnder(self: *Ui, point: geometry.Vec2) Error!void {
 
     const found = topmost orelse return;
 
+    // Everything it is inside, past the floats: what `isPointerWithin` asks.
+    var inside = found;
+    while (true) {
+        try self.within.append(self.gpa, self.hits.items[inside].id);
+        const parent = self.hits.items[inside].parent;
+        if (parent == inside) break;
+        inside = parent;
+    }
+
     // Up to the root, or to whatever takes the pointer for itself. A button
     // inside a draggable panel captures, so dragging the button does not also
     // drag the panel.
@@ -4193,6 +4208,21 @@ fn openId(self: *Ui) u32 {
 /// Whether the pointer is over this element. Ply's `pointer_over(id)`.
 pub fn isPointerOver(self: *Ui, name: []const u8) bool {
     return self.isOver(identify(name));
+}
+
+/// Whether what is on top under the pointer is this element or anything
+/// inside it, a float it holds too. `isPointerOver` stops at a float, since
+/// what is above a float in the tree is not what is under it on the screen;
+/// a view that lays its own contents over itself as floats - the rows and
+/// the tooltip of a text view - is still under the pointer where they are.
+/// What something else lays over it - a menu, another panel - is not inside
+/// it, and it is not under the pointer there.
+pub fn isPointerWithin(self: *Ui, name: []const u8) bool {
+    const id = identify(name);
+    for (self.within.items) |inside| {
+        if (inside == id) return true;
+    }
+    return false;
 }
 
 /// Ply's `is_pressed(id)`.
@@ -8958,6 +8988,59 @@ test "the pointer goes through a veil that lets it, to the button under it, and 
     try frame(&ui, false);
     try testing.expect(ui.isPointerOver("veil"));
     try testing.expect(!ui.isPointerOver("button"));
+}
+
+test "the pointer is within a view on the floats it lays over itself, and not on a float of another's" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    const frame = struct {
+        fn run(u: *Ui) !void {
+            u.begin(.init(400, 300));
+            openRoot(u);
+            u.open(.{ .id = "view", .width = .fixed(300), .height = .fixed(200), .background_color = paint });
+            // A row of the view's, laid over it where the view puts it.
+            u.open(.{
+                .id = "row",
+                .width = .fixed(200),
+                .height = .fixed(20),
+                .background_color = paint,
+                .floating = .{ .offset = .{ .x = 10, .y = 10 }, .z_index = 1 },
+            });
+            u.text("words", .{ .font_size = 16 });
+            u.close();
+            u.close();
+            // Someone else's menu, over the view's corner.
+            u.open(.{
+                .id = "menu",
+                .width = .fixed(60),
+                .height = .fixed(60),
+                .background_color = paint,
+                .floating = .{ .attach = .root, .offset = .{ .x = 240, .y = 140 }, .z_index = 50 },
+            });
+            u.close();
+            u.close();
+            _ = try u.end();
+        }
+    }.run;
+
+    try frame(&ui);
+    // On the row's words: over them, and not over the view, but within it.
+    ui.setPointer(15, 15, false);
+    try frame(&ui);
+    try testing.expect(!ui.isPointerOver("view"));
+    try testing.expect(ui.isPointerWithin("view"));
+    try testing.expect(ui.isPointerWithin("row"));
+    // On the view itself.
+    ui.setPointer(100, 150, false);
+    try frame(&ui);
+    try testing.expect(ui.isPointerOver("view"));
+    try testing.expect(ui.isPointerWithin("view"));
+    // On the menu over it: within the menu, not the view.
+    ui.setPointer(260, 160, false);
+    try frame(&ui);
+    try testing.expect(ui.isPointerWithin("menu"));
+    try testing.expect(!ui.isPointerWithin("view"));
 }
 
 test "a float inside a higher one is placed after it, on it, and over what is between" {
