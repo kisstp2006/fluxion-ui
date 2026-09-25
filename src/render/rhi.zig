@@ -227,6 +227,7 @@ pub const Renderer = struct {
             .glsl = .{ .vertex = module.glsl.vertex, .fragment = module.glsl.fragment },
             .glsl_es = .{ .vertex = module.glsl_es.vertex, .fragment = module.glsl_es.fragment },
             .hlsl = .{ .vertex = module.hlsl.vertex, .fragment = module.hlsl.fragment },
+            .spirv = .{ .vertex = module.spirv.vertex, .fragment = module.spirv.fragment },
             .label = "fluxion-ui",
         });
         errdefer device.destroyShader(shader);
@@ -1709,28 +1710,38 @@ test "a frame with more boxes than the buffer holds grows it" {
     try testing.expectEqual(before + 100, fixture.renderer.instances.items.len);
 }
 
-test "the Direct3D shaders compile and the frame reaches the pixels" {
-    // The other half of the shader pair. The OpenGL one is proved by
-    // `examples/window.zig`, which needs a display; this one needs no window
-    // at all - a Direct3D device is made without one, and the frame goes into
-    // a texture that is read straight back.
-    //
-    // Worth its own test because HLSL and GLSL are written side by side and
-    // only one of them was ever run. A semantic that does not match, a
-    // constant buffer packed differently, a `float2` where a `float4` was
-    // expected: all of them produce a blank window and none of them produce
-    // an error anywhere else.
+/// The GPU backends a device opens on with no window, which is where a frame
+/// can be drawn into a texture and read straight back: the renderer's pixel
+/// tests run on each of these this machine has. OpenGL, which needs a
+/// window, is proved by `examples/window.zig`.
+const gpu_backends = [_]rhi.Select{ .d3d11, .d3d12, .vulkan };
+
+/// A device on `select`, or null where this machine has none.
+fn gpuDevice(select: rhi.Select) !?rhi.Device {
+    var device = rhi.Device.init(testing.allocator, .{ .backend = select }) catch return null;
+    errdefer device.deinit();
+    // Said out loud, because a test that quietly ran on another backend
+    // would prove exactly nothing about the language it was handed.
+    try testing.expectEqualStrings(@tagName(select), @tagName(device.backendTag()));
+    return device;
+}
+
+test "the shader compiles and the frame reaches the pixels, on every GPU backend" {
+    // Fluxion Shader writes the one shader in each backend's language, and a
+    // mistake in one of them - a semantic that does not match, a constant
+    // buffer packed differently, a `float2` where a `float4` was expected -
+    // produces a blank window and no error anywhere else. So each backend
+    // draws the frame into a texture that is read straight back.
     const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
+    for (gpu_backends) |select| {
+        var device = try gpuDevice(select) orelse continue;
+        defer device.deinit();
+        try drawsTheSquare(&device, bytes);
+    }
+}
 
-    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .backend = .d3d11 }) catch
-        return error.SkipZigTest;
-    defer device.deinit();
-
-    // Said out loud, because a test that quietly ran on another backend
-    // would prove exactly nothing about the HLSL it was written for.
-    try testing.expectEqual(rhi.Backend.d3d11, device.backendTag());
-
+fn drawsTheSquare(device: *rhi.Device, bytes: []const u8) !void {
     const target = try device.createTexture(.{
         .width = 128,
         .height = 128,
@@ -1739,7 +1750,7 @@ test "the Direct3D shaders compile and the frame reaches the pixels" {
     defer device.destroyTexture(target);
 
     var face: font.Font = try .init(bytes);
-    var renderer: Renderer = try .init(testing.allocator, &device, &face);
+    var renderer: Renderer = try .init(testing.allocator, device, &face);
     defer renderer.deinit();
 
     const size: ui.Dimensions = .init(128, 128);
@@ -1786,15 +1797,17 @@ test "the Direct3D shaders compile and the frame reaches the pixels" {
     try testing.expect(channel(pixels, 10, 64, 0) < 50);
 }
 
-test "the Direct3D shader turns a box too" {
-    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .backend = .d3d11 }) catch
-        return error.SkipZigTest;
-    defer device.deinit();
-    try testing.expectEqual(rhi.Backend.d3d11, device.backendTag());
-
+test "the shader turns a box too, on every GPU backend" {
     const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
+    for (gpu_backends) |select| {
+        var device = try gpuDevice(select) orelse continue;
+        defer device.deinit();
+        try turnsTheBox(&device, bytes);
+    }
+}
 
+fn turnsTheBox(device: *rhi.Device, bytes: []const u8) !void {
     const target = try device.createTexture(.{
         .width = 128,
         .height = 128,
@@ -1803,7 +1816,7 @@ test "the Direct3D shader turns a box too" {
     defer device.destroyTexture(target);
 
     var face: font.Font = try .init(bytes);
-    var renderer: Renderer = try .init(testing.allocator, &device, &face);
+    var renderer: Renderer = try .init(testing.allocator, device, &face);
     defer renderer.deinit();
 
     const size: ui.Dimensions = .init(128, 128);
@@ -1840,19 +1853,21 @@ test "the Direct3D shader turns a box too" {
     try testing.expect(channel(pixels, 10, 64, 0) < 50);
 }
 
-test "the Direct3D shader draws a picture too" {
-    // The image branch of the HLSL, which was written beside the GLSL and
-    // would otherwise never have run. A `float4` sampled where a `float`
-    // was expected, a swizzle in the wrong order, a texture bound to the
-    // wrong slot: all of them draw nothing and none of them is an error.
-    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .backend = .d3d11 }) catch
-        return error.SkipZigTest;
-    defer device.deinit();
-    try testing.expectEqual(rhi.Backend.d3d11, device.backendTag());
-
+test "the shader draws a picture too, on every GPU backend" {
+    // The image branch of the shader, in each backend's language. A `float4`
+    // sampled where a `float` was expected, a swizzle in the wrong order, a
+    // texture bound to the wrong slot: all of them draw nothing and none of
+    // them is an error.
     const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
+    for (gpu_backends) |select| {
+        var device = try gpuDevice(select) orelse continue;
+        defer device.deinit();
+        try drawsThePicture(&device, bytes);
+    }
+}
 
+fn drawsThePicture(device: *rhi.Device, bytes: []const u8) !void {
     const target = try device.createTexture(.{
         .width = 64,
         .height = 64,
@@ -1874,7 +1889,7 @@ test "the Direct3D shader draws a picture too" {
     }, 2 * 4);
 
     var face: font.Font = try .init(bytes);
-    var renderer: Renderer = try .init(testing.allocator, &device, &face);
+    var renderer: Renderer = try .init(testing.allocator, device, &face);
     defer renderer.deinit();
     renderer.setTextures(&.{sheet});
 
