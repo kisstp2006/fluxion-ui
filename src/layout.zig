@@ -112,6 +112,14 @@ pub const Sizing = struct {
         return .{ .kind = .fixed, .min = size, .max = size };
     }
 
+    /// This many pixels where the parent has room, and less where it has
+    /// not - down to `least`, or what its content needs if that is more.
+    /// A side panel's width: kept as it was set in a large window, squeezed
+    /// rather than pushed off a small one.
+    pub inline fn fixedDownTo(size: f32, least: f32) Sizing {
+        return .{ .kind = .fixed, .min = @min(least, size), .max = size };
+    }
+
     /// This fraction of the parent's inner size. `0.5` is half.
     pub inline fn percent(of_parent: f32) Sizing {
         return .{ .kind = .percent, .fraction = of_parent };
@@ -1064,20 +1072,19 @@ pub const Scrollbar = struct {
 /// chip with a long label wants. Scrolling without clipping is not a thing,
 /// so every `scroll` constructor turns the matching clip on too.
 ///
-/// One thing changes for an element that clips, and two more for one that
+/// One thing changes for an element that clips, and one more for one that
 /// scrolls:
 ///
 ///   1. **Its children do not raise its minimum** on the clipped axis. A
 ///      paragraph inside a scroll container does not make the container
 ///      un-shrinkable.
-///   2. **Its children are not squeezed to fit** along a main axis it
-///      scrolls. They keep their sizes and run off the end, which is the
-///      content a scrollbar scrolls through.
-///   3. **Its children may be larger than it** across an axis it scrolls.
+///   2. **Its children may be larger than it** across an axis it scrolls:
+///      a long line in a list that scrolls sideways keeps its length.
 ///
-/// An axis that clips and does not scroll squeezes its children like any
-/// other - text gives way, breaking or cut short - and cuts off only what
-/// still cannot fit.
+/// Along its main axis it squeezes its children like any other element -
+/// text gives way, breaking or cut short, and a list inside it shrinks -
+/// and only what still cannot fit runs off the end: cut off, or the
+/// content a scrollbar scrolls through.
 pub const Clip = struct {
     /// Cut off anything past the left and right edges.
     horizontal: bool = false,

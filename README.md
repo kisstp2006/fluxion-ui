@@ -466,19 +466,19 @@ the matching clip on because content that is not cut off has nowhere to scroll
 to. An element may clip without scrolling, which is what a fixed-width chip
 with a long label wants.
 
-A clip changes one thing, and scrolling two more:
+A clip changes one thing, and scrolling one more:
 
 1. **Its children do not raise its minimum** on the clipped axis, so a long
    list does not make the panel round it un-shrinkable.
-2. **Its children are not squeezed** along a main axis it scrolls. They keep
-   their sizes and run off the end - and that overflow *is* the content a
-   scroll position moves through. Squeezing it away would leave nothing to
-   scroll.
-3. **Its children may be larger than it** across an axis it scrolls.
+2. **Its children may be larger than it** across an axis it scrolls: a long
+   line in a list that scrolls sideways keeps its length.
 
-An axis that clips without scrolling squeezes its children like any other, so
-the label in a narrow chip ends in `…` rather than in half a letter, and only
-what still cannot fit is cut. Ply leaves every clipped axis unsqueezed.
+Along its main axis it squeezes its children like any other element, and only
+what still cannot fit runs off the end - cut off, or the content a scroll
+position moves through. So the label in a narrow chip ends in `…` rather than
+in half a letter, and a list inside a panel that scrolls gives way before the
+panel scrolls, the way a scroll container's children shrink on the web. Ply
+leaves every clipped axis unsqueezed.
 
 The scroll position is **state that outlives a frame**, like what is typed
 into a field. A layout is otherwise a pure function of its declaration and a

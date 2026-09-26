@@ -1604,7 +1604,7 @@ fn closeChecked(self: *Ui) Error!void {
 
     const children_start: u32 = @intCast(self.children.items.len);
     // What this element clips, which changes what its children may ask of
-    // it. Rule one of three: a clipped axis takes nothing from its children's
+    // it. Rule one: a clipped axis takes nothing from its children's
     // minimum, so a long list does not make the box round it un-shrinkable.
     const clip = self.elements.items[index].clip;
     const clips_main = clip.onAxis(along_x);
@@ -1669,6 +1669,12 @@ fn applyOwnSizing(element: *Element) void {
             },
             // A ratio waits for the other axis, for the same reason.
             .ratio => {},
+            // Its size whatever it holds; one that gives way does so down to
+            // its least, or its content's.
+            .fixed => {
+                size.* = wanted.max;
+                smallest.* = wanted.clamp(smallest.*);
+            },
             else => {
                 size.* = wanted.clamp(size.*);
                 smallest.* = wanted.clamp(smallest.*);
@@ -1815,7 +1821,7 @@ fn sizeAlongAxis(self: *Ui, x_axis: bool, from: u32) Error!void {
                 // unbroken, and the wrap pass is handed a width it can never
                 // break at.
                 //
-                // Rule three: unless the parent scrolls this axis, in which
+                // Rule two: unless the parent scrolls this axis, in which
                 // case a child wider than its container is exactly the point.
                 const room = if (parent.clip.scrollsOn(x_axis)) @max(inner, widest) else inner;
                 const smallest = child.min_dimensions.onAxis(x_axis);
@@ -1843,11 +1849,13 @@ const WrapLine = struct {
 /// grow to - which is Ply's rule and the thing that stops the answer
 /// depending on itself. Where the lines fall decides how much space each one
 /// has to share out, and how much a child grew depends on that; asking the
-/// grown size first would be a loop.
+/// grown size first would be a loop. Its minimum is what its content needs
+/// too, not only what it declared: two fields that each need more than half
+/// the row go on a line each rather than both being squeezed out of it.
 fn breakSize(self: *Ui, child_index: u32, x_axis: bool) f32 {
     const child = self.elements.items[child_index];
     const wanted = child.config.sizing.onAxis(x_axis);
-    return if (wanted.kind == .grow) wanted.min else child.dimensions.onAxis(x_axis);
+    return if (wanted.kind == .grow) floorOf(child, x_axis) else child.dimensions.onAxis(x_axis);
 }
 
 /// The next line of a wrapping container, starting at the `from`th child.
@@ -1937,11 +1945,10 @@ fn distributeRun(self: *Ui, parent: Element, children: []const u32, x_axis: bool
     if (spare > 0) {
         try self.grow(children, x_axis, spare);
     } else {
-        // Rule two: a container that scrolls this axis lets its children run
-        // off the end rather than squeezing them. That overflow *is* the
-        // content a scroll position moves through - squeezing it away would
-        // leave nothing to scroll.
-        if (parent.clip.scrollsOn(x_axis)) return;
+        // Squeezed down to what they need, and only what still does not
+        // fit runs off the end - cut off where this axis clips, and scrolled
+        // through where it scrolls. A list inside a panel that scrolls gives
+        // way before the panel scrolls.
         try self.shrink(children, x_axis, -spare);
     }
 }
@@ -2049,9 +2056,11 @@ fn shrink(self: *Ui, children: []const u32, x_axis: bool, excess_in: f32) Error!
     for (children) |child_index| {
         const child = self.elements.items[child_index];
         const wanted = child.config.sizing.onAxis(x_axis);
-        // Fixed elements are not negotiable, and percentages already had
-        // their share taken out of the parent.
-        if (wanted.kind == .fixed or wanted.kind == .percent) continue;
+        // Fixed elements are not negotiable - but for one that gives way,
+        // `fixedDownTo` - and percentages already had their share taken out
+        // of the parent.
+        if (wanted.kind == .fixed and wanted.min >= wanted.max) continue;
+        if (wanted.kind == .percent) continue;
         if (child.dimensions.onAxis(x_axis) <= floorOf(child, x_axis)) continue;
         try self.resizable.append(self.gpa, child_index);
     }
@@ -5128,6 +5137,10 @@ pub const Spill = struct {
     /// How far it reaches past where it belongs, across and down.
     over_x: f32,
     over_y: f32,
+    /// Where it was drawn, and where it belongs: its parent's box, or the
+    /// surface for a float.
+    box: BoundingBox,
+    within: BoundingBox,
 };
 
 /// What the last frame drew outside where it belongs - as many as fit in
@@ -5143,8 +5156,12 @@ pub fn spills(self: *const Ui, into: []Spill) []Spill {
         if (i == 0 or found == into.len) continue;
         if (!element.motion.isIdentity()) continue;
         var over: geometry.Vec2 = .{ .x = 0, .y = 0 };
+        var within = self.elements.items[element.parent].box;
         if (element.floating) |float| {
-            if (float.keep_on_screen) over = beyond(element.box, safe);
+            // One cut off at its target's edge is where it belongs whatever
+            // its box; any other has the surface, or the safe part of it.
+            within = if (float.keep_on_screen) safe else self.surfaceBox();
+            if (!float.clip) over = beyond(element.box, within);
         } else {
             const parent = self.elements.items[element.parent];
             over = beyond(element.box, parent.box);
@@ -5158,10 +5175,15 @@ pub fn spills(self: *const Ui, into: []Spill) []Spill {
             }
         }
         if (over.x <= 0.5 and over.y <= 0.5) continue;
-        into[found] = .{ .id = element.id, .text = self.firstTextIn(@intCast(i)), .over_x = over.x, .over_y = over.y };
+        into[found] = .{ .id = element.id, .text = self.firstTextIn(@intCast(i)), .over_x = over.x, .over_y = over.y, .box = element.box, .within = within };
         found += 1;
     }
     return into[0..found];
+}
+
+/// The whole surface, safe area and all.
+fn surfaceBox(self: *const Ui) BoundingBox {
+    return .init(0, 0, self.surface.width, self.surface.height);
 }
 
 /// How far `inner` reaches past `outer`, across and down.
@@ -5208,6 +5230,70 @@ fn leaf(ui: *Ui, name: []const u8, d: layout.Declaration) void {
     named.background_color = paint;
     ui.open(named);
     ui.close();
+}
+
+test "a size that gives way is its size where there is room, and down to its least where there is not" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    // Room: exactly 60, though it holds nothing.
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    ui.open(.{ .width = .fixed(300), .height = .fixed(20) });
+    leaf(&ui, "side", .{ .width = .fixedDownTo(60, 10), .height = .grow });
+    leaf(&ui, "rest", .{ .width = .grow, .height = .grow });
+    ui.close();
+    ui.close();
+    _ = try ui.end();
+    try testing.expectEqual(@as(f32, 60), ui.boxOf("side").?.width);
+
+    // None: it gives way, where a plain fixed size beside it does not - and
+    // not below its least.
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    ui.open(.{ .width = .fixed(100), .height = .fixed(20) });
+    leaf(&ui, "side", .{ .width = .fixedDownTo(60, 10), .height = .grow });
+    leaf(&ui, "firm", .{ .width = .fixed(60), .height = .grow });
+    ui.close();
+    ui.close();
+    _ = try ui.end();
+    try testing.expectEqual(@as(f32, 40), ui.boxOf("side").?.width);
+    try testing.expectEqual(@as(f32, 60), ui.boxOf("firm").?.width);
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    ui.open(.{ .width = .fixed(50), .height = .fixed(20) });
+    leaf(&ui, "side", .{ .width = .fixedDownTo(60, 10), .height = .grow });
+    leaf(&ui, "firm", .{ .width = .fixed(60), .height = .grow });
+    ui.close();
+    ui.close();
+    _ = try ui.end();
+    try testing.expectEqual(@as(f32, 10), ui.boxOf("side").?.width);
+}
+
+test "growing children that need more than a line between them go on a line each" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fixed(70), .height = .fit, .gap = 4, .wrap = true, .wrap_gap = 2 });
+        defer ui.close();
+        inline for (.{ "a", "b" }) |name| {
+            ui.open(.{ .id = name, .width = .grow, .height = .fixed(20), .padding = .xy(6, 0), .gap = 4 });
+            ui.text("X", sixteen);
+            ui.text("12.5", sixteen);
+            ui.close();
+        }
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Each needs 12 + 8 + 4 + 16: two of them and the gap are more than 70.
+    try testing.expectEqual(BoundingBox.init(0, 0, 70, 20), ui.boxOf("a").?);
+    try testing.expectEqual(BoundingBox.init(0, 22, 70, 20), ui.boxOf("b").?);
+    var none: [4]Spill = undefined;
+    try testing.expectEqual(@as(usize, 0), ui.spills(&none).len);
 }
 
 test "a fixed size is what it says" {
@@ -6446,10 +6532,13 @@ test "a float kept on screen is moved back in, and is no bigger than the screen"
     _ = try ui.end();
 
     try testing.expectEqual(BoundingBox.init(120, 0, 80, 100), ui.boxOf("menu").?);
-    // One that was not asked to goes where its anchor puts it.
+    // One that was not asked to goes where its anchor puts it - off the
+    // edge, which is what `spills` says of it, and of nothing else.
     try testing.expectEqual(@as(f32, 170), ui.boxOf("free").?.x);
-    var none: [4]Spill = undefined;
-    try testing.expectEqual(@as(usize, 0), ui.spills(&none).len);
+    var found: [4]Spill = undefined;
+    const spilled = ui.spills(&found);
+    try testing.expectEqual(@as(usize, 1), spilled.len);
+    try testing.expectEqual(@as(f32, 50), spilled[0].over_x);
 }
 
 test "what spills is what is drawn outside its parent on an axis it does not scroll" {
@@ -6644,13 +6733,13 @@ test "the style carries through to the command a renderer sees" {
 // Clipping and scrolling
 // -------------------------------------------------------------------------
 //
-// The three rules a clip changes are each a place the layout would otherwise
+// The two rules a clip changes are each a place the layout would otherwise
 // refuse to overflow, and each has a test that fails without it. Then the
 // scissor pair, then the scroll position.
 
-test "a clip container lets its children overflow rather than squeezing them" {
-    // Rule two. Without it the two hundred pixels of content would be
-    // compressed into a hundred, and there would be nothing left to scroll.
+test "a clip container lets what cannot give way overflow" {
+    // Two hundred pixels of fixed content in a hundred: what there is to
+    // scroll through.
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
@@ -6723,7 +6812,7 @@ test "a clipped axis does not raise the container's minimum" {
 }
 
 test "a child may be wider than the container across a clipped axis" {
-    // Rule three. In a column, width is the cross axis, and a child is
+    // Rule two. In a column, width is the cross axis, and a child is
     // normally held inside the parent there.
     var ui = withText(testing.allocator);
     defer ui.deinit();
@@ -6745,6 +6834,32 @@ test "a child may be wider than the container across a clipped axis" {
     _ = try ui.end();
 
     try testing.expectEqual(@as(f32, 400), ui.boxOf("wide").?.width);
+}
+
+test "a list in a container that scrolls gives way before the container scrolls" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 400));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "panel", .width = .fixed(100), .height = .fixed(100), .direction = .top_to_bottom, .clip = .scrollY });
+        defer ui.close();
+        leaf(&ui, "bar", .{ .width = .grow, .height = .fixed(20) });
+        ui.open(.{ .id = "list", .width = .grow, .height = .grow, .direction = .top_to_bottom, .clip = .scrollY });
+        for (0..10) |_| {
+            ui.open(.{ .width = .grow, .height = .fixed(20) });
+            ui.close();
+        }
+        ui.close();
+    }
+    ui.close();
+    _ = try ui.end();
+
+    // Two hundred pixels of rows, and the list is what is left under the
+    // bar: the list scrolls, and the panel has nothing to.
+    try testing.expectEqual(@as(f32, 80), ui.boxOf("list").?.height);
+    try testing.expectEqual(@as(f32, 20), ui.boxOf("list").?.y - ui.boxOf("panel").?.y);
 }
 
 test "a clip emits a scissor pair around its children and nothing else" {
