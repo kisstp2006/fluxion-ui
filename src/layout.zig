@@ -678,6 +678,15 @@ pub const Focus = struct {
     /// only from a press on it or from `Ui.setFocus`: a list whose rows are
     /// clicked, which the keyboard walks with the list's own keys.
     tab_stop: bool = true,
+
+    /// Whose the keys are while it has the focus. `navigation`: Tab, the
+    /// arrows and a pad move the focus on, Enter and Space press it - and a
+    /// text input keeps the typing keys and leaves Tab to move on. `all`:
+    /// every key is its own, Tab too, and nothing moves the focus away but a
+    /// press elsewhere or `Ui.setFocus`: a code editor.
+    keys: Keys = .navigation,
+
+    pub const Keys = enum { navigation, all };
 };
 
 /// Something to call when an element is pointed at or focused. Ply's

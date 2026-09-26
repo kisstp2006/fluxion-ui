@@ -1038,7 +1038,10 @@ sends the last field of a form back to its first rather than on, and
 `.previous` is Shift+Tab's. **`.tab_stop = false`** keeps an element out of
 Tab's walk and the arrows' - it takes the focus from a press on it, or from
 `setFocus`, and from nothing else: a list whose rows are clicked and walked
-with the list's own keys.
+with the list's own keys. **`.keys = .all`** makes every key the element's
+own while it has the focus, Tab and the arrows too: `navigate`,
+`holdNavigation` and `setActivate` leave it alone, `wantsKeyboard()` is true,
+and `holdsEveryKey()` says so - a code editor, which indents with Tab.
 
 **The arrows go to the element that way.** The one the focus names, if it
 names one - `.focus = .{ .down = "quit" }`, Ply's `focus_down`, read as it is

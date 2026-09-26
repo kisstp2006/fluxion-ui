@@ -233,6 +233,7 @@ const Focusing = struct {
     next: ?u32 = null,
     previous: ?u32 = null,
     tab_stop: bool = true,
+    keys: layout.Focus.Keys = .navigation,
 
     fn of(asked: layout.Focus) Focusing {
         return .{
@@ -244,6 +245,7 @@ const Focusing = struct {
             .next = if (asked.next) |name| identify(name) else null,
             .previous = if (asked.previous) |name| identify(name) else null,
             .tab_stop = asked.tab_stop,
+            .keys = asked.keys,
         };
     }
 
@@ -4320,13 +4322,24 @@ pub fn setCursor(self: *Ui, shape: ?layout.CursorShape) void {
 
 /// Whether the interface wants the keys.
 ///
-/// True only when a **text input** has the focus, which is the case that
-/// matters: W means "walk" until somebody is typing a name into a box, and
-/// then it means W. A focused button does not take the keyboard - a game
+/// True when a **text input** has the focus, which is the case that matters:
+/// W means "walk" until somebody is typing a name into a box, and then it
+/// means W - and when an element that takes every key has it (see
+/// `holdsEveryKey`). A focused button does not take the keyboard - a game
 /// still wants its own bindings while one is highlighted.
 pub fn wantsKeyboard(self: *Ui) bool {
     if (self.focus == 0) return false;
-    return self.edits.contains(self.focus);
+    return self.edits.contains(self.focus) or self.holdsEveryKey();
+}
+
+/// Whether what has the focus takes every key, Tab and the arrows too:
+/// declared with `.focus = .{ .keys = .all }`. While it does, `navigate`,
+/// `holdNavigation` and `setActivate` leave the focus and the presses alone,
+/// so a program can hand them every key as it comes.
+pub fn holdsEveryKey(self: *Ui) bool {
+    const at = self.focusedHit() orelse return false;
+    const focus = self.hits.items[at].focus orelse return false;
+    return focus.keys == .all;
 }
 
 /// Where the cursor of the input with the keyboard is, or null when no input
@@ -4411,6 +4424,7 @@ pub fn isFocused(self: *Ui, name: []const u8) bool {
 /// one focusable element that already has the focus, Tab moves nothing and
 /// says so, and an arrow with nothing further that way does the same.
 pub fn navigate(self: *Ui, to: input.Navigation) bool {
+    if (self.holdsEveryKey()) return false;
     const before = self.focus;
     switch (to) {
         .next => self.stepTab(true),
@@ -4508,7 +4522,7 @@ const Hold = struct {
 /// `textAction(.submit)` rather than this; `wantsKeyboard` is how a program
 /// knows which of the two to send.
 pub fn setActivate(self: *Ui, down: bool) void {
-    self.activation = self.activation.advance(down);
+    self.activation = self.activation.advance(down and !self.holdsEveryKey());
     switch (self.activation) {
         // What has the focus now is what is pressed until the key comes up.
         .pressed_this_frame => self.activated = self.focus,
@@ -11759,6 +11773,41 @@ test "with one element to go to, Tab that stays put says it did not move" {
     defer bare.deinit();
     try panels(&bare);
     try testing.expect(!bare.navigate(.next));
+}
+
+test "an element that takes every key keeps the focus from Tab, the arrows and Enter, and wants the keyboard" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    const Page = struct {
+        fn frame(u: *Ui) !void {
+            u.begin(.{ .size = .init(400, 300) });
+            u.open(.{ .id = "code", .width = .fixed(200), .height = .fixed(100), .focus = .{ .keys = .all } });
+            u.close();
+            u.open(.{ .id = "ok", .width = .fixed(60), .height = .fixed(30), .focus = .{} });
+            u.close();
+            _ = try u.end();
+        }
+    };
+    try Page.frame(&ui);
+    try Page.frame(&ui);
+
+    ui.setFocus("ok");
+    try testing.expect(!ui.wantsKeyboard());
+    ui.setFocus("code");
+    try testing.expect(ui.wantsKeyboard());
+    try testing.expect(ui.holdsEveryKey());
+    try testing.expect(!ui.navigate(.next));
+    try testing.expect(!ui.navigate(.down));
+    ui.holdNavigation(.down);
+    try testing.expect(ui.isFocused("code"));
+    ui.setActivate(true);
+    try Page.frame(&ui);
+    try testing.expect(!ui.isElementPressed("code"));
+    ui.setActivate(false);
+
+    // Elsewhere, Tab walks again.
+    ui.setFocus("ok");
+    try testing.expect(ui.navigate(.next));
 }
 
 test "Tab goes on from a panel somebody clicked" {
