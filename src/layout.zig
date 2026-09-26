@@ -947,6 +947,12 @@ pub const Floating = struct {
     /// Whether to cut it off at the edge of what it is attached to. Ply's
     /// `clip_by_parent`.
     clip: bool = false,
+    /// Whether it stays on the surface: no wider or taller than what an
+    /// interface may use, and moved back in where its anchor would put part
+    /// of it off an edge. What a menu, a tooltip or a dialog wants; not what
+    /// a label pinned to something in a scene does, which goes where that
+    /// thing goes.
+    keep_on_screen: bool = false,
 
     /// See `fractions`. Nought is the left or the top, one the right or the
     /// bottom.
@@ -1058,16 +1064,20 @@ pub const Scrollbar = struct {
 /// chip with a long label wants. Scrolling without clipping is not a thing,
 /// so every `scroll` constructor turns the matching clip on too.
 ///
-/// Three things change for an element that clips, and each is a place the
-/// layout would otherwise refuse to overflow:
+/// One thing changes for an element that clips, and two more for one that
+/// scrolls:
 ///
 ///   1. **Its children do not raise its minimum** on the clipped axis. A
 ///      paragraph inside a scroll container does not make the container
 ///      un-shrinkable.
-///   2. **Its children are not squeezed to fit** along a clipped main axis.
-///      They keep their sizes and run off the end, which is the content a
-///      scrollbar scrolls through.
-///   3. **Its children may be larger than it** across a clipped cross axis.
+///   2. **Its children are not squeezed to fit** along a main axis it
+///      scrolls. They keep their sizes and run off the end, which is the
+///      content a scrollbar scrolls through.
+///   3. **Its children may be larger than it** across an axis it scrolls.
+///
+/// An axis that clips and does not scroll squeezes its children like any
+/// other - text gives way, breaking or cut short - and cuts off only what
+/// still cannot fit.
 pub const Clip = struct {
     /// Cut off anything past the left and right edges.
     horizontal: bool = false,
@@ -1148,6 +1158,11 @@ pub const Clip = struct {
     /// Whether it scrolls at all, and so needs its position remembered.
     pub inline fn scrolls(self: Clip) bool {
         return self.scroll_x or self.scroll_y;
+    }
+
+    /// Whether it scrolls along one axis: rules two and three above.
+    pub inline fn scrollsOn(self: Clip, x_axis: bool) bool {
+        return if (x_axis) self.scroll_x else self.scroll_y;
     }
 
     /// The same clip with a scrollbar on it. Ply's

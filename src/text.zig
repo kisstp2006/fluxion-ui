@@ -30,16 +30,24 @@ const AlignX = geometry.AlignX;
 const Color = color.Color;
 const Dimensions = geometry.Dimensions;
 
-/// What to do when text is wider than the room it has.
+/// What to do when text is wider than the room it has. **Text never runs
+/// out of its box**: it breaks onto another line, or a line that cannot
+/// break is shortened and ends in an `ellipsis`.
 pub const WrapMode = enum {
-    /// Break between words, which is what reading requires. The default.
+    /// Break between words, which is what reading requires - and inside a
+    /// word too long for a line of its own, a path or an address. The
+    /// default.
     words,
-    /// Break only where the text itself says to. Long lines overflow.
+    /// Break only where the text itself says to. A line too long for the
+    /// room ends in an ellipsis.
     newline,
-    /// Never break. What a label in a fixed-width chip wants, and what a
-    /// clip container is usually paired with.
+    /// One line, the text's first, which is what a label, a tab or a list's
+    /// row wants: too long for the room, it ends in an ellipsis.
     none,
 };
+
+/// What a line cut short ends in.
+pub const ellipsis = "\u{2026}";
 
 pub const Outline = struct {
     color: Color = .black,
@@ -252,21 +260,53 @@ pub const Words = struct {
 ///
 /// **This is the number that makes the shrink pass mean anything**: every
 /// other kind of element has a minimum equal to its content, so nothing could
-/// ever give way. A paragraph can, down to its longest word.
-///
-/// Which is only true of a paragraph that breaks between words. The other two
-/// modes give nothing: `.newline` breaks where the text says to and nowhere
-/// else, so it is as narrow as its widest line, and `.none` breaks nowhere at
-/// all. **A run squeezed below this draws over whatever is beside it** - the
-/// box gets smaller and the line does not - so getting it wrong for a mode
-/// that cannot break is worse than not shrinking at all.
+/// ever give way. Text can, and in every mode, down to about one character -
+/// an em - since none of them ever runs out of its box: a paragraph breaks
+/// its lines, a word too long for one inside it, and a line that cannot
+/// break is cut short with an `ellipsis`. A run narrower than an em is that
+/// narrow already.
 pub fn narrowest(run: []const u8, style: TextStyle, measurer: Measurer) f32 {
-    if (style.wrap != .words) return unwrappedWidth(run, style, measurer);
+    const em: f32 = @floatFromInt(style.font_size);
+    if (style.wrap != .words) return @min(unwrappedWidth(run, style, measurer), em);
 
     var widest: f32 = 0;
     var words: Words = .init(run, style, measurer);
     while (words.next()) |word| widest = @max(widest, word.width);
-    return widest;
+    return @min(widest, em);
+}
+
+/// What of a run is drawn: all of it, but for a run in one line - `.none` -
+/// whose first is all there is.
+pub fn shown(run: []const u8, style: TextStyle) []const u8 {
+    if (style.wrap != .none) return run;
+    return run[0 .. std.mem.indexOfScalar(u8, run, '\n') orelse run.len];
+}
+
+/// How many bytes of `piece` fit in `room` pixels, whole characters: the
+/// longest start of it no wider. At least one character when `one_at_least`,
+/// which is how a word too long for a line still goes somewhere.
+pub fn fitting(piece: []const u8, room: f32, style: TextStyle, measurer: Measurer, one_at_least: bool) u32 {
+    if (piece.len == 0) return 0;
+    if (measurer.measure(piece, style).width <= room + 0.001) return @intCast(piece.len);
+    // What fits, and what does not: a start of none fits.
+    var fits: usize = 0;
+    var too_wide: usize = piece.len;
+    while (true) {
+        var middle = characterStart(piece, fits + (too_wide - fits) / 2);
+        if (middle <= fits) middle = characterStart(piece, fits + 1);
+        if (middle >= too_wide) break;
+        if (measurer.measure(piece[0..middle], style).width <= room + 0.001) fits = middle else too_wide = middle;
+    }
+    if (fits == 0 and one_at_least) return @intCast(characterStart(piece, 1));
+    return @intCast(fits);
+}
+
+/// Where the character at or after byte `at` starts - so a cut never splits
+/// one's bytes.
+fn characterStart(piece: []const u8, at: usize) usize {
+    var i = @min(at, piece.len);
+    while (i < piece.len and piece[i] & 0xC0 == 0x80) i += 1;
+    return i;
 }
 
 /// How wide the run would be if nothing broke it - or, when it has newlines
@@ -373,24 +413,41 @@ test "the spaces a run starts with are the gap before its first word, not a brea
     try testing.expectEqual(2, words.next().?.start);
 }
 
-test "the widest word is what a paragraph can be squeezed to" {
+test "text gives way to about a character, whatever its mode" {
     // This is the number that makes shrinking possible at all: every other
     // element's minimum is its content, so nothing gives way. A paragraph
-    // gives way down to its longest word.
-    try testing.expectEqual(@as(f32, 40), narrowest("a bb Hello cc", plain, mono));
+    // gives way to its longest word or an em, the less: below its longest
+    // word, it breaks the word.
+    try testing.expectEqual(@as(f32, 16), narrowest("a bb Hello cc", plain, mono));
+    try testing.expectEqual(@as(f32, 8), narrowest("a b", plain, mono));
 
-    // With wrapping off there is nothing to give: the minimum is the whole
-    // run.
+    // A line that cannot break is cut short with an ellipsis, so it gives
+    // way as far.
     const unbroken: TextStyle = .{ .font_size = 16, .wrap = .none };
-    try testing.expectEqual(
-        mono.measure("a bb Hello cc", unbroken).width,
-        narrowest("a bb Hello cc", unbroken, mono),
-    );
-
-    // And a run that breaks only where it says to is as narrow as its widest
-    // line. Its longest word would be a minimum it cannot draw inside.
+    try testing.expectEqual(@as(f32, 16), narrowest("a bb Hello cc", unbroken, mono));
     const hard: TextStyle = .{ .font_size = 16, .wrap = .newline };
-    try testing.expectEqual(@as(f32, 48), narrowest("ab cde\nHello", hard, mono));
+    try testing.expectEqual(@as(f32, 16), narrowest("ab cde\nHello", hard, mono));
+
+    // And a run narrower than an em is as narrow as it already is.
+    try testing.expectEqual(@as(f32, 8), narrowest("x", unbroken, mono));
+}
+
+test "a run in one line shows its first line" {
+    const one: TextStyle = .{ .wrap = .none };
+    try testing.expectEqualStrings("first", shown("first\nsecond", one));
+    try testing.expectEqualStrings("first\nsecond", shown("first\nsecond", plain));
+}
+
+test "what fits is whole characters, and one at least when asked" {
+    // Eight pixels a character.
+    try testing.expectEqual(@as(u32, 3), fitting("abcdef", 24, plain, mono, false));
+    try testing.expectEqual(@as(u32, 3), fitting("abcdef", 31, plain, mono, false));
+    try testing.expectEqual(@as(u32, 6), fitting("abcdef", 100, plain, mono, false));
+    try testing.expectEqual(@as(u32, 0), fitting("abcdef", 4, plain, mono, false));
+    try testing.expectEqual(@as(u32, 1), fitting("abcdef", 4, plain, mono, true));
+    // Two bytes a letter here, and never half of one.
+    try testing.expectEqual(@as(u32, 4), fitting("éééé", 16, plain, mono, false));
+    try testing.expectEqual(@as(u32, 2), fitting("éééé", 4, plain, mono, true));
 }
 
 test "the unwrapped width of a run with newlines is its widest line" {

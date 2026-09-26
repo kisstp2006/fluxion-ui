@@ -615,8 +615,12 @@ const Line = struct {
     /// Where it starts in the run, and how many bytes it is.
     start: u32,
     len: u32,
-    /// How wide it came out, for aligning it against the others.
+    /// How wide it came out, for aligning it against the others - its
+    /// ellipsis included.
     width: f32,
+    /// Where after its start the `text.ellipsis` of a line cut short goes,
+    /// or null for a line drawn whole.
+    ellipsis_at: ?f32 = null,
 };
 
 /// A text cursor, as a frame left it.
@@ -1187,9 +1191,10 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
 /// ```
 ///
 /// The element it makes is as wide as the text would be unbroken and as
-/// narrow as its longest word - which is the whole reason the shrink pass
+/// narrow as about a character - which is the whole reason the shrink pass
 /// exists. Every other kind of element has a minimum equal to its content and
-/// so cannot give way; a paragraph can.
+/// so cannot give way; text can, since it never runs out of its box: see
+/// `text.WrapMode`.
 pub fn text(self: *Ui, content: []const u8, style: text_mod.TextStyle) void {
     self.textChecked(content, style) catch |err| self.remember(err);
 }
@@ -1253,7 +1258,7 @@ fn addRun(
     const style = wanted.scaled(self.scale);
 
     const index: u32 = @intCast(self.elements.items.len);
-    const content = self.strings.items[start..][0..len];
+    const content = text_mod.shown(self.strings.items[start..][0..len], style);
 
     // Without a measurer there is nothing to measure with, and a zero-sized
     // element is a visible mistake rather than a silent one.
@@ -1770,10 +1775,10 @@ fn sizeAlongAxis(self: *Ui, x_axis: bool, from: u32) Error!void {
         const inner = @max(0, parent.dimensions.onAxis(x_axis) - config.padding.onAxis(x_axis));
         const children = self.childrenOf(parent);
 
-        // The widest child, for a parent that clips across this axis and so
+        // The widest child, for a parent that scrolls across this axis and so
         // must not squeeze them. Computed before anything is resized.
         var widest: f32 = 0;
-        if (parent.clip.onAxis(x_axis)) {
+        if (parent.clip.scrollsOn(x_axis)) {
             for (children) |child_index| {
                 widest = @max(widest, self.elements.items[child_index].dimensions.onAxis(x_axis));
             }
@@ -1810,9 +1815,9 @@ fn sizeAlongAxis(self: *Ui, x_axis: bool, from: u32) Error!void {
                 // unbroken, and the wrap pass is handed a width it can never
                 // break at.
                 //
-                // Rule three: unless the parent clips this axis, in which case
-                // a child wider than its container is exactly the point.
-                const room = if (parent.clip.onAxis(x_axis)) @max(inner, widest) else inner;
+                // Rule three: unless the parent scrolls this axis, in which
+                // case a child wider than its container is exactly the point.
+                const room = if (parent.clip.scrollsOn(x_axis)) @max(inner, widest) else inner;
                 const smallest = child.min_dimensions.onAxis(x_axis);
                 const held = @max(smallest, @min(child.dimensions.onAxis(x_axis), room));
                 setSize(child, x_axis, held);
@@ -1932,11 +1937,11 @@ fn distributeRun(self: *Ui, parent: Element, children: []const u32, x_axis: bool
     if (spare > 0) {
         try self.grow(children, x_axis, spare);
     } else {
-        // Rule two: a container that clips this axis lets its children run
+        // Rule two: a container that scrolls this axis lets its children run
         // off the end rather than squeezing them. That overflow *is* the
         // content a scroll position moves through - squeezing it away would
         // leave nothing to scroll.
-        if (parent.clip.onAxis(x_axis)) return;
+        if (parent.clip.scrollsOn(x_axis)) return;
         try self.shrink(children, x_axis, -spare);
     }
 }
@@ -2168,71 +2173,17 @@ fn wrapText(self: *Ui) Error!void {
         run.lines_start = @intCast(self.lines.items.len);
         run.lines_len = 0;
 
-        const content = self.strings.items[run.start..][0..run.len];
-        var words: text_mod.Words = .init(content, run.style, measurer);
-        var start: ?u32 = null;
-        var stop: u32 = 0;
-        var line_width: f32 = 0;
-        // The space before the next word, held back because a line that ends
-        // here does not include it.
-        var gap: f32 = 0;
-
-        while (words.next()) |word| {
-            if (word.isBreak()) {
-                // The one break the text asks for itself. Honoured under
-                // every mode but `.none`, and it ends the line even when the
-                // line is empty - two newlines in a row are a blank line.
-                if (run.style.wrap != .none) {
-                    try self.lines.append(self.gpa, .{
-                        .start = start orelse word.start,
-                        .len = if (start) |from| stop - from else 0,
-                        .width = line_width,
-                    });
-                    run.lines_len += 1;
-                    start = null;
-                    stop = 0;
-                    line_width = 0;
-                    gap = 0;
-                }
-                continue;
-            }
-
-            const wraps = run.style.wrap == .words;
-            if (start != null and wraps and line_width + gap + word.width > width + 0.001) {
-                try self.lines.append(self.gpa, .{
-                    .start = start.?,
-                    .len = stop - start.?,
-                    .width = line_width,
-                });
-                run.lines_len += 1;
-                start = word.start;
-                stop = word.start + word.len;
-                line_width = word.width;
-                gap = word.space;
-                continue;
-            }
-
-            if (start == null) {
-                start = word.start;
-                line_width = word.width;
-            } else {
-                line_width += gap + word.width;
-            }
-            stop = word.start + word.len;
-            gap = word.space;
+        const content = text_mod.shown(self.strings.items[run.start..][0..run.len], run.style);
+        if (run.style.wrap == .words) {
+            try self.breakWords(run, content, width, measurer);
+        } else {
+            try self.cutLines(run, content, width, measurer);
         }
 
-        // Whatever is left, and an empty run still occupies one line - a
-        // paragraph of nothing is a paragraph the height of one line, which
-        // is what a text input with no text in it needs to be.
-        if (start != null or run.lines_len == 0) {
-            try self.lines.append(self.gpa, .{
-                .start = start orelse 0,
-                .len = if (start) |from| stop - from else 0,
-                .width = line_width,
-            });
-            run.lines_len += 1;
-        }
+        // An empty run still occupies one line - a paragraph of nothing is a
+        // paragraph the height of one line, which is what a text input with
+        // no text in it needs to be.
+        if (run.lines_len == 0) try self.addLine(run, .{ .start = 0, .len = 0, .width = 0 });
 
         // Both, and the minimum is the point. **A paragraph cannot give any
         // height back once its width is settled**: taking a line's worth off
@@ -2245,6 +2196,100 @@ fn wrapText(self: *Ui) Error!void {
         const wrapped = line_height * @as(f32, @floatFromInt(run.lines_len));
         self.elements.items[run.element].dimensions.height = wrapped;
         self.elements.items[run.element].min_dimensions.height = wrapped;
+    }
+}
+
+fn addLine(self: *Ui, run: *TextRun, line: Line) Error!void {
+    try self.lines.append(self.gpa, line);
+    run.lines_len += 1;
+}
+
+/// A paragraph's lines: broken between words, and inside a word too long for
+/// a line of its own, so no line is wider than `width`.
+fn breakWords(self: *Ui, run: *TextRun, content: []const u8, width: f32, measurer: text_mod.Measurer) Error!void {
+    var words: text_mod.Words = .init(content, run.style, measurer);
+    var start: ?u32 = null;
+    var stop: u32 = 0;
+    var line_width: f32 = 0;
+    // The space before the next word, held back because a line that ends
+    // here does not include it.
+    var gap: f32 = 0;
+
+    while (words.next()) |word| {
+        if (word.isBreak()) {
+            // The one break the text asks for itself. It ends the line even
+            // when the line is empty - two newlines in a row are a blank line.
+            try self.addLine(run, .{
+                .start = start orelse word.start,
+                .len = if (start) |from| stop - from else 0,
+                .width = line_width,
+            });
+            start = null;
+            line_width = 0;
+            gap = 0;
+            continue;
+        }
+
+        if (start) |from| {
+            if (line_width + gap + word.width <= width + 0.001) {
+                line_width += gap + word.width;
+                stop = word.start + word.len;
+                gap = word.space;
+                continue;
+            }
+            try self.addLine(run, .{ .start = from, .len = stop - from, .width = line_width });
+        }
+
+        // The first word of a line, and one too long for it is broken where
+        // it has to be: a line each of as much as fits, the rest starting
+        // the next.
+        var from = word.start;
+        const word_end = word.start + word.len;
+        var left = word.width;
+        while (left > width + 0.001) {
+            const piece = content[from..word_end];
+            const taken = text_mod.fitting(piece, width, run.style, measurer, true);
+            if (taken >= piece.len) break;
+            try self.addLine(run, .{
+                .start = from,
+                .len = taken,
+                .width = measurer.measure(piece[0..taken], run.style).width,
+            });
+            from += taken;
+            left = measurer.measure(content[from..word_end], run.style).width;
+        }
+        start = from;
+        stop = word_end;
+        line_width = left;
+        gap = word.space;
+    }
+
+    if (start) |from| try self.addLine(run, .{ .start = from, .len = stop - from, .width = line_width });
+}
+
+/// Lines broken only where the text says, each too wide for `width` cut short
+/// with an ellipsis.
+fn cutLines(self: *Ui, run: *TextRun, content: []const u8, width: f32, measurer: text_mod.Measurer) Error!void {
+    var from: u32 = 0;
+    while (true) {
+        const line_end: u32 = @intCast(std.mem.indexOfScalarPos(u8, content, from, '\n') orelse content.len);
+        // The spaces a line ends with are not part of it, as between words:
+        // they would push a centred line off centre.
+        const line = std.mem.trimEnd(u8, content[from..line_end], " ");
+        const whole = measurer.measure(line, run.style).width;
+        if (whole <= width + 0.001) {
+            try self.addLine(run, .{ .start = from, .len = @intCast(line.len), .width = whole });
+        } else {
+            const dots = measurer.measure(text_mod.ellipsis, run.style).width;
+            var kept = text_mod.fitting(line, width - dots, run.style, measurer, false);
+            // "Save…", not "Save …".
+            while (kept > 0 and line[kept - 1] == ' ') kept -= 1;
+            const shown_width = if (kept > 0) measurer.measure(line[0..kept], run.style).width else 0;
+            try self.addLine(run, .{ .start = from, .len = kept, .width = shown_width + dots, .ellipsis_at = shown_width });
+        }
+        // A newline at the very end starts no line of its own.
+        if (line_end + 1 >= content.len) break;
+        from = line_end + 1;
     }
 }
 
@@ -2353,7 +2398,7 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
 
     for (0..run.lines_len) |i| {
         const line = self.lines.items[run.lines_start + i];
-        if (line.len == 0) continue;
+        if (line.len == 0 and line.ellipsis_at == null) continue;
 
         // Each line is aligned inside the element's width on its own, which
         // is what makes a centred paragraph centred line by line rather than
@@ -2361,31 +2406,49 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
         const x = box.x + geometry.leadingSpaceX(box.width - line.width, run.style.alignment);
         const y = box.y + line_height * @as(f32, @floatFromInt(i));
         const content = self.strings.items[run.start..][0..run.len];
+        const spans = self.spans.items[run.spans_start..][0..run.spans_len];
 
-        if (run.spans_len == 0) {
+        if (spans.len == 0) {
             try self.emitPiece(
                 element,
                 run.style,
                 content[line.start..][0..line.len],
-                .init(x, y, line.width, line_height),
+                .init(x, y, line.ellipsis_at orelse line.width, line_height),
                 run.style.color,
                 &.{},
                 0,
             );
-            continue;
+        } else {
+            try self.emitSpanned(
+                element,
+                run.style,
+                content,
+                line.start,
+                line.start + line.len,
+                spans,
+                x,
+                y,
+                line_height,
+                run.along,
+            );
         }
 
-        try self.emitSpanned(
+        // A line cut short ends in an ellipsis, in the colour of what it
+        // stands for: the first character left out.
+        const at = line.ellipsis_at orelse continue;
+        var ink = run.style.color;
+        const left_out = line.start + line.len;
+        for (spans) |span| {
+            if (span.start <= left_out and left_out < span.end) ink = span.colorOver(run.style.color);
+        }
+        try self.emitPiece(
             element,
             run.style,
-            content,
-            line.start,
-            line.start + line.len,
-            self.spans.items[run.spans_start..][0..run.spans_len],
-            x,
-            y,
-            line_height,
-            run.along,
+            text_mod.ellipsis,
+            .init(x + at, y, line.width - at, line_height),
+            ink,
+            &.{},
+            0,
         );
     }
 }
@@ -3087,7 +3150,8 @@ fn sizeFloats(self: *Ui, x_axis: bool) Error!void {
             else => element.dimensions.onAxis(x_axis),
         };
 
-        const held = std.math.clamp(size, wanted.min, if (wanted.max > 0) wanted.max else size);
+        var held = std.math.clamp(size, wanted.min, if (wanted.max > 0) wanted.max else size);
+        if (element.floating.?.keep_on_screen) held = @min(held, if (x_axis) safe.width else safe.height);
         if (x_axis) element.dimensions.width = held else element.dimensions.height = held;
 
         try self.sizeAlongAxis(x_axis, float.element);
@@ -3104,7 +3168,7 @@ fn sizeFloats(self: *Ui, x_axis: bool) Error!void {
 /// **Nothing is clipped to it.** An inset that also cut would stop a
 /// full-bleed backdrop reaching the corners of the screen, and a backdrop is
 /// exactly the thing that should not keep clear.
-fn safeBox(self: *Ui) BoundingBox {
+fn safeBox(self: *const Ui) BoundingBox {
     const inset = self.safe_area;
     return .init(
         @floatFromInt(inset.left),
@@ -3166,7 +3230,7 @@ fn placeFloats(self: *Ui) Error!void {
             self.safeBox();
 
         const size = self.elements.items[float.element].dimensions;
-        const at: Point = if (config.fractions) |f| .{
+        var at: Point = if (config.fractions) |f| .{
             .x = against.x + against.width * f.target_x - size.width * f.element_x + config.offset.x,
             .y = against.y + against.height * f.target_y - size.height * f.element_y + config.offset.y,
         } else .{
@@ -3175,6 +3239,13 @@ fn placeFloats(self: *Ui) Error!void {
             .y = against.y + geometry.leadingSpaceY(against.height, config.anchor.parent_y) -
                 geometry.leadingSpaceY(size.height, config.anchor.element_y) + config.offset.y,
         };
+        if (config.keep_on_screen) {
+            // No bigger than the surface, from `sizeFloats`, so each clamp
+            // has room.
+            const safe = self.safeBox();
+            at.x = std.math.clamp(at.x, safe.x, @max(safe.x, safe.x + safe.width - size.width));
+            at.y = std.math.clamp(at.y, safe.y, @max(safe.y, safe.y + safe.height - size.height));
+        }
 
         // What it can be seen and pointed at through. A float is not inside
         // its declared parent on screen, so it does not inherit whatever that
@@ -5048,6 +5119,73 @@ pub fn boxOf(self: *Ui, name: []const u8) ?BoundingBox {
     return null;
 }
 
+/// Something the last frame drew outside where it belongs: see `spills`.
+pub const Spill = struct {
+    /// The element's id: a name's hash, or an unnamed element's.
+    id: u32,
+    /// The first text in it or under it, to tell a person which it is.
+    text: []const u8,
+    /// How far it reaches past where it belongs, across and down.
+    over_x: f32,
+    over_y: f32,
+};
+
+/// What the last frame drew outside where it belongs - as many as fit in
+/// `into`: an element past its parent's box on an axis the parent does not
+/// scroll, a float kept on screen that still is not, and a line of text
+/// wider than its own box. What a test of an interface asks to show that
+/// nothing in it spills, at any size. A turned or scaled element is not
+/// asked about.
+pub fn spills(self: *const Ui, into: []Spill) []Spill {
+    var found: usize = 0;
+    const safe = self.safeBox();
+    for (self.elements.items, 0..) |element, i| {
+        if (i == 0 or found == into.len) continue;
+        if (!element.motion.isIdentity()) continue;
+        var over: geometry.Vec2 = .{ .x = 0, .y = 0 };
+        if (element.floating) |float| {
+            if (float.keep_on_screen) over = beyond(element.box, safe);
+        } else {
+            const parent = self.elements.items[element.parent];
+            over = beyond(element.box, parent.box);
+            if (parent.clip.scroll_x) over.x = 0;
+            if (parent.clip.scroll_y) over.y = 0;
+        }
+        if (element.run) |index| {
+            const run = self.runs.items[index];
+            for (self.lines.items[run.lines_start..][0..run.lines_len]) |line| {
+                over.x = @max(over.x, line.width - element.box.width);
+            }
+        }
+        if (over.x <= 0.5 and over.y <= 0.5) continue;
+        into[found] = .{ .id = element.id, .text = self.firstTextIn(@intCast(i)), .over_x = over.x, .over_y = over.y };
+        found += 1;
+    }
+    return into[0..found];
+}
+
+/// How far `inner` reaches past `outer`, across and down.
+fn beyond(inner: BoundingBox, outer: BoundingBox) geometry.Vec2 {
+    return .{
+        .x = @max(@max(0, outer.x - inner.x), inner.x + inner.width - (outer.x + outer.width)),
+        .y = @max(@max(0, outer.y - inner.y), inner.y + inner.height - (outer.y + outer.height)),
+    };
+}
+
+/// The first text an element draws, or one under it draws.
+fn firstTextIn(self: *const Ui, index: u32) []const u8 {
+    for (self.elements.items[index..], index..) |element, i| {
+        const run_index = element.run orelse continue;
+        // Under `index`, or past everything that is.
+        var up: u32 = @intCast(i);
+        while (up != index and up != 0) up = self.elements.items[up].parent;
+        if (up != index) break;
+        const run = self.runs.items[run_index];
+        return self.strings.items[run.start..][0..run.len];
+    }
+    return "";
+}
+
 // -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
@@ -6060,10 +6198,11 @@ test "a wrapped paragraph makes its parent taller" {
     try testing.expectApproxEqAbs(@round(lines), lines, 0.001);
 }
 
-test "a paragraph can be shrunk down to its longest word, and no further" {
+test "a paragraph can be shrunk below its longest word, which then breaks where it must" {
     // This is the test the shrink pass has been waiting for. Every other kind
     // of element has a minimum equal to its content and so cannot give way;
-    // a paragraph can, down to the word that will not break.
+    // a paragraph can - and a word too long for the room breaks inside, so
+    // nothing runs out of the box.
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
@@ -6072,8 +6211,7 @@ test "a paragraph can be shrunk down to its longest word, and no further" {
     {
         ui.open(.{ .width = .fixed(200), .height = .grow });
         defer ui.close();
-        // Wants 200 (twenty-five characters), gives way to 88 - the width of
-        // "enormously", which is eleven characters.
+        // Wants 184, and gets the 40 the fixed sibling leaves.
         ui.open(.{ .id = "prose", .width = .fitBetween(0, 1000), .height = .fit });
         {
             defer ui.close();
@@ -6082,16 +6220,19 @@ test "a paragraph can be shrunk down to its longest word, and no further" {
         ui.empty(.{ .id = "fixed", .width = .fixed(160), .height = .grow, .background_color = paint });
     }
     ui.close();
-    _ = try ui.end();
-
-    const prose = ui.boxOf("prose").?;
-    const fixed = ui.boxOf("fixed").?;
+    const drawn = try ui.end();
 
     // The fixed sibling kept every pixel, and the prose gave up the rest.
-    try testing.expectEqual(@as(f32, 160), fixed.width);
-    try testing.expect(prose.width < 184);
-    // But not below its longest word - "enormously" is eighty pixels.
-    try testing.expect(prose.width >= 80);
+    try testing.expectEqual(@as(f32, 160), ui.boxOf("fixed").?.width);
+    try testing.expectEqual(@as(f32, 40), ui.boxOf("prose").?.width);
+    // Five characters a line: "enormously" in two.
+    var found: [8]commands.RenderCommand = undefined;
+    const texts = textsOf(drawn, &found);
+    try testing.expectEqual(@as(usize, 5), texts.len);
+    try testing.expectEqualStrings("enorm", texts[1].config.text.text);
+    try testing.expectEqualStrings("ously", texts[2].config.text.text);
+    var none: [4]Spill = undefined;
+    try testing.expectEqual(@as(usize, 0), ui.spills(&none).len);
 }
 
 test "a newline breaks a line wherever the text asks" {
@@ -6179,7 +6320,7 @@ test "a line after a newline keeps its indentation" {
     try testing.expectEqual(@as(f32, 32), ui.boxOf("block").?.height);
 }
 
-test "wrapping can be turned off, and then nothing breaks" {
+test "a line that does not break ends in an ellipsis where it has no room" {
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
@@ -6193,11 +6334,149 @@ test "wrapping can be turned off, and then nothing breaks" {
     ui.close();
     const drawn = try ui.end();
 
-    // One line, overflowing its container - which is what a label in a
-    // fixed-width chip wants, paired with a clip.
-    try testing.expectEqual(1, drawn.len);
+    // One line, as much of it as leaves room for the ellipsis - and not the
+    // space before it.
+    try testing.expectEqual(@as(usize, 2), drawn.len);
     try testing.expectEqual(@as(f32, 16), ui.boxOf("chip").?.height);
-    try testing.expectEqual(@as(f32, 88), drawn[0].bounding_box.width);
+    try testing.expectEqualStrings("aaa", drawn[0].config.text.text);
+    try testing.expectEqual(@as(f32, 24), drawn[0].bounding_box.width);
+    try testing.expectEqualStrings(text_mod.ellipsis, drawn[1].config.text.text);
+    try testing.expectEqual(@as(f32, 24), drawn[1].bounding_box.x);
+    try testing.expectEqual(@as(f32, 8), drawn[1].bounding_box.width);
+}
+
+test "a line in one is its first, and each line breaking only at newlines is cut on its own" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "one", .width = .fixed(40), .height = .fit });
+        ui.text("ab\ncdefghij", .{ .font_size = 16, .color = paint, .wrap = .none });
+        ui.close();
+        ui.open(.{ .id = "lines", .width = .fixed(40), .height = .fit });
+        ui.text("ab\ncdefghij", .{ .font_size = 16, .color = paint, .wrap = .newline });
+        ui.close();
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    try testing.expectEqual(@as(f32, 16), ui.boxOf("one").?.height);
+    try testing.expectEqual(@as(f32, 32), ui.boxOf("lines").?.height);
+    var found: [8]commands.RenderCommand = undefined;
+    const texts = textsOf(drawn, &found);
+    try testing.expectEqual(@as(usize, 4), texts.len);
+    try testing.expectEqualStrings("ab", texts[0].config.text.text);
+    try testing.expectEqualStrings("ab", texts[1].config.text.text);
+    try testing.expectEqualStrings("cdef", texts[2].config.text.text);
+    try testing.expectEqualStrings(text_mod.ellipsis, texts[3].config.text.text);
+}
+
+test "a container that clips and does not scroll squeezes its text instead of cutting it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "row", .width = .fixed(60), .height = .fit, .clip = .x });
+        defer ui.close();
+        ui.text("a label far too long", .{ .font_size = 16, .color = paint, .wrap = .none });
+        ui.empty(.{ .width = .fixed(12), .height = .fixed(12) });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    // 48 for the label, whose ellipsis ends it, and the 12 after it still
+    // in the row.
+    var found: [8]commands.RenderCommand = undefined;
+    const texts = textsOf(drawn, &found);
+    try testing.expectEqual(@as(usize, 2), texts.len);
+    try testing.expectEqualStrings("a lab", texts[0].config.text.text);
+    try testing.expectEqual(@as(f32, 40), texts[1].bounding_box.x);
+    var none: [4]Spill = undefined;
+    try testing.expectEqual(@as(usize, 0), ui.spills(&none).len);
+}
+
+test "an ellipsis is the colour of what it stands for" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(800, 600));
+    openRoot(&ui);
+    {
+        ui.open(.{ .width = .fixed(40), .height = .fit });
+        defer ui.close();
+        ui.markup("ab{color=#FF0000|cdefgh}", .{ .font_size = 16, .color = paint, .wrap = .none });
+    }
+    ui.close();
+    const drawn = try ui.end();
+
+    var found: [8]commands.RenderCommand = undefined;
+    const texts = textsOf(drawn, &found);
+    const last = texts[texts.len - 1];
+    try testing.expectEqualStrings(text_mod.ellipsis, last.config.text.text);
+    try testing.expectEqual(Color.hex(0xFF0000), last.config.text.color);
+}
+
+test "a float kept on screen is moved back in, and is no bigger than the screen" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(200, 100));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "anchor", .width = .fixed(20), .height = .fixed(20) });
+        defer ui.close();
+        ui.empty(.{
+            .id = "menu",
+            .width = .fixed(80),
+            .height = .fixed(300),
+            .floating = .{ .anchor = .after, .offset = .{ .x = 150, .y = 0 }, .keep_on_screen = true },
+        });
+        ui.empty(.{
+            .id = "free",
+            .width = .fixed(80),
+            .height = .fixed(10),
+            .floating = .{ .anchor = .after, .offset = .{ .x = 150, .y = 0 } },
+        });
+    }
+    ui.close();
+    _ = try ui.end();
+
+    try testing.expectEqual(BoundingBox.init(120, 0, 80, 100), ui.boxOf("menu").?);
+    // One that was not asked to goes where its anchor puts it.
+    try testing.expectEqual(@as(f32, 170), ui.boxOf("free").?.x);
+    var none: [4]Spill = undefined;
+    try testing.expectEqual(@as(usize, 0), ui.spills(&none).len);
+}
+
+test "what spills is what is drawn outside its parent on an axis it does not scroll" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .width = .fixed(50), .height = .fixed(20) });
+        ui.open(.{ .width = .fixed(80), .height = .fixed(20) });
+        ui.text("too wide", sixteen);
+        ui.close();
+        ui.close();
+        // Scrolled through, not spilled.
+        ui.open(.{ .width = .fixed(50), .height = .fixed(20), .clip = .scrollX });
+        ui.empty(.{ .width = .fixed(80), .height = .fixed(20) });
+        ui.close();
+    }
+    ui.close();
+    _ = try ui.end();
+
+    var found: [4]Spill = undefined;
+    const spilled = ui.spills(&found);
+    try testing.expectEqual(@as(usize, 1), spilled.len);
+    try testing.expectEqualStrings("too wide", spilled[0].text);
+    try testing.expectEqual(@as(f32, 30), spilled[0].over_x);
 }
 
 test "a line is aligned inside the width it was given" {
@@ -6309,7 +6588,7 @@ test "text without a measurer lays out as nothing rather than crashing" {
     try testing.expectEqual(@as(f32, 0), ui.boxOf("row").?.width);
 }
 
-test "a longer word than the container gets a line to itself" {
+test "a word longer than the container is broken inside, a line each of what fits" {
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
@@ -6323,11 +6602,15 @@ test "a longer word than the container gets a line to itself" {
     ui.close();
     const drawn = try ui.end();
 
-    // The long word overflows rather than being cut in half - breaking
-    // inside a word needs hyphenation rules this library has not got.
-    try testing.expectEqual(3, drawn.len);
-    try testing.expectEqualStrings("enormous", drawn[1].config.text.text);
-    try testing.expect(drawn[1].bounding_box.width > 24);
+    // Three characters a line. Without hyphenation rules, as a path or an
+    // address breaks in a browser: where the room ends.
+    try testing.expectEqual(5, drawn.len);
+    try testing.expectEqualStrings("eno", drawn[1].config.text.text);
+    try testing.expectEqualStrings("rmo", drawn[2].config.text.text);
+    try testing.expectEqualStrings("us", drawn[3].config.text.text);
+    try testing.expectEqualStrings("cd", drawn[4].config.text.text);
+    for (drawn) |command| try testing.expect(command.bounding_box.width <= 24);
+    try testing.expectEqual(@as(f32, 80), ui.boxOf("narrow").?.height);
 }
 
 test "the style carries through to the command a renderer sees" {
@@ -11547,13 +11830,12 @@ test "a growing column is not squeezed under what follows it either" {
     try testing.expect(ui.boxOf("under").?.y >= 48 - epsilon);
 }
 
-test "a run that only breaks where it says to is not squeezed over its neighbour" {
+test "a run that only breaks where it says to is cut short beside its neighbour, not drawn over it" {
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
-    // `.newline` breaks nowhere but at a newline, so the narrowest this run
-    // can be drawn is its widest line - not its widest word, which is what a
-    // run that breaks between words can give.
+    // `.newline` breaks nowhere but at a newline, so squeezed, its line ends
+    // in an ellipsis where the room does.
     ui.begin(.init(400, 300));
     openRoot(&ui);
     {
@@ -11570,8 +11852,8 @@ test "a run that only breaks where it says to is not squeezed over its neighbour
         if (std.meta.activeTag(command.config) != .text) continue;
         widest = @max(widest, command.bounding_box.right());
     }
-    try testing.expectEqual(@as(f32, 88), widest);
-    try testing.expect(ui.boxOf("beside").?.x >= 88 - epsilon);
+    try testing.expectEqual(@as(f32, 40), widest);
+    try testing.expect(ui.boxOf("beside").?.x >= 40 - epsilon);
 }
 
 test "a scrolling list keeps the room it was given, not the size of its content" {

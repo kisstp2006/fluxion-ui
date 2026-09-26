@@ -303,11 +303,23 @@ is safe to hand over. Ply copies too, into a fresh string per element per
 frame; this is one buffer, cleared and refilled, so a settled interface stops
 allocating for it.
 
+**Text never runs out of its box.** What happens when it has no room is its
+`wrap`:
+
+| `wrap` | Short of room |
+| --- | --- |
+| `.words`, the default | breaks between words, and inside a word too long for a line of its own - a path, an address |
+| `.newline` | breaks only at the text's own newlines, and a line too long ends in `…` |
+| `.none` | one line, the text's first, ending in `…` when it does not fit |
+
+The ellipsis is `text.ellipsis`, in the colour of the first character it stands
+for, and a cut line never ends in the space before it.
+
 **Text is what makes the shrink pass mean anything.** Every other kind of
-element has a minimum equal to its content and so cannot give way. A paragraph
-can: it is as wide as it would be unbroken and as narrow as its longest word,
-and everything between those is a place the layout may put it. That is why the
-passes run in the order they do -
+element has a minimum equal to its content and so cannot give way. Text can,
+in every mode: it is as wide as it would be unbroken and as narrow as about one
+character - an em - and everything between those is a place the layout may put
+it. That is why the passes run in the order they do -
 
 1. size along x, so every paragraph knows its width,
 2. **wrap**, so every paragraph knows how many lines it is,
@@ -454,18 +466,19 @@ the matching clip on because content that is not cut off has nowhere to scroll
 to. An element may clip without scrolling, which is what a fixed-width chip
 with a long label wants.
 
-A clip changes three things, and each is a place the layout would otherwise
-refuse to overflow:
+A clip changes one thing, and scrolling two more:
 
 1. **Its children do not raise its minimum** on the clipped axis, so a long
    list does not make the panel round it un-shrinkable.
-2. **Its children are not squeezed** along a clipped main axis. They keep
+2. **Its children are not squeezed** along a main axis it scrolls. They keep
    their sizes and run off the end - and that overflow *is* the content a
    scroll position moves through. Squeezing it away would leave nothing to
    scroll.
-3. **Its children may be larger than it** across a clipped cross axis.
+3. **Its children may be larger than it** across an axis it scrolls.
 
-All three are Ply's, and each has a test that fails without it.
+An axis that clips without scrolling squeezes its children like any other, so
+the label in a narrow chip ends in `…` rather than in half a letter, and only
+what still cannot fit is cut. Ply leaves every clipped axis unsqueezed.
 
 The scroll position is **state that outlives a frame**, like what is typed
 into a field. A layout is otherwise a pure function of its declaration and a
@@ -915,6 +928,12 @@ which is what makes a dropdown the width of the control it drops from.
 within one, and the pointer finds it first. Ply's `clip_by_parent` is
 `.clip = true`, which cuts it off at the target's edge.
 
+**It can be kept on screen.** `.keep_on_screen = true` makes it no wider or
+taller than the surface's safe area and moves it back in where its anchor puts
+part of it off an edge - what a menu near the corner, a tooltip at the pointer
+and a dialog in a small window all want. A label pinned to something in a scene
+does not ask, and goes where that thing goes.
+
 **It is never under the float it hangs off.** One whose target is inside
 another float - or is one - takes that float's `z_index` when its own is
 lower, so it is placed after its target is and drawn over it: a layer at 20
@@ -1342,7 +1361,7 @@ than from memory.
 | **Custom boxes** | laid out as any element and handed back by number, for the program to draw in between the renderer's passes |
 | **Rotation** | of an element and its children or of its own box alone, with a pivot and flips, nesting, and a hit test that follows |
 | **Size, opacity and tint** | of an element and its children, about a pivot, nesting with turns, carried to the floats inside it |
-| **Text** | a `Measurer` seam, word wrapping, hard newlines, per-line alignment, letter spacing, line height |
+| **Text** | a `Measurer` seam, word wrapping, breaking inside a word too long for its line, hard newlines, an ellipsis on a line cut short, per-line alignment, letter spacing, line height |
 | **Markup** | `{color=red\|...}` with nesting, plus `opacity`, `hide` and `shadow` - parsed before the layout sees it |
 | **Rich text** | words in their own sizes and weights, pictures among them, rows that wrap between words, and as many characters shown as asked |
 | **Animated text** | all nine of Ply's: `wave`, `pulse`, `swing`, `jitter`, `transform`, `gradient`, `type`, `fade` and `scale` |
@@ -1351,7 +1370,8 @@ than from memory.
 | **Pointing** | hit testing, hover, press, release and focus, with `capture`, `preserve_focus`, clip-aware picking, `wantsPointer` for a program that has its own use for a click, and a cursor shape to hand the window |
 | **Callbacks** | `on_hover`, `on_press`, `on_release`, `on_focus` and `on_unfocus`, called when the frame is over |
 | **The focus from a keyboard or a pad** | `.focus` on a declaration, a Tab order with `tab_index`, the arrows and a pad's d-pad going to a named neighbour or the nearest element that way, a held direction that repeats on `tick`'s clock, a key that presses what has the focus the way a click does, and a click that focuses the button rather than its label |
-| **Floating** | out of the flow, anchored to a parent, an element by name, or the surface - at an edge, the middle, or any fraction along - with an offset, a z-index and optional clipping |
+| **Floating** | out of the flow, anchored to a parent, an element by name, or the surface - at an edge, the middle, or any fraction along - with an offset, a z-index, optional clipping, and kept on screen when asked |
+| **Checking a layout** | `spills`: whatever the last frame drew outside its parent on an axis it does not scroll, a float kept on screen that is not, and a line wider than its box |
 | **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup, and the caret's place for an input method |
 | **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text, and a pass that can draw over a scene rather than instead of it |
 
@@ -1380,24 +1400,20 @@ keyboard reaches a text input as [an action rather than a
 key](#the-keyboard-is-the-programs).
 
 A container too small for its fixed children still overflows rather than
-squeezing them, which is the right answer: a silent squeeze hides the problem,
-and overflow is what a scroll container is for. What *can* give way is a
-paragraph, down to its longest word - see [Text](#text).
+squeezing them, which is the right answer: a fixed size is a promise, and
+overflow is what a scroll container is for. What *can* give way is text, in
+every mode, down to about a character - see [Text](#text) - and `spills` says
+what did not, which is what a test of a whole interface at a small size asks.
 
-**And no further, and never in height.** This is another place where this
-parts company with Ply, and the one where Ply has a bug. A paragraph is the
-one thing that draws outside its box: shrink it and the text does not get
-smaller, the box does - so a line that no longer fits is drawn over whatever
-comes next. Ply gives a
-text element a minimum of one line and its longest word, keeps that minimum
-after wrapping, and lets the vertical pass squeeze a three-line paragraph back
-to one - which is why an interface with too little room for its text in Ply
-overlaps rather than overflows. Here a paragraph's minimum height becomes its
-wrapped height the moment the wrap is known, a run that breaks only at its own
-newlines is as narrow as its widest line rather than its widest word, and a
-container that grows is asked again for both after wrapping rather than only
-the ones that fit their content. The interface runs off the edge instead,
-which is the same answer every other overflow gets.
+**And never in height.** This is another place where this parts company with
+Ply, and the one where Ply has a bug. Ply gives a text element a minimum of one
+line and its longest word, keeps that minimum after wrapping, and lets the
+vertical pass squeeze a three-line paragraph back to one - which is why an
+interface with too little room for its text in Ply overlaps rather than
+overflows. Here a paragraph's minimum height becomes its wrapped height the
+moment the wrap is known, and a container that grows is asked again after
+wrapping rather than only the ones that fit their content. And a line never
+reaches past its box sideways: it breaks, or it is cut short with an ellipsis.
 
 It is the failure mode a `scale` makes easy to reach - twice the interface in
 the same window - so it is worth knowing which of the two you are looking at.
