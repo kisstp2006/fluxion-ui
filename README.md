@@ -925,8 +925,12 @@ that the next one reuses.
 which is what makes a dropdown the width of the control it drops from.
 
 **It is drawn over the page**, in `z_index` order and in declaration order
-within one, and the pointer finds it first. Ply's `clip_by_parent` is
-`.clip = true`, which cuts it off at the target's edge.
+within one, and the pointer finds it first. Nothing that clips around where it
+was declared cuts it off, unless it asks: `.clip = .target` cuts it off at the
+target's edge (Ply's `clip_by_parent`), and `.clip = .like_children` wherever
+the target's own children are cut off - at the target's edge only when the
+target clips, and by whatever clips around it - as if it were in the target's
+flow. Either way, what cuts the target off cuts the float off too.
 
 **It can be kept on screen.** `.keep_on_screen = true` makes it no wider or
 taller than the surface's safe area and moves it back in where its anchor puts

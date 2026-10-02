@@ -3258,16 +3258,40 @@ fn placeFloats(self: *Ui) Error!void {
 
         // What it can be seen and pointed at through. A float is not inside
         // its declared parent on screen, so it does not inherit whatever that
-        // parent clips - unless it asked to be clipped to it.
-        self.elements.items[float.element].float_visible = if (config.clip) against else null;
+        // parent clips - unless it asked to be cut off. See `Floating.Clip`.
+        const cut: ?BoundingBox = switch (config.clip) {
+            .none => null,
+            .target => if (target) |index| against.intersect(self.shownInside(index)) else against,
+            .like_children => if (target) |index| self.shownInside(index) else self.surfaceBox(),
+        };
+        self.elements.items[float.element].float_visible = cut;
 
-        if (config.clip) try self.emitScissor(.scissor_start, against);
+        if (cut) |box| try self.emitScissor(.scissor_start, box);
         const above: Above = if (config.attach == .parent and target != null) .{
             .motion = self.elements.items[target.?].motion,
             .ink = self.elements.items[target.?].ink,
         } else .{};
         try self.positionAndEmit(float.element, at, above);
-        if (config.clip) try self.emitScissor(.scissor_end, against);
+        if (cut) |box| try self.emitScissor(.scissor_end, box);
+    }
+}
+
+/// What is left showing of `index`'s children: its own box when it clips,
+/// cut by each clipping element it is inside, up to the nearest float, which
+/// shows what it was given. Floats are placed after what carries them, so
+/// that one has its own already.
+fn shownInside(self: *const Ui, index: u32) BoundingBox {
+    var shown = self.surfaceBox();
+    var at = index;
+    while (true) {
+        const element = self.elements.items[at];
+        if (element.clip.clips()) shown = shown.intersect(element.box);
+        if (element.floating != null) {
+            if (element.float_visible) |box| shown = shown.intersect(box);
+            return shown;
+        }
+        if (at == 0) return shown;
+        at = element.parent;
     }
 }
 
@@ -5161,7 +5185,7 @@ pub fn spills(self: *const Ui, into: []Spill) []Spill {
             // One cut off at its target's edge is where it belongs whatever
             // its box; any other has the surface, or the safe part of it.
             within = if (float.keep_on_screen) safe else self.surfaceBox();
-            if (!float.clip) over = beyond(element.box, within);
+            if (float.clip != .target) over = beyond(element.box, within);
         } else {
             const parent = self.elements.items[element.parent];
             over = beyond(element.box, parent.box);
@@ -9535,7 +9559,7 @@ test "a float is not clipped by what it was declared in, unless it asks" {
     defer ui.deinit();
 
     const frame = struct {
-        fn run(u: *Ui, clip: bool) !void {
+        fn run(u: *Ui, clip: layout.Floating.Cut) !void {
             u.begin(.init(400, 300));
             openRoot(u);
             {
@@ -9563,23 +9587,139 @@ test "a float is not clipped by what it was declared in, unless it asks" {
     }.run;
 
     // Hanging below the window, outside it entirely.
-    try frame(&ui, false);
+    try frame(&ui, .none);
     ui.setPointer(50, 70, false);
-    try frame(&ui, false);
+    try frame(&ui, .none);
     try testing.expect(ui.isPointerOver("tip"));
 
     // Clipped to it, the same point is outside what is showing.
-    try frame(&ui, true);
+    try frame(&ui, .target);
     ui.setPointer(50, 70, false);
-    try frame(&ui, true);
+    try frame(&ui, .target);
     try testing.expect(!ui.isPointerOver("tip"));
+
+    // Cut like the window's own children, the same.
+    try frame(&ui, .like_children);
+    ui.setPointer(50, 70, false);
+    try frame(&ui, .like_children);
+    try testing.expect(!ui.isPointerOver("tip"));
+}
+
+/// A window of 100 by 100 that clips, at the top left, holding a box of
+/// `holder` size that does not, with a float of 30 by 30 hanging off that box
+/// at `offset`, cut as `clip` says.
+fn windowWithFloat(u: *Ui, holder: Dimensions, offset: geometry.Vec2, clip: layout.Floating.Cut) ![]const commands.RenderCommand {
+    u.begin(.init(400, 300));
+    openRoot(u);
+    {
+        u.open(.{ .id = "window", .width = .fixed(100), .height = .fixed(100), .clip = .both });
+        defer u.close();
+        u.open(.{ .id = "holder", .width = .fixed(holder.width), .height = .fixed(holder.height) });
+        defer u.close();
+        u.open(.{
+            .id = "tip",
+            .width = .fixed(30),
+            .height = .fixed(30),
+            .background_color = paint,
+            .floating = .{ .offset = offset, .clip = clip },
+        });
+        u.close();
+    }
+    u.close();
+    return try u.end();
+}
+
+/// The scissor the 30 by 30 float of `windowWithFloat` was drawn inside.
+fn scissorAroundTip(drawn: []const commands.RenderCommand) ?BoundingBox {
+    var scissors: [8]BoundingBox = undefined;
+    var depth: usize = 0;
+    for (drawn) |command| switch (command.config) {
+        .scissor_start => {
+            scissors[depth] = command.bounding_box;
+            depth += 1;
+        },
+        .scissor_end => depth -= 1,
+        .rectangle => if (command.bounding_box.width == 30 and command.bounding_box.height == 30) {
+            return if (depth == 0) null else scissors[depth - 1];
+        },
+        else => {},
+    };
+    return null;
+}
+
+test "a float cut like the children of what it hangs off is cut by what clips around it" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Right of a 40 by 40 box that does not clip, inside the window that
+    // does: in the box's flow it would be seen, and so it is.
+    var drawn = try windowWithFloat(&ui, .{ .width = 40, .height = 40 }, .{ .x = 50, .y = 0 }, .like_children);
+    try testing.expectEqual(ui.boxOf("window").?, scissorAroundTip(drawn).?);
+    ui.setPointer(65, 15, false);
+    _ = try windowWithFloat(&ui, .{ .width = 40, .height = 40 }, .{ .x = 50, .y = 0 }, .like_children);
+    try testing.expect(ui.isPointerOver("tip"));
+
+    // Half out of the bottom of the window: the half outside is not seen.
+    drawn = try windowWithFloat(&ui, .{ .width = 40, .height = 40 }, .{ .x = 0, .y = 85 }, .like_children);
+    ui.setPointer(15, 95, false);
+    _ = try windowWithFloat(&ui, .{ .width = 40, .height = 40 }, .{ .x = 0, .y = 85 }, .like_children);
+    try testing.expect(ui.isPointerOver("tip"));
+    ui.setPointer(15, 108, false);
+    _ = try windowWithFloat(&ui, .{ .width = 40, .height = 40 }, .{ .x = 0, .y = 85 }, .like_children);
+    try testing.expect(!ui.isPointerOver("tip"));
+
+    // Cut at the box's own edge instead, it is not seen right of it at all.
+    drawn = try windowWithFloat(&ui, .{ .width = 40, .height = 40 }, .{ .x = 50, .y = 0 }, .target);
+    try testing.expectEqual(ui.boxOf("holder").?, scissorAroundTip(drawn).?);
+    ui.setPointer(65, 15, false);
+    _ = try windowWithFloat(&ui, .{ .width = 40, .height = 40 }, .{ .x = 50, .y = 0 }, .target);
+    try testing.expect(!ui.isPointerOver("tip"));
+}
+
+test "a float cut at its target's edge is cut by what clips around the target too" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // A box taller than the window, the float at its bottom: inside the
+    // box, but where the window cuts the box off.
+    const holder: Dimensions = .{ .width = 40, .height = 150 };
+    const drawn = try windowWithFloat(&ui, holder, .{ .x = 0, .y = 110 }, .target);
+    try testing.expectEqual(BoundingBox.init(0, 0, 40, 100), scissorAroundTip(drawn).?);
+    ui.setPointer(15, 120, false);
+    _ = try windowWithFloat(&ui, holder, .{ .x = 0, .y = 110 }, .target);
+    try testing.expect(!ui.isPointerOver("tip"));
+}
+
+test "a float cut like the children of what it hangs off is not cut by a box that does not clip" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Nothing around it clips: it hangs off a box that does not, in the
+    // root, which shows the whole surface.
+    ui.begin(.init(400, 300));
+    openRoot(&ui);
+    {
+        ui.open(.{ .id = "holder", .width = .fixed(40), .height = .fixed(40) });
+        defer ui.close();
+        ui.open(.{
+            .id = "tip",
+            .width = .fixed(30),
+            .height = .fixed(30),
+            .background_color = paint,
+            .floating = .{ .offset = .{ .x = 200, .y = 200 }, .clip = .like_children },
+        });
+        ui.close();
+    }
+    ui.close();
+    const drawn = try ui.end();
+    try testing.expectEqual(BoundingBox.init(0, 0, 400, 300), scissorAroundTip(drawn).?);
 }
 
 test "clipping a float to its parent emits a balanced scissor" {
     var ui = withText(testing.allocator);
     defer ui.deinit();
 
-    const drawn = try withMenu(&ui, .{ .anchor = .below, .clip = true }, .fixed(80));
+    const drawn = try withMenu(&ui, .{ .anchor = .below, .clip = .target }, .fixed(80));
     const emitted: commands.List = .{ .items = drawn };
     try testing.expect(emitted.scissorsBalanced());
     try testing.expectEqual(@as(usize, 1), emitted.count(.scissor_start));

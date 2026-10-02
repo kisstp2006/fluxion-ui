@@ -952,9 +952,8 @@ pub const Floating = struct {
     /// order the floating elements are *emitted* in, which is what actually
     /// puts one over another.
     z_index: i16 = 0,
-    /// Whether to cut it off at the edge of what it is attached to. Ply's
-    /// `clip_by_parent`.
-    clip: bool = false,
+    /// What cuts it off: see `Cut`.
+    clip: Cut = .none,
     /// Whether it stays on the surface: no wider or taller than what an
     /// interface may use, and moved back in where its anchor would put part
     /// of it off an edge. What a menu, a tooltip or a dialog wants; not what
@@ -969,6 +968,22 @@ pub const Floating = struct {
         element_y: f32 = 0,
         target_x: f32 = 0,
         target_y: f32 = 0,
+    };
+
+    /// What cuts a floating element off. It is not inside its target on
+    /// screen, so nothing that cuts the target or its children cuts it unless
+    /// it asks.
+    pub const Cut = enum {
+        /// Nothing: it is seen wherever it goes. A menu, a tooltip.
+        none,
+        /// The edge of what it is attached to, and whatever cuts that off in
+        /// turn. Ply's `clip_by_parent`.
+        target,
+        /// Whatever cuts off the children of what it is attached to: that
+        /// element's edge when it clips, and whatever clips around it - as
+        /// if it were in its flow. A box placed by hand inside a scrolling
+        /// list, or a window that shows part of what it holds.
+        like_children,
     };
 
     pub const Attach = enum {
