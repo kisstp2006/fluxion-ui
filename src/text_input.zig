@@ -640,6 +640,8 @@ pub const TextEdit = struct {
     /// has not been built - and both of these change what a key does.
     multiline: bool = false,
     max_length: ?usize = null,
+    /// Drawn as bullets: what a phone's bar above its keyboard hides too.
+    password: bool = false,
 
     /// Bumped every time the text actually changes.
     ///

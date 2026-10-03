@@ -1533,6 +1533,7 @@ fn textInputChecked(self: *Ui, declaration: layout.Declaration, asked: text_inpu
     entry.value_ptr.live = true;
     entry.value_ptr.multiline = config.multiline;
     entry.value_ptr.max_length = config.max_length;
+    entry.value_ptr.password = config.password;
     if (entry.value_ptr.markup != config.markup) {
         // Turning it on has to build the view of the text that the cursor
         // moves through; turning it off has to stop using it.
@@ -5003,6 +5004,62 @@ pub fn editOf(self: *Ui, name: []const u8) ?*text_input.TextEdit {
     return self.edits.getPtr(identify(name));
 }
 
+/// The text input with the keyboard, or null when none has it: what a
+/// platform that edits text somewhere of its own - a phone's bar above its
+/// keyboard - shows, with its caret, and whether it is a password, takes
+/// lines, or has a length it stops at.
+pub fn focusedEdit(self: *Ui) ?*text_input.TextEdit {
+    if (self.focus == 0) return null;
+    return self.edits.getPtr(self.focus);
+}
+
+/// The whole of what the input with the keyboard holds, in place of what it
+/// held, with its caret - or a selection from `selection_start` to
+/// `selection_end` - as byte offsets: what a phone's bar above its keyboard
+/// sends, each change whole. An edit the reader made, as typing is: it
+/// groups with the typing round it into one undo, and `textChanged` says so.
+/// Kept to the input's `max_length`.
+pub fn replaceFocusedText(self: *Ui, run: []const u8, selection_start: usize, selection_end: usize) void {
+    self.replaceFocusedChecked(run, selection_start, selection_end) catch |err| self.remember(err);
+}
+
+fn replaceFocusedChecked(self: *Ui, run: []const u8, selection_start: usize, selection_end: usize) Error!void {
+    const edit = self.focusedEdit() orelse return;
+    var kept = run;
+    if (edit.max_length) |max| {
+        var count: usize = 0;
+        var upto: usize = 0;
+        while (upto < kept.len and count < max) : (count += 1) upto = text_input.next(kept, upto);
+        kept = kept[0..upto];
+    }
+    if (!std.mem.eql(u8, edit.value(), kept)) {
+        try edit.pushUndo(self.gpa, .insert);
+        try edit.setValue(self.gpa, kept);
+        edit.changed = true;
+    }
+    const shown = edit.shown();
+    const at = characterStart(shown, @min(selection_end, shown.len));
+    const anchor = characterStart(shown, @min(selection_start, shown.len));
+    edit.cursor = at;
+    edit.anchor = if (anchor == at) null else anchor;
+    edit.resetBlink();
+    edit.active = true;
+}
+
+/// The start of the character `at` falls in.
+fn characterStart(run: []const u8, at: usize) usize {
+    return if (at < run.len and run[at] & 0xC0 == 0x80) text_input.previous(run, at) else at;
+}
+
+/// The input with the keyboard answered, as Enter in a one-line input
+/// answers - without the new line Enter puts in one that takes lines: what a
+/// phone's bar says when its Done is pressed. See `textSubmitted`.
+pub fn submitFocused(self: *Ui) void {
+    const edit = self.focusedEdit() orelse return;
+    edit.submitted = true;
+    edit.active = true;
+}
+
 /// Forget the inputs that were not declared this frame.
 ///
 /// The mirror of the sweep `measureScroll` does, and it clears the idle clock
@@ -8345,6 +8402,55 @@ test "typing goes into the focused input and nowhere else" {
     try testing.expect(ui.textChanged("name"));
     _ = try oneField(&ui, .{});
     try testing.expect(!ui.textChanged("name"));
+}
+
+test "a phone's bar puts the whole text in the focused input, caret and all, as one undoable edit" {
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+
+    // Nothing focused: nothing to put it in.
+    _ = try oneField(&ui, .{ .max_length = 8, .password = true });
+    ui.replaceFocusedText("lost", 4, 4);
+    try testing.expect(ui.focusedEdit() == null);
+    try testing.expectEqualStrings("", ui.textValueOf("name").?);
+
+    ui.setFocus("name");
+    _ = try oneField(&ui, .{ .max_length = 8, .password = true });
+    const edit = ui.focusedEdit().?;
+    try testing.expect(edit.password);
+    try testing.expectEqual(@as(?usize, 8), edit.max_length);
+
+    // Each change whole, the caret where the bar has it: here inside "é",
+    // which is taken back to the start of the character.
+    ui.replaceFocusedText("Hé", 2, 2);
+    ui.replaceFocusedText("Héllo", 6, 6);
+    try testing.expectEqualStrings("Héllo", ui.textValueOf("name").?);
+    try testing.expectEqual(@as(usize, 6), edit.cursor);
+    try testing.expect(edit.anchor == null);
+    _ = try oneField(&ui, .{ .max_length = 8, .password = true });
+    try testing.expect(ui.textChanged("name"));
+
+    // A selection, and no change to the text: not a change.
+    ui.replaceFocusedText("Héllo", 1, 3);
+    try testing.expectEqual(@as(usize, 1), edit.anchor.?);
+    try testing.expectEqual(@as(usize, 3), edit.cursor);
+    _ = try oneField(&ui, .{ .max_length = 8, .password = true });
+    try testing.expect(!ui.textChanged("name"));
+
+    // Kept to the length the input stops at, in characters.
+    ui.replaceFocusedText("Héllo world", 12, 12);
+    try testing.expectEqualStrings("Héllo wo", ui.textValueOf("name").?);
+    try testing.expectEqual(@as(usize, 9), edit.cursor);
+
+    // The typing groups into one undo, as keys do.
+    try testing.expect(try edit.undo(testing.allocator));
+    try testing.expectEqualStrings("", ui.textValueOf("name").?);
+
+    // Done: answered, as Enter answers, and the text left as it was.
+    ui.submitFocused();
+    _ = try oneField(&ui, .{ .max_length = 8, .password = true });
+    try testing.expect(ui.textSubmitted("name"));
+    try testing.expectEqualStrings("", ui.textValueOf("name").?);
 }
 
 test "the cursor is drawn where the text ends, and only while focused" {
