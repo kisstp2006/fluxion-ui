@@ -13,6 +13,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // fluxion-font: where one emoji's characters end, which is where a caret
+    // stops - and, for the renderer, the glyphs themselves.
+    const typeface = b.dependency("fluxion_font", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The importable module. Consumers do:
     //   const ui = @import("fluxion_ui");
     //
@@ -25,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "fluxion_math", .module = math.module("fluxion_math") },
+            .{ .name = "fluxion_font", .module = typeface.module("fluxion_font") },
         },
     });
 
@@ -37,12 +45,11 @@ pub fn build(b: *std.Build) void {
     // for programs that want one ready-made. Consumers do:
     //   const render = @import("fluxion_ui_rhi");
     //
-    // All three of its dependencies are lazy, so a program that only lays out
-    // - or that brings its own renderer - fetches none of them.
+    // Its two dependencies of its own are lazy, so a program that only lays
+    // out - or that brings its own renderer - fetches neither.
     const rhi_dep = b.lazyDependency("fluxion_rhi", .{ .target = target, .optimize = optimize });
-    const font_for_render = b.lazyDependency("fluxion_font", .{ .target = target, .optimize = optimize });
     const shader_dep = b.lazyDependency("fluxion_shader", .{ .target = target, .optimize = optimize });
-    const have_renderer = rhi_dep != null and font_for_render != null and shader_dep != null;
+    const have_renderer = rhi_dep != null and shader_dep != null;
 
     // Declared whether or not the three have arrived, and handed them once
     // they have. On the first run after a clean checkout they have not: the
@@ -60,7 +67,7 @@ pub fn build(b: *std.Build) void {
     });
     if (have_renderer) {
         render_mod.addImport("fluxion_rhi", rhi_dep.?.module("fluxion_rhi"));
-        render_mod.addImport("fluxion_font", font_for_render.?.module("fluxion_font"));
+        render_mod.addImport("fluxion_font", typeface.module("fluxion_font"));
         render_mod.addImport("fluxion_shader", shader_dep.?.module("fluxion_shader"));
     }
 
@@ -152,7 +159,7 @@ pub fn build(b: *std.Build) void {
 
     // Already asked for above, and null on the first run after a clean
     // checkout while the build runner fetches it.
-    const font_dep = font_for_render;
+    const font_dep: ?*std.Build.Dependency = typeface;
 
     const platform_dep = b.lazyDependency("fluxion_platform", .{
         .target = target,
@@ -226,7 +233,7 @@ fn webRenderer(b: *std.Build, optimize: std.builtin.OptimizeMode) ?*std.Build.St
     const wasm = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const math = b.dependency("fluxion_math", .{ .target = wasm, .optimize = optimize });
     const rhi = b.lazyDependency("fluxion_rhi", .{ .target = wasm, .optimize = optimize });
-    const font = b.lazyDependency("fluxion_font", .{ .target = wasm, .optimize = optimize });
+    const font = b.dependency("fluxion_font", .{ .target = wasm, .optimize = optimize });
     const shader = b.lazyDependency("fluxion_shader", .{ .target = wasm, .optimize = optimize });
 
     const ui = b.createModule(.{
@@ -235,6 +242,7 @@ fn webRenderer(b: *std.Build, optimize: std.builtin.OptimizeMode) ?*std.Build.St
         .optimize = optimize,
         .imports = &.{
             .{ .name = "fluxion_math", .module = math.module("fluxion_math") },
+            .{ .name = "fluxion_font", .module = font.module("fluxion_font") },
         },
     });
     const render = b.createModule(.{
@@ -244,7 +252,7 @@ fn webRenderer(b: *std.Build, optimize: std.builtin.OptimizeMode) ?*std.Build.St
         .imports = &.{
             .{ .name = "fluxion_ui", .module = ui },
             .{ .name = "fluxion_rhi", .module = (rhi orelse return null).module("fluxion_rhi") },
-            .{ .name = "fluxion_font", .module = (font orelse return null).module("fluxion_font") },
+            .{ .name = "fluxion_font", .module = font.module("fluxion_font") },
             .{ .name = "fluxion_shader", .module = (shader orelse return null).module("fluxion_shader") },
         },
     });

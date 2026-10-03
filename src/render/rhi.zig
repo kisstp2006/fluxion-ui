@@ -81,15 +81,19 @@ pub const Instance = extern struct {
     /// weighs: (1, 0) across, (0, 1) down. Unread for anything else.
     fade: [4]f32 = @splat(0),
 
-    /// The three things one quad can be.
+    /// The four things one quad can be.
     pub const Kind = struct {
         /// A rectangle or a border: the rounded-box distance field, filled.
         pub const shape: f32 = 0;
-        /// A glyph: one channel of coverage out of the atlas, in `color`.
+        /// A glyph: its coverage - the atlas's alpha - in `color`. A colour
+        /// glyph drawn this way is its silhouette.
         pub const glyph: f32 = 1;
         /// A picture: all four channels of a texture, tinted by `color` and
         /// cut to the same rounded box a rectangle would be.
         pub const image: f32 = 2;
+        /// A colour glyph - an emoji - in its own colours, premultiplied in
+        /// the atlas, with only `color`'s alpha applied.
+        pub const color_glyph: f32 = 3;
     };
 };
 
@@ -144,6 +148,9 @@ pub const Renderer = struct {
     /// What a text command's `font` is an index into, the default first. The
     /// faces are borrowed; the table is this renderer's own. See `setFaces`.
     faces: std.ArrayList(*const font.Font),
+    /// The slots in `faces` a run falls back on, in order, for an emoji or a
+    /// character its own face has not got. See `setFallbacks`.
+    fallbacks: std.ArrayList(u16) = .empty,
 
     atlas: Atlas,
     atlas_texture: rhi.types.Texture,
@@ -197,9 +204,9 @@ pub const Renderer = struct {
         const atlas_texture = try device.createTexture(.{
             .width = atlas_size,
             .height = atlas_size,
-            // One byte a pixel: a glyph is coverage, not colour, and the
-            // colour comes from the instance.
-            .format = .r8_unorm,
+            // Four bytes a pixel: a letter is coverage in the alpha, drawn
+            // in the instance's colour, and an emoji is its own colours.
+            .format = .rgba8_unorm,
             .label = "fluxion-ui glyphs",
         });
         errdefer device.destroyTexture(atlas_texture);
@@ -349,6 +356,21 @@ pub const Renderer = struct {
         self.faces.appendSliceAssumeCapacity(faces);
     }
 
+    /// Which faces a run falls back on, as slots in the table `setFaces`
+    /// gave: tried in order for an emoji, and for a character the run's own
+    /// face has no glyph for. Usually the system's emoji fonts. See Fluxion
+    /// Font's `fallback` for which one wins.
+    pub fn setFallbacks(self: *Renderer, slots: []const u16) Allocator.Error!void {
+        self.fallbacks.clearRetainingCapacity();
+        try self.fallbacks.appendSlice(self.gpa, slots);
+    }
+
+    /// How colour glyphs are drawn: for a font that keeps them as pictures,
+    /// what decodes a PNG. See `font.ColorOptions`.
+    pub fn setColorOptions(self: *Renderer, options: font.ColorOptions) void {
+        self.atlas.color = options;
+    }
+
     /// Forget the glyphs drawn in one face, so they are rasterised again from
     /// whatever that face is now.
     ///
@@ -388,6 +410,7 @@ pub const Renderer = struct {
         self.device.destroyTexture(self.atlas_texture);
         self.atlas.deinit();
         self.faces.deinit(self.gpa);
+        self.fallbacks.deinit(self.gpa);
         self.instances.deinit(self.gpa);
         self.batches.deinit(self.gpa);
         self.clips.deinit(self.gpa);
@@ -438,7 +461,7 @@ pub const Renderer = struct {
         try self.build(commands, size);
 
         if (self.atlas.dirty) {
-            try self.device.updateTexture(self.atlas_texture, self.atlas.pixels, self.atlas.width);
+            try self.device.updateTexture(self.atlas_texture, self.atlas.pixels, self.atlas.width * 4);
             self.atlas.markClean();
         }
 
@@ -765,35 +788,62 @@ pub const Renderer = struct {
         return value - @floor(value);
     }
 
+    /// The most faces a run falls back on.
+    const max_fallbacks = 7;
+
     /// One instance per glyph of a line.
     fn addText(self: *Renderer, command: ui.RenderCommand, run: ui.commands.Text) Error!void {
-        // Everything below is the run's own face: the scale, the baseline,
-        // which glyph a character is, the kerning, and the glyphs themselves.
+        // The run's own face sets the baseline; each glyph comes from
+        // whichever face draws it - its own, or a fallback - with that face's
+        // scale and kerning.
         const slot = self.slotFor(run.font) orelse return;
         const face = self.faces.items[slot];
 
+        var chain: [1 + max_fallbacks]*const font.Font = undefined;
+        var chain_slots: [1 + max_fallbacks]u16 = undefined;
+        chain[0] = face;
+        chain_slots[0] = slot;
+        var links: usize = 1;
+        for (self.fallbacks.items) |fallback| {
+            if (links == chain.len) break;
+            if (fallback == slot or fallback >= self.faces.items.len) continue;
+            chain[links] = self.faces.items[fallback];
+            chain_slots[links] = fallback;
+            links += 1;
+        }
+
         const turn = turnOf(command.transform);
         const size: u16 = run.font_size;
-        const scale = face.scaleFor(@floatFromInt(size));
 
         // The command's box is the line; the baseline is one ascent down it.
         const baseline = command.bounding_box.y + face.at(@floatFromInt(size)).ascent();
         var pen = command.bounding_box.x;
-        var previous: ?u16 = null;
+        var previous: ?font.fallback.Placed = null;
 
         const em: f32 = @floatFromInt(size);
+        // Effects count characters - an emoji sequence is one - from the
+        // start of the whole run.
         var at: u32 = run.first;
+        var cluster: ?u32 = null;
 
-        var letters = (std.unicode.Utf8View.init(run.text) catch return).iterator();
-        while (letters.nextCodepoint()) |codepoint| {
-            const index = face.glyphFor(codepoint);
+        var glyphs: font.fallback.Glyphs = .init(chain[0..links], run.text);
+        while (glyphs.next()) |placed| {
+            const glyph_face = chain[placed.face];
             if (previous) |left| {
-                pen += @as(f32, @floatFromInt(face.kern(left, index) catch 0)) * scale;
+                if (left.face == placed.face) {
+                    pen += @as(f32, @floatFromInt(glyph_face.kern(left.glyph, placed.glyph) catch 0)) * glyph_face.scaleFor(em);
+                }
             }
-            previous = index;
-            defer at += 1;
+            previous = placed;
+            if (cluster) |start| {
+                if (start != placed.start) at += 1;
+            }
+            cluster = placed.start;
 
-            const entry = try self.atlas.glyph(face, slot, index, size);
+            const entry = try self.atlas.glyph(glyph_face, chain_slots[placed.face], placed.glyph, size);
+            // A colour glyph is drawn in its own colours, unless the run is a
+            // shadow, which is every glyph's shape in one colour.
+            const colored = entry.colored and !run.silhouette;
             if (entry.isBlank()) {
                 pen += entry.advance;
                 continue;
@@ -811,7 +861,7 @@ pub const Renderer = struct {
             };
 
             if (run.effects.len == 0) {
-                try self.addGlyph(box, .{ entry.u0, entry.v0, entry.u1, entry.v1 }, turn.motion, turn.origin, run.color, run.outline);
+                try self.addGlyph(box, .{ entry.u0, entry.v0, entry.u1, entry.v1 }, turn.motion, turn.origin, run.color, run.outline, colored);
                 continue;
             }
 
@@ -849,7 +899,7 @@ pub const Renderer = struct {
             };
             const both = turnOf(glyph.then(command.transform));
 
-            try self.addGlyph(box, .{ entry.u0, entry.v0, entry.u1, entry.v1 }, both.motion, both.origin, colour, run.outline);
+            try self.addGlyph(box, .{ entry.u0, entry.v0, entry.u1, entry.v1 }, both.motion, both.origin, colour, run.outline, colored);
         }
     }
 
@@ -861,6 +911,9 @@ pub const Renderer = struct {
         origin: [2]f32,
         color: ui.Color,
         outline: ?ui.TextOutline,
+        /// An emoji in its own colours: only `color`'s alpha reaches it, and
+        /// its outline is drawn around its silhouette.
+        colored: bool,
     ) Allocator.Error!void {
         if (outline) |stroke| {
             if (stroke.width > 0 and !stroke.color.invisible()) {
@@ -874,11 +927,16 @@ pub const Renderer = struct {
                     var shifted = box;
                     shifted[0] += offset[0];
                     shifted[1] += offset[1];
-                    try self.instances.append(self.gpa, glyphInstance(shifted, uv, motion, origin, stroke.color));
+                    try self.instances.append(self.gpa, glyphInstance(shifted, uv, motion, origin, stroke.color, Instance.Kind.glyph));
                 }
             }
         }
-        try self.instances.append(self.gpa, glyphInstance(box, uv, motion, origin, color));
+        if (colored) {
+            const alpha: ui.Color = .{ .r = 1, .g = 1, .b = 1, .a = color.a };
+            try self.instances.append(self.gpa, glyphInstance(box, uv, motion, origin, alpha, Instance.Kind.color_glyph));
+        } else {
+            try self.instances.append(self.gpa, glyphInstance(box, uv, motion, origin, color, Instance.Kind.glyph));
+        }
     }
 
     fn addNineSlice(
@@ -963,6 +1021,7 @@ fn glyphInstance(
     motion: [4]f32,
     origin: [2]f32,
     color: ui.Color,
+    kind: f32,
 ) Instance {
     return .{
         .rect = box,
@@ -971,7 +1030,7 @@ fn glyphInstance(
         .uv = uv,
         .motion = motion,
         .border = 0,
-        .textured = Instance.Kind.glyph,
+        .textured = kind,
         .origin = origin,
     };
 }
@@ -1257,6 +1316,42 @@ test "a text outline is drawn behind the glyph" {
     try testing.expectEqual(ui.Color.black.array(), instances[0].color);
     try testing.expectEqual(ui.Color.white.array(), instances[8].color);
     try testing.expect(instances[0].rect[0] < instances[8].rect[0]);
+}
+
+test "an emoji is drawn from the fallback face in its own colours, and its shadow is its shape" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(testing.io, "C:/Windows/Fonts/seguiemj.ttf", testing.allocator, .limited(64 << 20)) catch return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const emoji_face: font.Font = try .init(bytes);
+
+    try fixture.renderer.setFaces(&.{ &fixture.face, &emoji_face });
+    try fixture.renderer.setFallbacks(&.{1});
+
+    const half_red: ui.Color = .{ .r = 1, .g = 0, .b = 0, .a = 0.5 };
+    try fixture.renderer.build(&.{
+        .{
+            .bounding_box = .init(20, 30, 200, 20),
+            .config = .{ .text = .{ .text = "A😀", .color = half_red, .font_size = 16 } },
+        },
+        .{
+            .bounding_box = .init(20, 60, 200, 20),
+            .config = .{ .text = .{ .text = "😀", .color = .black, .font_size = 16, .silhouette = true } },
+        },
+    }, page);
+
+    const instances = fixture.renderer.instances.items;
+    try testing.expectEqual(@as(usize, 3), instances.len);
+    // The letter in the run's colour, from the run's own face.
+    try testing.expectEqual(Instance.Kind.glyph, instances[0].textured);
+    try testing.expectEqual(half_red.array(), instances[0].color);
+    // The emoji in its own colours, with only the run's alpha, after it.
+    try testing.expectEqual(Instance.Kind.color_glyph, instances[1].textured);
+    try testing.expectEqual([4]f32{ 1, 1, 1, 0.5 }, instances[1].color);
+    try testing.expect(instances[1].rect[0] > instances[0].rect[0]);
+    // A shadow is the emoji's shape in the shadow's colour.
+    try testing.expectEqual(Instance.Kind.glyph, instances[2].textured);
+    try testing.expectEqual(ui.Color.black.array(), instances[2].color);
 }
 
 test "a space moves the pen and adds no instance" {

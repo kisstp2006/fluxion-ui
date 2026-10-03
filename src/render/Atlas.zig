@@ -2,6 +2,12 @@
 
 //! Every glyph the program has drawn, in one texture.
 //!
+//! **Four bytes a pixel.** A letter is coverage, kept in the alpha with
+//! white beside it, and is drawn in the colour of its text; an emoji is a
+//! picture, kept in its own colours - premultiplied, so a filtered sample at
+//! its edge blends towards nothing rather than towards black - and is drawn
+//! as it is. `Entry.colored` says which.
+//!
 //! A renderer cannot upload a glyph per draw call: a paragraph is a few
 //! hundred of them, and a texture switch between each would be a few hundred
 //! draw calls for one line of prose. So each glyph is rasterised once, packed
@@ -59,6 +65,9 @@ pub const Entry = struct {
     top: i32,
     /// How far the pen moves afterwards.
     advance: f32,
+    /// A picture in its own colours rather than coverage. See the top of
+    /// the file.
+    colored: bool = false,
 
     /// Whether there is anything to draw. A space has an advance and no
     /// picture, and a renderer that does not check draws a zero-sized quad
@@ -84,8 +93,11 @@ pub const Key = struct {
 const padding: u32 = 1;
 
 gpa: Allocator,
-/// Coverage, one byte a pixel. Uploaded as `r8_unorm`.
+/// Four bytes a pixel, uploaded as `rgba8_unorm`. See the top of the file.
 pixels: []u8,
+/// How a glyph with a colour form is drawn - and, for a font of pictures,
+/// what decodes them. Without a decoder such a glyph draws as its shape.
+color: font.ColorOptions = .{},
 width: u32,
 height: u32,
 
@@ -101,7 +113,7 @@ entries: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
 dirty: bool = false,
 
 pub fn init(gpa: Allocator, width: u32, height: u32) Allocator.Error!Atlas {
-    const pixels = try gpa.alloc(u8, width * height);
+    const pixels = try gpa.alloc(u8, width * height * 4);
     @memset(pixels, 0);
     return .{ .gpa = gpa, .pixels = pixels, .width = width, .height = height };
 }
@@ -125,18 +137,61 @@ pub fn glyph(self: *Atlas, face: *const font.Font, slot: u16, index: u16, size: 
     const key: Key = .{ .face = slot, .glyph = index, .size = size };
     if (self.entries.get(key)) |found| return found;
 
+    if (face.hasColor(index)) {
+        // A colour form that will not draw - a picture the decoder refuses -
+        // leaves the glyph its shape.
+        const drawn = face.renderColor(self.gpa, index, @floatFromInt(size), self.color) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        if (drawn) |found| {
+            var picture = found;
+            defer picture.deinit(self.gpa);
+            const entry = try self.place(.{
+                .pixels = picture.pixels,
+                .width = picture.width,
+                .height = picture.height,
+                .left = picture.left,
+                .top = picture.top,
+                .advance = picture.advance,
+                .colored = true,
+            });
+            try self.entries.put(self.gpa, key, entry);
+            return entry;
+        }
+    }
+
     var rendered = try face.render(self.gpa, index, face.scaleFor(@floatFromInt(size)));
     defer rendered.deinit(self.gpa);
 
-    const entry = try self.place(rendered);
+    const entry = try self.place(.{
+        .pixels = rendered.bitmap.pixels,
+        .width = rendered.bitmap.width,
+        .height = rendered.bitmap.height,
+        .left = rendered.left,
+        .top = rendered.top,
+        .advance = rendered.advance,
+        .colored = false,
+    });
     try self.entries.put(self.gpa, key, entry);
     return entry;
 }
 
+/// A glyph drawn, either way: coverage a byte a pixel, or straight RGBA.
+const Drawn = struct {
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    left: i32,
+    top: i32,
+    advance: f32,
+    colored: bool,
+};
+
 /// Find room for a rasterised glyph and copy it in.
-fn place(self: *Atlas, rendered: font.Font.Rendered) Error!Entry {
-    const w = rendered.bitmap.width;
-    const h = rendered.bitmap.height;
+fn place(self: *Atlas, rendered: Drawn) Error!Entry {
+    const w = rendered.width;
+    const h = rendered.height;
 
     // A space, or anything else with an advance and no picture. It still
     // needs an entry - the advance is on it - but it takes no room.
@@ -151,6 +206,7 @@ fn place(self: *Atlas, rendered: font.Font.Rendered) Error!Entry {
             .left = rendered.left,
             .top = rendered.top,
             .advance = rendered.advance,
+            .colored = rendered.colored,
         };
     }
 
@@ -168,9 +224,23 @@ fn place(self: *Atlas, rendered: font.Font.Rendered) Error!Entry {
     const y = self.pen_y;
 
     for (0..h) |row| {
-        const source = rendered.bitmap.row(@intCast(row));
-        const target = self.pixels[(y + row) * self.width + x ..][0..w];
-        @memcpy(target, source);
+        const target = self.pixels[((y + row) * self.width + x) * 4 ..][0 .. w * 4];
+        if (rendered.colored) {
+            const source = rendered.pixels[row * w * 4 ..][0 .. w * 4];
+            for (0..w) |column| {
+                const px = source[column * 4 ..][0..4];
+                const a: u32 = px[3];
+                target[column * 4 ..][0..4].* = .{
+                    @intCast((@as(u32, px[0]) * a + 127) / 255),
+                    @intCast((@as(u32, px[1]) * a + 127) / 255),
+                    @intCast((@as(u32, px[2]) * a + 127) / 255),
+                    px[3],
+                };
+            }
+        } else {
+            const source = rendered.pixels[row * w ..][0..w];
+            for (source, 0..) |cover, column| target[column * 4 ..][0..4].* = .{ 255, 255, 255, cover };
+        }
     }
 
     self.pen_x += w + padding;
@@ -189,6 +259,7 @@ fn place(self: *Atlas, rendered: font.Font.Rendered) Error!Entry {
         .left = rendered.left,
         .top = rendered.top,
         .advance = rendered.advance,
+        .colored = rendered.colored,
     };
 }
 
@@ -379,7 +450,7 @@ test "the pixels of a glyph actually reach the atlas" {
     const y0: u32 = @intFromFloat(entry.v0 * @as(f32, @floatFromInt(atlas.height)));
     for (0..entry.height) |row| {
         for (0..entry.width) |column| {
-            if (atlas.pixels[(y0 + row) * atlas.width + x0 + column] > 128) ink += 1;
+            if (atlas.pixels[((y0 + row) * atlas.width + x0 + column) * 4 + 3] > 128) ink += 1;
         }
     }
     try testing.expect(ink > 10);

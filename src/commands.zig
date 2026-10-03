@@ -95,6 +95,9 @@ pub const Text = struct {
     /// one".
     font: u16 = 0,
     outline: ?text_mod.Outline = null,
+    /// Draw every glyph as its shape in `color`, a colour emoji too: what a
+    /// shadow is, which is the run again in one colour behind it.
+    silhouette: bool = false,
 
     /// What moves, tints or hides the glyphs of this run, and how many
     /// characters into the whole run its first glyph is.

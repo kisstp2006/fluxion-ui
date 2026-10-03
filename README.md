@@ -1234,7 +1234,7 @@ three things a UI draws are the same thing:
 | --- | --- |
 | A rectangle | A rounded box, filled. |
 | A border | A rounded box with a smaller one cut out of it. |
-| A glyph | A rectangle whose alpha comes from the atlas. |
+| A glyph | A rectangle whose alpha comes from the atlas - or, for an emoji, its colours too. |
 
 So there is one pipeline, one shader, one texture and one buffer, and the only
 thing that breaks a batch is a scissor rectangle - which an interface changes
@@ -1247,9 +1247,12 @@ clamped to zero and one is a one-pixel antialiased edge that needs no
 multisampling and no extra geometry. A border is the same field twice, with
 the inner one subtracted.
 
-Glyphs live in one `r8_unorm` atlas, packed on shelves and keyed by face, glyph
-*and* size together - the same letter at 12 pixels and at 13 is two different
-pictures, and there is no scaling one into the other that does not look wrong.
+Glyphs live in one `rgba8_unorm` atlas, packed on shelves and keyed by face,
+glyph *and* size together - the same letter at 12 pixels and at 13 is two
+different pictures, and there is no scaling one into the other that does not
+look wrong. A letter is its coverage in the alpha, drawn in its run's colour;
+an emoji is its own colours, premultiplied so its filtered edge fades to
+nothing, with only the run's alpha on it.
 An atlas that fills up is emptied and the frame built again, so glyphs at sizes
 nothing draws any more cannot run it out of room for good.
 
@@ -1266,8 +1269,26 @@ keeps its pointer, so it says so with `renderer.forgetFace(slot)`. The measurer
 the layout used has to measure each run in the same face - the same table in
 the same order - or lines break where the text is not.
 
-Both dependencies are lazy. A program that only lays out, or that brings its
-own renderer, fetches neither.
+**Emoji.** Faces to fall back on are slots in the same table:
+
+```zig
+try renderer.setFaces(&.{ &interface_face, &emoji_face });
+try renderer.setFallbacks(&.{1});
+renderer.setColorOptions(.{ .decode_png = decodePng });   // for a font of pictures
+```
+
+Each run is walked a cluster at a time - an emoji sequence is one - and an
+emoji, or a character the run's face lacks, is drawn from the first fallback
+that has it, with the font's own substitutions putting a family or a flag
+together: Fluxion Font's `fallback` decides, and a measurer that wants the
+widths to match calls its `fallback.measure` over the same faces. A shadow is
+the run again with `silhouette` set, which draws an emoji as its shape. In a
+text input an emoji sequence is one character: the caret never stops inside
+one, and a backspace takes all of it.
+
+fluxion-rhi and fluxion-shader are lazy. A program that only lays out, or that
+brings its own renderer, fetches neither; fluxion-font it always fetches, for
+where an emoji's characters end.
 
 **Every backend is proved on a GPU.** The shader is written once, in
 [Fluxion Shader](https://github.com/kisstp2006/fluxion-shader), which writes it

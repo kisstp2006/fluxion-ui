@@ -32,6 +32,8 @@
 const std = @import("std");
 const testing = std.testing;
 
+const emoji = @import("fluxion_font").emoji;
+
 const Color = @import("color.zig").Color;
 const geometry = @import("geometry.zig");
 const layout = @import("layout.zig");
@@ -233,30 +235,24 @@ pub const Range = struct {
 
 /// The offset of the next character after `at`, or the end.
 ///
+/// A character is what a reader sees as one: an emoji sequence - a heart
+/// with its selector, a thumb with its skin tone, a family, a flag - is one,
+/// so the caret never lands inside it and a backspace takes all of it. See
+/// Fluxion Font's `emoji`.
+///
 /// A malformed byte is stepped over one at a time rather than refused. A text
 /// input is where invalid UTF-8 arrives - a paste from somewhere else, a file
 /// read with the wrong assumption - and an editor that returns an error
 /// instead of letting the reader fix it is the less useful of the two.
 pub fn next(text: []const u8, at: usize) usize {
     if (at >= text.len) return text.len;
-    const length = std.unicode.utf8ByteSequenceLength(text[at]) catch 1;
-    return @min(at + length, text.len);
+    return emoji.clusterEnd(text, at);
 }
 
-/// The offset of the character before `at`, or zero.
+/// The offset of the character before `at`, or zero. See `next`.
 pub fn previous(text: []const u8, at: usize) usize {
     if (at == 0) return 0;
-    var i = @min(at, text.len);
-    // Back over the continuation bytes, which all start `10`. At most three
-    // of them, and the bound is what stops a run of stray continuation bytes
-    // walking to the front of the string.
-    var steps: usize = 0;
-    while (i > 0 and steps < 4) {
-        i -= 1;
-        steps += 1;
-        if (text[i] & 0xC0 != 0x80) break;
-    }
-    return i;
+    return emoji.clusterStart(text, @min(at, text.len));
 }
 
 /// How many characters a string is, which is what a length limit counts.
@@ -1283,9 +1279,23 @@ test "walking UTF-8 goes by character, not by byte" {
 test "a stray continuation byte does not walk off the front" {
     // Invalid UTF-8 is what a paste from somewhere else looks like, and an
     // editor that panics on it is worse than one that shows mojibake.
+    // Each stray byte is a character of its own, either way.
     const broken = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80 };
-    try testing.expectEqual(@as(usize, 2), previous(&broken, 6));
+    try testing.expectEqual(@as(usize, 5), previous(&broken, 6));
+    try testing.expectEqual(@as(usize, 0), previous(&broken, 1));
     try testing.expectEqual(@as(usize, 1), next(&broken, 0));
+}
+
+test "an emoji sequence is one character to the caret" {
+    const text = "a❤️👨‍👩‍👧b";
+    const heart = 1;
+    const family = heart + "❤️".len;
+    const b = family + "👨‍👩‍👧".len;
+    try testing.expectEqual(@as(usize, family), next(text, heart));
+    try testing.expectEqual(@as(usize, b), next(text, family));
+    try testing.expectEqual(@as(usize, family), previous(text, b));
+    try testing.expectEqual(@as(usize, heart), previous(text, family));
+    try testing.expectEqual(@as(usize, 4), characters(text));
 }
 
 test "word boundaries are Ply's three, and they are three for a reason" {

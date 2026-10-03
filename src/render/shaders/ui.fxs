@@ -48,8 +48,13 @@ vertex {
 }
 
 fragment {
-    if (v_textured > 0.5 && v_textured < 1.5) {
-        target = vec4(v_color.rgb, v_color.a * sample(u_atlas, v_uv).r);
+    if (v_textured > 2.5) {
+        // An emoji: premultiplied in the atlas, so a filtered edge fades to
+        // nothing; divided back out for the straight-alpha blend.
+        vec4 texel = sample(u_atlas, v_uv);
+        target = vec4(texel.rgb / max(texel.a, 0.0001), texel.a * v_color.a);
+    } else if (v_textured > 0.5 && v_textured < 1.5) {
+        target = vec4(v_color.rgb, v_color.a * sample(u_atlas, v_uv).a);
     } else {
         float outer = roundedBox(v_local, v_half, v_radii);
         float alpha = clamp(0.5 - outer, 0.0, 1.0);

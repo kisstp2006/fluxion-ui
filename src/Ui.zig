@@ -2427,6 +2427,7 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
                 run.style.color,
                 &.{},
                 0,
+                false,
             );
         } else {
             try self.emitSpanned(
@@ -2459,6 +2460,7 @@ fn emitText(self: *Ui, index: u32, box: BoundingBox) Error!void {
             ink,
             &.{},
             0,
+            false,
         );
     }
 }
@@ -2521,6 +2523,7 @@ fn emitSpanned(
                 },
                 effects,
                 along,
+                true,
             );
         }
 
@@ -2532,6 +2535,7 @@ fn emitSpanned(
             span.colorOver(style.color),
             effects,
             along,
+            false,
         );
     }
 }
@@ -2545,6 +2549,8 @@ fn emitPiece(
     ink: Color,
     effects: []const markup_mod.Effect,
     first: u32,
+    /// A shadow: see `commands.Text.silhouette`.
+    silhouette: bool,
 ) Error!void {
     const shown = self.inked(ink);
     if (piece.len == 0 or shown.invisible()) return;
@@ -2565,6 +2571,7 @@ fn emitPiece(
             .outline = outline,
             .effects = effects,
             .first = first,
+            .silhouette = silhouette,
         } },
     });
 }
@@ -3069,6 +3076,7 @@ fn emitField(self: *Ui, index: u32, box: BoundingBox) Error!void {
                     style.color,
                     &.{},
                     0,
+                    false,
                 );
             } else {
                 try self.emitSpanned(

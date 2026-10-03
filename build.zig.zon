@@ -14,13 +14,13 @@
             .hash = "fluxion_math-0.1.0-dfpZBeNUBAAwUMriLKaOTRBWGFmfY53_jyYuMUxkPYek",
         },
 
-        // What one example measures and draws text with. Lazy, and named
-        // here rather than imported by the library: a layout asks how wide a
-        // run of text is and does not care who answers - see `text.Measurer`.
+        // Where one emoji's characters end - where a caret stops in a text
+        // input - and what the renderer draws text with. A layout still asks
+        // how wide a run of text is and does not care who answers - see
+        // `text.Measurer`.
         .fluxion_font = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-font#f666e62f498e5bfe04361c7f1bf6531334a51dbf",
-            .hash = "fluxion_font-0.1.0-f3pT4rn1AwBbbEom4emICxRn1vGPQvsRhUc0_lCawLB8",
-            .lazy = true,
+            .url = "git+https://github.com/kisstp2006/fluxion-font#d77cb3e41a1796a650fff4c30c49f06d42a20d85",
+            .hash = "fluxion_font-0.1.0-f3pT4ramBQCNGu9qtEhIzdiA66dzjcY88RD7BQPxCrGR",
         },
 
         // What the optional `fluxion_ui_rhi` module draws with. Lazy for the
