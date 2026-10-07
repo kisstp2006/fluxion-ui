@@ -113,9 +113,25 @@ pub fn build(b: *std.Build) void {
     // which accepts every call and draws nothing, so the instances and the
     // scissor batches can be checked on a machine with no GPU.
     if (have_renderer) {
+        // The same module again, with the C library on Linux, for the tests
+        // alone. The system's Vulkan is opened with its `dlopen`; without
+        // it the device fails to open and the pixel tests pass over Vulkan
+        // as if the machine had no GPU. The module consumers import is as
+        // it was.
         const render_tests = b.addTest(.{
             .name = "fluxion-ui-rhi-tests",
-            .root_module = render_mod,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/render/rhi.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = if (target.result.os.tag == .linux) true else null,
+                .imports = &.{
+                    .{ .name = "fluxion_ui", .module = mod },
+                    .{ .name = "fluxion_rhi", .module = rhi_dep.?.module("fluxion_rhi") },
+                    .{ .name = "fluxion_font", .module = typeface.module("fluxion_font") },
+                    .{ .name = "fluxion_shader", .module = shader_dep.?.module("fluxion_shader") },
+                },
+            }),
         });
         test_step.dependOn(&b.addRunArtifact(render_tests).step);
 

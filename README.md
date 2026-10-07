@@ -1312,6 +1312,11 @@ they run wherever the backend does, and pass over one this machine does not
 have. The OpenGL one opens a hidden window and skips where there is no
 display.
 
+On Linux, Vulkan is opened with the C library's `dlopen`, so the tests link
+it; a program that draws with Vulkan there links it too (`.link_libc =
+true`). Without it the device does not open, and the tests would pass over
+Vulkan as if there were no GPU.
+
 ```bash
 zig build example-window                     # OpenGL
 zig build example-window -- --backend d3d11  # Direct3D 11
