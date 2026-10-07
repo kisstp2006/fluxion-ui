@@ -71,6 +71,27 @@ pub fn build(b: *std.Build) void {
         render_mod.addImport("fluxion_shader", shader_dep.?.module("fluxion_shader"));
     }
 
+    // -------------------------------------------------------------------
+    // The CPU renderer
+    // -------------------------------------------------------------------
+
+    // A third module: the same picture as `fluxion_ui_rhi`, drawn on the
+    // CPU into a buffer of pixels. Consumers do:
+    //   const raster = @import("fluxion_ui_raster");
+    //
+    // Nothing lazy about it. It needs the font, which the library fetches
+    // anyway, and no GPU - which is the whole point of it: a shared-memory
+    // window, a framebuffer on a machine with no driver, a test.
+    const raster_mod = b.addModule("fluxion_ui_raster", .{
+        .root_source_file = b.path("src/render/raster.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "fluxion_ui", .module = mod },
+            .{ .name = "fluxion_font", .module = typeface.module("fluxion_font") },
+        },
+    });
+
     // zig build test
     const tests = b.addTest(.{
         .name = "fluxion-ui-tests",
@@ -79,6 +100,14 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the library test suite");
     test_step.dependOn(&run_tests.step);
+
+    // The CPU renderer's tests draw into buffers and read the pixels back,
+    // so they run everywhere - no GPU, no window, no display.
+    const raster_tests = b.addTest(.{
+        .name = "fluxion-ui-raster-tests",
+        .root_module = raster_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(raster_tests).step);
 
     // The renderer carries its own, and they run against the `none` backend -
     // which accepts every call and draws nothing, so the instances and the

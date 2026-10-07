@@ -61,6 +61,22 @@ pub const Rectangle = struct {
     corner_radius: CornerRadius = .sharp,
 };
 
+/// A soft shadow: the rounded box of the bounding box, blurred by `blur`.
+///
+/// The bounding box is the shape *before* the blur - the shadow reaches
+/// about `blur` past it, and a renderer draws that far out. It comes before
+/// the fill of the element casting it, and nothing of it is meant to show
+/// inside that element: `caster` is the element's own box, to cut out.
+pub const Shadow = struct {
+    color: Color,
+    /// CSS's blur radius: twice the deviation of the blur, in pixels.
+    blur: f32,
+    corner_radius: CornerRadius = .sharp,
+    /// The element that casts it, and its corners: where the shadow is not.
+    caster: BoundingBox = .zero,
+    caster_radius: CornerRadius = .sharp,
+};
+
 /// A line around the edge of the bounding box.
 ///
 /// Separate from `Rectangle` rather than a field on it, because the two are
@@ -152,6 +168,7 @@ pub const Config = union(enum) {
     /// Lay this out but draw nothing. A spacer, or an element whose fill is
     /// fully transparent.
     none,
+    shadow: Shadow,
     rectangle: Rectangle,
     border: Border,
     text: Text,
@@ -201,6 +218,7 @@ pub const RenderCommand = struct {
         return switch (self.config) {
             .none => false,
             .scissor_start, .scissor_end => true,
+            .shadow => |s| !self.bounding_box.empty() and !s.color.invisible(),
             .rectangle => |r| !self.bounding_box.empty() and !r.color.invisible(),
             .border => |b| !self.bounding_box.empty() and !b.color.invisible() and !b.width.isNone(),
             .text => |t| !t.color.invisible() and t.text.len > 0,

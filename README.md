@@ -1325,6 +1325,70 @@ for it checks the one thing a machine without a browser can: that WebGL is
 given a shader in a language it reads. Without one the renderer is refused at
 `init`, and the page stays blank.
 
+## The CPU renderer
+
+A second ready-made consumer of the command list, beside the GPU one:
+`fluxion_ui_raster` draws the same frame on the CPU, into a buffer of
+pixels. No device, no window, no driver.
+
+```zig
+const raster = @import("fluxion_ui_raster");
+
+var renderer: raster.Renderer = try .init(gpa, &face);
+defer renderer.deinit();
+
+const pixels = try gpa.alloc(raster.Pixel, 1280 * 720);
+try renderer.draw(.init(pixels, 1280, 720), try ui.end(), .hex(0x14161A));
+```
+
+**The pixels are premultiplied, alpha in the top byte** - `0xAARRGGBB` as a
+`u32`, which little-endian is B, G, R, A in memory. That is Wayland's
+`argb8888` and a Linux framebuffer's `xrgb8888`, so a shared-memory window
+or a framebuffer takes the buffer as it is; `toRgba` turns it into straight
+RGBA bytes for a PNG.
+
+It is for the places a GPU is absent or absurd: a panel or a menu handed to
+a compositor in shared memory, a machine whose kernel has a framebuffer and
+no driver, and tests - a frame drawn here is the same bytes on every machine
+and in every build mode, so a picture can be compared with the last one
+exactly. A `Target` can carry a `region`, and then nothing outside it is
+touched: what a window repaints when only its clock changed.
+
+It draws the same picture as the GPU renderer - the rounded box is the same
+distance field with the same one-pixel edge, and the animated text and the
+nine-slice arithmetic are shared code, in `render/common.zig` - and differs
+where a CPU can do better:
+
+| | GPU renderer | CPU renderer |
+| --- | --- | --- |
+| **Glyphs** | filtered into place at any fraction of a pixel | rasterised at a quarter-pixel phase, the baseline on a whole pixel |
+| **Borders** | the widest side all round, inside the box | each side its own width, and `inside`, `middle` and `outside` honoured |
+| **Letter spacing** | not drawn | drawn, once a character, as the measurer counts it |
+| **A taller line** | text at the top of its line | half the difference above, as CSS's half-leading |
+| **Shadows** | a stack of faint boxes | the exact soft edge, cut out under the element |
+
+## Shadows
+
+An element can cast a soft shadow - its own rounded shape, moved, grown and
+blurred:
+
+```zig
+ui.open(.{
+    .id = "menu",
+    .background_color = .hex(0x2C2C2C),
+    .corner_radius = .all(8),
+    .shadow = .{ .color = .black.withAlpha(0.3), .blur = 28, .offset = .{ .x = 0, .y = 14 } },
+    .floating = .{ .anchor = .below },
+});
+```
+
+It comes out as a `shadow` command just before the element's fill, so it
+sits under the element and over whatever was drawn before it - which is what
+lets a floating menu cast one on the page beneath it. **It is drawn outside
+the element only**, as CSS's `box-shadow` is, so a translucent surface does
+not show its own shadow through itself. The blur, the offset and the spread
+are lengths, and `scale` multiplies them like every other.
+
 ## Colour
 
 Four floats from zero to one, which is what a GPU takes. Ply keeps the same
@@ -1381,7 +1445,7 @@ than from memory.
 | **Sizing** | `fit`, `grow` with weights, `fixed`, `percent`, `ratio`, with minima and maxima |
 | **Layout** | direction, padding, gaps, alignment on both axes, `contain` and `cover`, wrapping |
 | **The surface** | a scale that multiplies every length in the tree, and a safe area that keeps the root off the edges of a television |
-| **Painting** | background colours, corner radii, borders on any side with three positions, z-index |
+| **Painting** | background colours, corner radii, borders on any side with three positions, soft shadows, z-index |
 | **Images** | a texture number, a source rectangle for sheets, a tint, and the same rounded box a rectangle gets |
 | **Custom boxes** | laid out as any element and handed back by number, for the program to draw in between the renderer's passes |
 | **Rotation** | of an element and its children or of its own box alone, with a pivot and flips, nesting, and a hit test that follows |
@@ -1399,6 +1463,7 @@ than from memory.
 | **Checking a layout** | `spills`: whatever the last frame drew outside its parent on an axis it does not scroll, a float kept on screen that is not, and a line wider than its box |
 | **Text input** | selection, the four deletions, word movement, undo and redo, click, double click and drag, password, multiline, markup, and the caret's place for an input method |
 | **A renderer** | optional, over Fluxion RHI: one instanced draw a frame, an SDF for the shapes, a glyph atlas for the text, and a pass that can draw over a scene rather than instead of it |
+| **A CPU renderer** | optional, into a buffer of premultiplied pixels: the same picture, no GPU, the same bytes on every machine |
 
 ### Only in Ply
 

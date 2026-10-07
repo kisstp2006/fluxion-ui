@@ -334,6 +334,8 @@ pub const Declaration = struct {
     gradient: ?Gradient = null,
     corner_radius: CornerRadius = .sharp,
     border: ?Border = null,
+    /// A soft shadow under it. See `Shadow`.
+    shadow: ?Shadow = null,
 
     /// What happens to content larger than this element. See `Clip`.
     clip: Clip = .none,
@@ -461,6 +463,7 @@ pub const Declaration = struct {
         out.corner_radius = self.corner_radius.scaled(by);
         out.clip = self.clip.scaled(by);
         if (self.border) |line| out.border = line.scaled(by);
+        if (self.shadow) |shade| out.shadow = shade.scaled(by);
         if (self.floating) |float| out.floating = float.scaled(by);
         if (self.image) |picture| out.image = picture.scaled(by);
         return out;
@@ -529,6 +532,42 @@ pub const Surface = struct {
 
 const Color = @import("color.zig").Color;
 const CornerRadius = geometry.CornerRadius;
+
+/// A soft shadow under an element: its own shape, moved, grown and blurred,
+/// in one colour.
+///
+/// CSS's `box-shadow`, the outer kind: **it is drawn outside the element
+/// only**, so a translucent surface - a menu of frosted glass - does not
+/// show its own shadow through itself. It is painted before the element's
+/// background, in the element's place in the list, so it sits under the
+/// element and over whatever was drawn before it - which is what lets a
+/// floating menu cast a shadow on the page beneath it.
+///
+/// ```zig
+/// .shadow = .{ .color = .black.withAlpha(0.2), .blur = 24, .offset = .{ .x = 0, .y = 8 } },
+/// ```
+pub const Shadow = struct {
+    color: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0.25 },
+    /// How soft the edge is, in pixels: CSS's blur radius, which is twice
+    /// the deviation of the blur. The shadow fades out over about this far
+    /// either side of where its edge would be.
+    blur: f32 = 8,
+    /// Where it falls, from under the element. Down is the usual: light
+    /// from above.
+    offset: geometry.Vec2 = .{ .x = 0, .y = 0 },
+    /// How much larger than the element the shape is before it is blurred.
+    spread: f32 = 0,
+
+    /// Every length multiplied by an interface scale. See `Surface.scale`.
+    pub fn scaled(self: Shadow, by: f32) Shadow {
+        return .{
+            .color = self.color,
+            .blur = self.blur * by,
+            .offset = .{ .x = self.offset.x * by, .y = self.offset.y * by },
+            .spread = self.spread * by,
+        };
+    }
+};
 
 /// A fill from one colour to another in a straight line: from the element's
 /// `background_color` at its left or top edge to `to` at its right or bottom.

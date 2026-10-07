@@ -117,6 +117,7 @@ const Element = struct {
     gradient: ?layout.Gradient = null,
     corner_radius: CornerRadius,
     border: ?layout.Border,
+    shadow: ?layout.Shadow = null,
     z_index: i16,
     /// An aspect ratio the resolved box is held to once the layout has run.
     /// See `layout.SlotFit`.
@@ -1125,6 +1126,7 @@ fn openChecked(self: *Ui, raw: layout.Declaration) Error!void {
         .gradient = declaration.gradient,
         .corner_radius = declaration.corner_radius,
         .border = declaration.border,
+        .shadow = declaration.shadow,
         .z_index = declaration.z_index,
         .slot_fit = declaration.slotFit(),
         .clip = self.remembered(declaration, id),
@@ -2857,6 +2859,7 @@ fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
     const element = self.elements.items[index];
     if (box.empty()) return;
 
+    if (element.shadow) |shade| try self.emitShadow(element, box, shade);
     try self.emitFill(element, box);
 
     // What the program draws itself goes over the fill, as a picture does.
@@ -2866,6 +2869,41 @@ fn emitBackground(self: *Ui, index: u32, box: BoundingBox) Error!void {
         .z_index = element.z_index,
         .transform = self.stamp,
         .config = .{ .custom = .{ .data = data, .tint = self.inked(.white) } },
+    });
+}
+
+/// The shadow under an element, before its fill: the element's box moved by
+/// the offset and grown by the spread, its corners grown with it.
+fn emitShadow(self: *Ui, element: Element, box: BoundingBox, shade: layout.Shadow) Error!void {
+    const colour = self.inked(shade.color);
+    if (colour.invisible()) return;
+
+    const grown: BoundingBox = .init(
+        box.x + shade.offset.x - shade.spread,
+        box.y + shade.offset.y - shade.spread,
+        box.width + 2 * shade.spread,
+        box.height + 2 * shade.spread,
+    );
+    if (grown.empty()) return;
+
+    // A corner grows with the spread, as CSS's does - but a square one stays
+    // square, or a spread would round every box it touched.
+    const own = element.corner_radius.clampTo(box.width, box.height);
+    var radii = own.array();
+    for (&radii) |*r| r.* = if (r.* > 0) @max(0, r.* + shade.spread) else 0;
+
+    try self.output.append(self.gpa, .{
+        .bounding_box = grown,
+        .id = element.id,
+        .z_index = element.z_index,
+        .transform = self.stamp,
+        .config = .{ .shadow = .{
+            .color = colour,
+            .blur = shade.blur,
+            .corner_radius = .corners(radii[0], radii[1], radii[2], radii[3]),
+            .caster = box,
+            .caster_radius = own,
+        } },
     });
 }
 
@@ -13065,4 +13103,45 @@ test "the default repeat is twelve steps in a second and a fifth" {
         if (ui.focus != before) steps += 1;
     }
     try testing.expectEqual(@as(usize, 12), steps);
+}
+
+test "a shadow comes out before the fill it is under, moved and grown" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.init(200, 200));
+    ui.open(.{});
+    ui.empty(.{
+        .width = .fixed(50),
+        .height = .fixed(40),
+        .background_color = .white,
+        .corner_radius = .all(4),
+        .shadow = .{ .blur = 10, .offset = .{ .x = 0, .y = 6 }, .spread = 2 },
+    });
+    ui.close();
+    const out = try ui.end();
+
+    try testing.expectEqual(@as(usize, 2), out.len);
+    const shade = out[0].config.shadow;
+    try testing.expectEqual(std.meta.Tag(commands.Config).rectangle, std.meta.activeTag(out[1].config));
+    // Moved down by the offset, grown by the spread on every side.
+    try testing.expectEqual(BoundingBox.init(-2, 4, 54, 44), out[0].bounding_box);
+    // Its corners grow with it; the caster is the element as it stands.
+    try testing.expectEqual(@as(f32, 6), shade.corner_radius.top_left);
+    try testing.expectEqual(BoundingBox.init(0, 0, 50, 40), shade.caster);
+    try testing.expectEqual(@as(f32, 4), shade.caster_radius.top_left);
+}
+
+test "a shadow scales with the interface" {
+    var ui: Ui = .init(testing.allocator);
+    defer ui.deinit();
+
+    ui.begin(.{ .size = .init(400, 400), .scale = 2 });
+    ui.open(.{});
+    ui.empty(.{ .width = .fixed(10), .height = .fixed(10), .shadow = .{ .blur = 4, .offset = .{ .x = 1, .y = 2 } } });
+    ui.close();
+    const out = try ui.end();
+
+    try testing.expectEqual(@as(f32, 8), out[0].config.shadow.blur);
+    try testing.expectEqual(BoundingBox.init(2, 4, 20, 20), out[0].bounding_box);
 }
