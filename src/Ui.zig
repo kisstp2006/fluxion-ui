@@ -2062,7 +2062,7 @@ fn shrink(self: *Ui, children: []const u32, x_axis: bool, excess_in: f32) Error!
         // of the parent.
         if (wanted.kind == .fixed and wanted.min >= wanted.max) continue;
         if (wanted.kind == .percent) continue;
-        if (child.dimensions.onAxis(x_axis) <= floorOf(child, x_axis)) continue;
+        if (atFloor(child, x_axis)) continue;
         try self.resizable.append(self.gpa, child_index);
     }
 
@@ -2110,7 +2110,7 @@ fn retireAtFloor(self: *Ui, x_axis: bool) void {
     var kept: usize = 0;
     for (self.resizable.items) |child_index| {
         const child = self.elements.items[child_index];
-        if (child.dimensions.onAxis(x_axis) <= floorOf(child, x_axis)) continue;
+        if (atFloor(child, x_axis)) continue;
         self.resizable.items[kept] = child_index;
         kept += 1;
     }
@@ -2121,6 +2121,14 @@ fn retireAtFloor(self: *Ui, x_axis: bool) void {
 /// content needs, whichever is larger.
 fn floorOf(element: Element, x_axis: bool) f32 {
     return @max(element.config.sizing.onAxis(x_axis).min, element.min_dimensions.onAxis(x_axis));
+}
+
+/// Whether an element has nothing to give: at its floor, or above it by no
+/// more than rounding. One a hair above it would otherwise be taken as the
+/// largest to shrink, give up the hair, and stop the pass with nothing taken
+/// from the others.
+fn atFloor(element: Element, x_axis: bool) bool {
+    return element.dimensions.onAxis(x_axis) <= floorOf(element, x_axis) + epsilon;
 }
 
 inline fn setSize(element: *Element, x_axis: bool, size: f32) void {
@@ -6406,6 +6414,44 @@ test "a paragraph can be shrunk below its longest word, which then breaks where 
     try testing.expectEqual(@as(usize, 5), texts.len);
     try testing.expectEqualStrings("enorm", texts[1].config.text.text);
     try testing.expectEqualStrings("ously", texts[2].config.text.text);
+    var none: [4]Spill = undefined;
+    try testing.expectEqual(@as(usize, 0), ui.spills(&none).len);
+}
+
+test "a row too narrow for its tabs shrinks them, though one stands at its least" {
+    // Tabs: the first keeps its whole title as its least, the others may be
+    // cut down to about a character. The first's width, worked out from its
+    // text, may sit a rounding error above that least; it has nothing to
+    // give all the same, and the others still give way.
+    var ui = withText(testing.allocator);
+    defer ui.deinit();
+    var title = sixteen;
+    title.wrap = .none;
+    var whole: f32 = 0;
+    for (0..2) |frame| {
+        ui.begin(.init(800, 600));
+        openRoot(&ui);
+        {
+            // Wide enough at first for the first tab's whole title.
+            ui.open(.{ .id = "row", .width = .fixed(if (frame == 0) 800 else 240), .height = .fixed(30), .gap = 2 });
+            defer ui.close();
+            inline for (.{ "first", "second", "third" }, 0..) |name, n| {
+                const least: f32 = if (n == 0 and frame == 1) whole - 0.0001 else 0;
+                ui.open(.{ .id = name, .width = .fitWith(.{ .min = least }), .height = .grow, .padding = .xy(10, 0) });
+                defer ui.close();
+                // The first the widest, as the one in front may be.
+                ui.text(if (n == 0) "the title of a tab" else "a tab", title);
+            }
+        }
+        ui.close();
+        _ = try ui.end();
+        whole = ui.boxOf("first").?.width;
+    }
+
+    const first = ui.boxOf("first").?;
+    const third = ui.boxOf("third").?;
+    try testing.expect(first.width > 100);
+    try testing.expectApproxEqAbs(@as(f32, 240), third.x + third.width, 0.01);
     var none: [4]Spill = undefined;
     try testing.expectEqual(@as(usize, 0), ui.spills(&none).len);
 }
