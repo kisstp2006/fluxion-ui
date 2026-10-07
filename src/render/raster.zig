@@ -27,25 +27,20 @@
 //! format, so the common destinations take the buffer as it is. `toRgba`
 //! turns it into straight RGBA bytes for a PNG.
 //!
-//! What it shares with the GPU renderer is everything that is a decision
-//! rather than a way of drawing: the rounded box is the same distance field
-//! with the same one-pixel edge, a gradient runs the same way, the animated
-//! text is `common.move`, a nine-slice is cut by `common`'s arithmetic. What
-//! it does differently, it does because a CPU can:
+//! It draws what the GPU renderer draws, decision for decision: the rounded
+//! box is the same distance field with the same one-pixel edge, a gradient
+//! runs the same way, a border has four widths and a position - a field
+//! underlined in its accent colour is a border on its bottom side only, and
+//! it follows the rounded corners up and thins out the way a stroke on a
+//! curve does - letter spacing is drawn as the measurer counted it, a line
+//! taller than its font centres the text in it, a shadow is the box's soft
+//! edge cut out under its caster, the animated text is `common.move`, and a
+//! nine-slice is cut by `common`'s arithmetic.
 //!
-//!   * **Glyphs land on quarter pixels** and the baseline on a whole one,
-//!     rather than being filtered into place - see `Glyphs`.
-//!   * **A border has four widths and a position.** The GPU renderer draws
-//!     the widest side all round, inside the box; here the left, right, top
-//!     and bottom are what was asked for, and `outside` and `middle` are
-//!     honoured. A field underlined in its accent colour is a border on its
-//!     bottom side only, and it follows the rounded corners up and thins out
-//!     the way a stroke on a curve does.
-//!   * **Letter spacing is drawn**, as the measurer counted it: once after
-//!     every character.
-//!   * **A line height centres the text in the line.** A run with a
-//!     `line_height` taller than its font puts half the difference above
-//!     the text, as CSS does, so a label in a button sits in its middle.
+//! The one thing it does differently, it does because a CPU can: **glyphs
+//! land on quarter pixels**, each phase rasterised from the outline, rather
+//! than being filtered into place from one picture in an atlas - see
+//! `Glyphs`.
 
 const std = @import("std");
 const testing = std.testing;

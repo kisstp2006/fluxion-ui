@@ -1225,16 +1225,17 @@ try renderer.draw(.{ .surface = surface }, size, try ui.end(), .hex(0x14161A));
 try device.present(surface);
 ```
 
-**One instanced draw for the whole frame.** Every rectangle, every border and
-every glyph is the same unit quad under a different set of per-instance
+**One instanced draw for the whole frame.** Every rectangle, every border,
+every glyph and every shadow is the same unit quad under a different set of per-instance
 numbers, and the fragment shader decides what it is looking at - because the
-three things a UI draws are the same thing:
+things a UI draws are the same thing:
 
 | | What it is |
 | --- | --- |
 | A rectangle | A rounded box, filled. |
-| A border | A rounded box with a smaller one cut out of it. |
+| A border | A rounded box with a smaller one cut out of it, each side as wide as it was asked to be. |
 | A glyph | A rectangle whose alpha comes from the atlas - or, for an emoji, its colours too. |
+| A shadow | A rounded box with its edge softened, and the element casting it cut out. |
 
 So there is one pipeline, one shader, one texture and one buffer, and the only
 thing that breaks a batch is a scissor rectangle - which an interface changes
@@ -1354,18 +1355,21 @@ and in every build mode, so a picture can be compared with the last one
 exactly. A `Target` can carry a `region`, and then nothing outside it is
 touched: what a window repaints when only its clock changed.
 
-It draws the same picture as the GPU renderer - the rounded box is the same
-distance field with the same one-pixel edge, and the animated text and the
-nine-slice arithmetic are shared code, in `render/common.zig` - and differs
-where a CPU can do better:
+It draws the same picture as the GPU renderer, and the two agree on every
+decision: the rounded box is the same distance field with the same
+one-pixel edge; a border has each side's own width and sits `inside`,
+`middle` or `outside`; letter spacing is drawn once a character, as the
+measurer counts it; a line taller than its font puts half the difference
+above the text, as CSS's half-leading does, on a baseline at a whole pixel;
+a shadow is the box's soft edge, cut out under the element that casts it.
+The animated text and the nine-slice arithmetic are shared code, in
+`render/common.zig`.
 
-| | GPU renderer | CPU renderer |
-| --- | --- | --- |
-| **Glyphs** | filtered into place at any fraction of a pixel | rasterised at a quarter-pixel phase, the baseline on a whole pixel |
-| **Borders** | the widest side all round, inside the box | each side its own width, and `inside`, `middle` and `outside` honoured |
-| **Letter spacing** | not drawn | drawn, once a character, as the measurer counts it |
-| **A taller line** | text at the top of its line | half the difference above, as CSS's half-leading |
-| **Shadows** | a stack of faint boxes | the exact soft edge, cut out under the element |
+Where they differ is in how a glyph reaches a fraction of a pixel. The GPU
+renderer draws each glyph once into its atlas and lets the texture filter
+put it where the pen is; the CPU renderer draws it again for each quarter of
+a pixel, so the shape is where the pen is rather than a blur of it - which a
+CPU can afford and a one-texture atlas cannot.
 
 ## Shadows
 

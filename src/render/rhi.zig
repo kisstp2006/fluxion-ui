@@ -9,11 +9,14 @@
 //! full of interface is one draw call, and adding a thousand more boxes to it
 //! is still one.
 //!
-//! That works because the three things a UI draws are the same thing:
+//! That works because the things a UI draws are the same thing:
 //!
 //!   * A **rectangle** is a rounded box, filled.
-//!   * A **border** is a rounded box with a smaller rounded box cut out of it.
+//!   * A **border** is a rounded box with a smaller rounded box cut out of it,
+//!     each side as wide as it was asked to be.
 //!   * A **glyph** is a rectangle whose alpha comes from the atlas.
+//!   * A **shadow** is a rounded box with its edge softened, and the box of
+//!     the element casting it cut out.
 //!
 //! So there is one pipeline, one shader, one texture and one buffer, and the
 //! only thing that breaks a batch is a scissor rectangle - which a UI changes
@@ -59,8 +62,10 @@ pub const Instance = extern struct {
     color: [4]f32,
     /// Top-left, top-right, bottom-right, bottom-left.
     radii: [4]f32,
-    /// The corners of the glyph in the atlas. All zero for anything that is
-    /// not text.
+    /// The corners of the glyph in the atlas, for text and pictures. For a
+    /// shape, which way it fades. For a shadow, the box of the element that
+    /// casts it - its middle relative to the quad's middle, and its half
+    /// size - which it is not drawn under.
     uv: [4]f32,
     /// Where the quad ends up, if something turned it: the two axes of the
     /// motion, as (x.x, x.y, y.x, y.y). The identity for almost everything.
@@ -71,7 +76,8 @@ pub const Instance = extern struct {
     /// rigid motion cannot stretch either.
     motion: [4]f32,
 
-    /// How thick the border is, in pixels. Zero fills the whole box.
+    /// Non-zero for a border, whose widths are in `fade`; zero fills the
+    /// whole box. For a shadow, the deviation of its blur.
     border: f32,
     /// What the fragment shader is looking at: `Kind`, as a float because
     /// that is what a vertex attribute is. A number rather than three
@@ -82,10 +88,11 @@ pub const Instance = extern struct {
     /// so the three of them are one `float4` attribute rather than two.
     origin: [2]f32,
     /// The colour a shape fades to, along the corner coordinate its `uv`
-    /// weighs: (1, 0) across, (0, 1) down. Unread for anything else.
+    /// weighs: (1, 0) across, (0, 1) down. For a border, its four widths -
+    /// left, top, right, bottom. For a shadow, its caster's corner radii.
     fade: [4]f32 = @splat(0),
 
-    /// The four things one quad can be.
+    /// The five things one quad can be.
     pub const Kind = struct {
         /// A rectangle or a border: the rounded-box distance field, filled.
         pub const shape: f32 = 0;
@@ -98,6 +105,9 @@ pub const Instance = extern struct {
         /// A colour glyph - an emoji - in its own colours, premultiplied in
         /// the atlas, with only `color`'s alpha applied.
         pub const color_glyph: f32 = 3;
+        /// A shadow: the rounded box's distance field through a soft edge,
+        /// cut out under its caster.
+        pub const shadow: f32 = 4;
     };
 };
 
@@ -595,21 +605,7 @@ pub const Renderer = struct {
                     .fade = if (fill.gradient) |g| g.to.array() else fill.color.array(),
                 }),
                 .shadow => |shade| try self.addShadow(command.bounding_box, shade, turn.motion, turn.origin),
-                .border => |line| try self.instances.append(self.gpa, .{
-                    .rect = boxArray(command.bounding_box),
-                    .color = line.color.array(),
-                    .radii = line.corner_radius.array(),
-                    .uv = @splat(0),
-                    // One width for all four sides. Four different ones would
-                    // need four quads, and no interface has ever asked.
-                    .motion = turn.motion,
-                    .border = @floatFromInt(@max(
-                        @max(line.width.left, line.width.right),
-                        @max(line.width.top, line.width.bottom),
-                    )),
-                    .textured = Instance.Kind.shape,
-                    .origin = turn.origin,
-                }),
+                .border => |line| try self.instances.append(self.gpa, borderInstance(command.bounding_box, line, turn.motion, turn.origin)),
                 .text => |run| {
                     if (bound != null and !std.meta.eql(bound.?, self.atlas_texture)) {
                         try self.closeBatch(&batch_start, scissor, bound);
@@ -724,7 +720,18 @@ pub const Renderer = struct {
         const size: u16 = run.font_size;
 
         // The command's box is the line; the baseline is one ascent down it.
-        const baseline = command.bounding_box.y + face.at(@floatFromInt(size)).ascent();
+        // A line taller than the font puts half the difference above the
+        // text, as CSS's half-leading does, so a label sits in the middle of
+        // its line. The baseline goes on a whole pixel: a horizontal stem
+        // between two rows is two grey ones.
+        const metrics = face.at(@floatFromInt(size));
+        var top = command.bounding_box.y;
+        if (run.line_height > 0) {
+            top += (@as(f32, @floatFromInt(run.line_height)) - (metrics.ascent() - metrics.descent())) / 2;
+        }
+        const baseline = @round(top + metrics.ascent());
+        // Once after every character, as the measurer counts it.
+        const spacing: f32 = @floatFromInt(run.letter_spacing);
         var pen = command.bounding_box.x;
         var previous: ?font.fallback.Placed = null;
 
@@ -744,7 +751,10 @@ pub const Renderer = struct {
             }
             previous = placed;
             if (cluster) |start| {
-                if (start != placed.start) at += 1;
+                if (start != placed.start) {
+                    at += 1;
+                    pen += spacing;
+                }
             }
             cluster = placed.start;
 
@@ -830,39 +840,12 @@ pub const Renderer = struct {
         }
     }
 
-    /// A shadow as a stack of rounded boxes, each a little larger than the
-    /// last and each faint, so together they fade from the full colour at
-    /// half a blur inside the edge to nothing at half a blur outside it.
-    ///
-    /// The one shader has no soft edge, and a stack needs none. It is an
-    /// approximation of the blur the CPU renderer draws exactly, and unlike
-    /// that one it is not cut out under the element casting it - which an
-    /// opaque element hides, and only a translucent one shows.
+    /// A shadow as one quad, three blur deviations larger than its box all
+    /// round, which the fragment shader fills with the box's soft edge and
+    /// leaves empty under the element casting it.
     fn addShadow(self: *Renderer, box: ui.BoundingBox, shade: ui.commands.Shadow, motion: [4]f32, origin: [2]f32) Allocator.Error!void {
-        const layers = 8;
-        // Each layer's alpha, so that all of them together come to the
-        // shadow's: 1 - (1 - each)^layers = alpha.
-        const each = 1 - std.math.pow(f32, 1 - std.math.clamp(shade.color.a, 0, 1), 1.0 / @as(f32, layers));
-        const radii = shade.corner_radius.array();
-        for (0..layers) |i| {
-            const t = (@as(f32, @floatFromInt(i)) + 0.5) / layers;
-            const grow = (t - 0.5) * shade.blur;
-            const w = box.width + 2 * grow;
-            const h = box.height + 2 * grow;
-            if (w <= 0 or h <= 0) continue;
-            var r: [4]f32 = undefined;
-            for (radii, &r) |from, *to| to.* = std.math.clamp(from + grow, 0, @min(w, h) / 2);
-            try self.instances.append(self.gpa, .{
-                .rect = .{ box.x - grow, box.y - grow, w, h },
-                .color = shade.color.withAlpha(each).array(),
-                .radii = r,
-                .uv = @splat(0),
-                .motion = motion,
-                .border = 0,
-                .textured = Instance.Kind.shape,
-                .origin = origin,
-            });
-        }
+        if (box.width <= 0 or box.height <= 0) return;
+        try self.instances.append(self.gpa, shadowInstance(box, shade, motion, origin));
     }
 
     fn addNineSlice(
@@ -940,6 +923,73 @@ pub const Renderer = struct {
         self.instance_capacity = capacity;
     }
 };
+
+/// A border's quad: its box grown by how far the line reaches outside it -
+/// none inside, half its width in the middle, all of it outside - and its
+/// four widths for the shader to cut the hole with.
+fn borderInstance(box: ui.BoundingBox, line: ui.commands.Border, motion: [4]f32, origin: [2]f32) Instance {
+    const left: f32 = @floatFromInt(line.width.left);
+    const right: f32 = @floatFromInt(line.width.right);
+    const top: f32 = @floatFromInt(line.width.top);
+    const bottom: f32 = @floatFromInt(line.width.bottom);
+    const reach: f32 = switch (line.position) {
+        .inside => 0,
+        .middle => 0.5,
+        .outside => 1,
+    };
+    const grow = @max(@max(left, right), @max(top, bottom)) * reach;
+    var radii = line.corner_radius.array();
+    if (grow > 0) {
+        for (&radii) |*r| r.* = if (r.* > 0) r.* + grow else 0;
+    }
+    return .{
+        .rect = .{
+            box.x - left * reach,
+            box.y - top * reach,
+            box.width + (left + right) * reach,
+            box.height + (top + bottom) * reach,
+        },
+        .color = line.color.array(),
+        .radii = radii,
+        .uv = @splat(0),
+        .motion = motion,
+        .border = @max(@max(left, right), @max(top, bottom)),
+        .textured = Instance.Kind.shape,
+        .origin = origin,
+        .fade = .{ left, top, right, bottom },
+    };
+}
+
+/// A shadow's quad. See `Renderer.addShadow`.
+fn shadowInstance(box: ui.BoundingBox, shade: ui.commands.Shadow, motion: [4]f32, origin: [2]f32) Instance {
+    const sigma = @max(shade.blur / 2, 0.01);
+    const reach = sigma * 3;
+    var radii = shade.corner_radius.array();
+    for (&radii) |*r| r.* = @min(r.*, @min(box.width, box.height) / 2);
+
+    // The caster's middle relative to the quad's, which is the box's, and
+    // its half size; a caster with no area cuts nothing out.
+    const caster = shade.caster;
+    const has_caster = caster.width > 0 and caster.height > 0;
+    const middle_x = box.x + box.width / 2;
+    const middle_y = box.y + box.height / 2;
+    return .{
+        .rect = .{ box.x - reach, box.y - reach, box.width + 2 * reach, box.height + 2 * reach },
+        .color = shade.color.array(),
+        .radii = radii,
+        .uv = if (has_caster) .{
+            caster.x + caster.width / 2 - middle_x,
+            caster.y + caster.height / 2 - middle_y,
+            caster.width / 2,
+            caster.height / 2,
+        } else @splat(0),
+        .motion = motion,
+        .border = sigma,
+        .textured = Instance.Kind.shadow,
+        .origin = origin,
+        .fade = if (has_caster) shade.caster_radius.array() else @splat(0),
+    };
+}
 
 fn glyphInstance(
     box: [4]f32,
@@ -1038,6 +1088,10 @@ fn systemFont(gpa: Allocator) !?[]u8 {
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        // Where Fedora keeps its fonts: DejaVu, and Inter, which a Fedora
+        // desktop has when it has nothing else.
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/rsms-inter-fonts/Inter-Regular.ttf",
     });
 }
 
@@ -1155,6 +1209,126 @@ test "a border becomes the same quad with a width on it" {
     // whole difference between a border and a filled box.
     try testing.expectEqual(@as(f32, 3), instances[0].border);
     try testing.expectEqual(@as(f32, 0), instances[0].textured);
+}
+
+test "a border on one side carries its four widths, for the shader to cut the hole with" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    // What a text field's accent line is: the bottom side only.
+    try fixture.renderer.build(&.{.{
+        .bounding_box = .init(10, 20, 100, 32),
+        .config = .{ .border = .{ .color = .white, .width = .{ .bottom = 2 }, .corner_radius = .all(4) } },
+    }}, page);
+
+    const instance = fixture.renderer.instances.items[0];
+    // Left, top, right, bottom - and inside, so the quad is the box.
+    try testing.expectEqual([4]f32{ 0, 0, 0, 2 }, instance.fade);
+    try testing.expectEqual([4]f32{ 10, 20, 100, 32 }, instance.rect);
+    try testing.expectEqual(@as(f32, 2), instance.border);
+    // No fade: a border's widths must not be read as a gradient.
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, instance.uv);
+}
+
+test "a border outside its box, or across its edge, grows the quad by as much" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    try fixture.renderer.build(&.{
+        .{
+            .bounding_box = .init(10, 10, 50, 50),
+            .config = .{ .border = .{ .color = .white, .width = .all(4), .position = .outside, .corner_radius = .all(6) } },
+        },
+        .{
+            .bounding_box = .init(10, 10, 50, 50),
+            .config = .{ .border = .{ .color = .white, .width = .all(4), .position = .middle } },
+        },
+    }, page);
+
+    const outside = fixture.renderer.instances.items[0];
+    try testing.expectEqual([4]f32{ 6, 6, 58, 58 }, outside.rect);
+    // A rounded corner grows with it; the hole keeps the box's own.
+    try testing.expectEqual(@as(f32, 10), outside.radii[0]);
+    const middle = fixture.renderer.instances.items[1];
+    try testing.expectEqual([4]f32{ 8, 8, 54, 54 }, middle.rect);
+    // A square corner stays square.
+    try testing.expectEqual(@as(f32, 0), middle.radii[0]);
+}
+
+test "a shadow is one soft quad reaching three deviations past its box, with its caster" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    try fixture.renderer.build(&.{.{
+        .bounding_box = .init(100, 108, 200, 100),
+        .config = .{ .shadow = .{
+            .color = ui.Color.black.withAlpha(0.3),
+            .blur = 20,
+            .corner_radius = .all(8),
+            .caster = .init(100, 100, 200, 100),
+            .caster_radius = .all(8),
+        } },
+    }}, page);
+
+    const instances = fixture.renderer.instances.items;
+    try testing.expectEqual(1, instances.len);
+    const shadow = instances[0];
+    try testing.expectEqual(Instance.Kind.shadow, shadow.textured);
+    // A blur of 20 is a deviation of 10, and the quad reaches 30 past.
+    try testing.expectEqual(@as(f32, 10), shadow.border);
+    try testing.expectEqual([4]f32{ 70, 78, 260, 160 }, shadow.rect);
+    // The caster sits 8 above the shadow's middle, its half size beside.
+    try testing.expectEqual([4]f32{ 0, -8, 100, 50 }, shadow.uv);
+    try testing.expectEqual([4]f32{ 8, 8, 8, 8 }, shadow.fade);
+    try testing.expectApproxEqAbs(@as(f32, 0.3), shadow.color[3], 1e-6);
+}
+
+test "letter spacing moves every glyph after the first along" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const plain: ui.RenderCommand = .{
+        .bounding_box = .init(0, 0, 300, 20),
+        .config = .{ .text = .{ .text = "HHH", .color = .white, .font_size = 16 } },
+    };
+    var spaced = plain;
+    spaced.config.text.letter_spacing = 5;
+
+    try fixture.renderer.build(&.{plain}, page);
+    const before = try testing.allocator.dupe(Instance, fixture.renderer.instances.items);
+    defer testing.allocator.free(before);
+    try fixture.renderer.build(&.{spaced}, page);
+    const after = fixture.renderer.instances.items;
+
+    try testing.expectEqual(before.len, after.len);
+    for (before, after, 0..) |b, a, i| {
+        try testing.expectApproxEqAbs(b.rect[0] + 5 * @as(f32, @floatFromInt(i)), a.rect[0], 0.001);
+    }
+}
+
+test "a line taller than the font puts the text in its middle, on a whole-pixel baseline" {
+    const fixture = try Fixture.init(testing.allocator) orelse return error.SkipZigTest;
+    defer fixture.deinit(testing.allocator);
+
+    const tight: ui.RenderCommand = .{
+        .bounding_box = .init(0, 0.4, 300, 40),
+        .config = .{ .text = .{ .text = "H", .color = .white, .font_size = 16 } },
+    };
+    var tall = tight;
+    tall.config.text.line_height = 40;
+
+    try fixture.renderer.build(&.{tight}, page);
+    const top_tight = fixture.renderer.instances.items[0].rect[1];
+    try fixture.renderer.build(&.{tall}, page);
+    const top_tall = fixture.renderer.instances.items[0].rect[1];
+
+    const metrics = fixture.face.at(16);
+    const half_leading = (40 - (metrics.ascent() - metrics.descent())) / 2;
+    // Moved down by about half the spare height - by whole pixels, since
+    // each baseline is rounded - and each glyph's top on a whole pixel.
+    try testing.expect(@abs(top_tall - top_tight - half_leading) <= 1);
+    try testing.expectEqual(@round(top_tight), top_tight);
+    try testing.expectEqual(@round(top_tall), top_tall);
 }
 
 test "text becomes one instance per glyph, advancing along the line" {

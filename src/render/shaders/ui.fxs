@@ -16,6 +16,10 @@ varying vec4 v_radii;
 varying vec2 v_uv;
 varying float v_border;
 varying float v_textured;
+// Passed through as they are, for the kinds that use them: a border's four
+// widths, and a shadow's caster - its box and its corners.
+varying vec4 v_sides;
+varying vec4 v_caster;
 
 uniform Frame : 0 {
     vec4 u_viewport;
@@ -43,12 +47,29 @@ vertex {
     v_uv = mix(a_uv.xy, a_uv.zw, a_corner);
     v_border = a_params.x;
     v_textured = a_params.y;
+    v_sides = a_fade;
+    v_caster = a_uv;
     position = vec4(pixel.x / u_viewport.x * 2.0 - 1.0,
                     1.0 - pixel.y / u_viewport.y * 2.0, 0.0, 1.0);
 }
 
 fragment {
-    if (v_textured > 2.5) {
+    if (v_textured > 3.5) {
+        // A shadow: the box's distance through the curve a Gaussian blur
+        // gives a straight edge, the logistic one, within a percent of it.
+        // The quad reaches three sigmas past the box, which is where the
+        // curve has run out. Nothing is drawn under the caster, so a
+        // translucent element does not show its own shadow through itself.
+        float sigma = max(v_border, 0.01);
+        vec2 core = max(v_half - vec2(3.0 * sigma), vec2(0.0));
+        float d = roundedBox(v_local, core, v_radii);
+        float soft = 1.0 / (1.0 + exp(min(1.702 * d / sigma, 60.0)));
+        if (v_caster.z > 0.0) {
+            float caster = roundedBox(v_local - v_caster.xy, v_caster.zw, v_sides);
+            soft = soft * (1.0 - clamp(0.5 - caster, 0.0, 1.0));
+        }
+        target = vec4(v_color.rgb, v_color.a * soft);
+    } else if (v_textured > 2.5) {
         // An emoji: premultiplied in the atlas, so a filtered edge fades to
         // nothing; divided back out for the straight-alpha blend.
         vec4 texel = sample(u_atlas, v_uv);
@@ -63,8 +84,14 @@ fragment {
             target = vec4(texel.rgb * v_color.rgb, texel.a * v_color.a * alpha);
         } else {
             if (v_border > 0.0) {
-                vec4 inner_radii = max(v_radii - v_border, vec4(0.0));
-                float inner = roundedBox(v_local, max(v_half - v_border, vec2(0.0)), inner_radii);
+                // The hole is the box less each side's width - left, top,
+                // right, bottom - and its corners as much smaller as the
+                // wider of the two sides that meet there.
+                vec4 s = v_sides;
+                vec2 inner_half = max(v_half - vec2(s.x + s.z, s.y + s.w) * 0.5, vec2(0.0));
+                vec2 inner_centre = vec2(s.x - s.z, s.y - s.w) * 0.5;
+                vec4 inner_radii = max(v_radii - vec4(max(s.x, s.y), max(s.z, s.y), max(s.z, s.w), max(s.x, s.w)), vec4(0.0));
+                float inner = roundedBox(v_local - inner_centre, inner_half, inner_radii);
                 alpha *= clamp(0.5 + inner, 0.0, 1.0);
             }
             target = vec4(v_color.rgb, v_color.a * alpha);

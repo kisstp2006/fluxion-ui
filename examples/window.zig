@@ -949,6 +949,9 @@ fn systemFont(gpa: std.mem.Allocator) !?[]u8 {
         "C:/Windows/Fonts/consola.ttf",
         "C:/Windows/Fonts/arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        // Where Fedora keeps its fonts.
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/rsms-inter-fonts/Inter-Regular.ttf",
     };
     for (candidates) |path| {
         return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(32 << 20)) catch continue;
@@ -1381,6 +1384,101 @@ test "a turned box reaches the pixels turned" {
     // the bar would be if it had not turned.
     try testing.expect(channel(pixels, 10, 64, 0) < 50);
     try testing.expect(channel(pixels, 118, 64, 0) < 50);
+}
+
+/// One frame of `declare`, drawn by the GPU renderer through OpenGL into a
+/// 128-pixel texture and read back - or null where there is no display.
+fn drawnOnGl(declare: *const fn (*Ui) void) !?[]u8 {
+    const bytes = try systemFont(testing.allocator) orelse return null;
+    defer testing.allocator.free(bytes);
+
+    var window = Window.open(64, 64, false, true) catch |err|
+        if (Window.isAbsent(err)) return null else return err;
+    defer window.close();
+
+    var device: rhi.Device = rhi.Device.init(testing.allocator, .{ .gl = window.hooks() }) catch return null;
+    defer device.deinit();
+
+    const target = try device.createTexture(.{
+        .width = 128,
+        .height = 128,
+        .usage = .{ .sampled = true, .render_target = true },
+    });
+    defer device.destroyTexture(target);
+
+    var measured: Measured = .{ .face = try .init(bytes) };
+    var renderer: render.Renderer = try .init(testing.allocator, &device, &measured.face);
+    defer renderer.deinit();
+
+    const size: ui.Dimensions = .init(128, 128);
+    var layout: Ui = .init(testing.allocator);
+    defer layout.deinit();
+    layout.setMeasurer(measured.measurer());
+
+    layout.begin(.{ .size = size });
+    declare(&layout);
+    const commands = try layout.end();
+
+    try renderer.draw(.{ .texture = target }, size, commands, .black);
+    return try device.readTexture(target, testing.allocator);
+}
+
+fn red(pixels: []const u8, x: usize, y: usize) u8 {
+    return pixels[(y * 128 + x) * 4];
+}
+
+test "a border on one side reaches the pixels on that side only" {
+    // The shader's hole cut with four widths: a line along the bottom of a
+    // box - a text field's underline - and nothing along its other sides,
+    // which is what a hole cut with the widest width all round would draw.
+    const pixels = try drawnOnGl(struct {
+        fn declare(layout: *Ui) void {
+            layout.open(.{ .width = .grow, .height = .grow, .align_x = .center, .align_y = .center });
+            defer layout.close();
+            layout.empty(.{
+                .width = .fixed(100),
+                .height = .fixed(60),
+                .border = .{ .color = .hex(0xFF8000), .width = .{ .bottom = 4 } },
+            });
+        }
+    }.declare) orelse return error.SkipZigTest;
+    defer testing.allocator.free(pixels);
+
+    // The box is 14..114 across and 34..94 down.
+    try testing.expect(red(pixels, 64, 92) > 200);
+    try testing.expect(red(pixels, 20, 92) > 200);
+    try testing.expect(red(pixels, 64, 35) < 50);
+    try testing.expect(red(pixels, 15, 64) < 50);
+    try testing.expect(red(pixels, 112, 64) < 50);
+    try testing.expect(red(pixels, 64, 64) < 50);
+}
+
+test "a shadow reaches the pixels round its box and not under it" {
+    // The shader's soft shape: strong just past the box's edge, nothing far
+    // away - and nothing under the element casting it, which has no fill
+    // here, so whatever the shadow drew under it would show.
+    const pixels = try drawnOnGl(struct {
+        fn declare(layout: *Ui) void {
+            layout.open(.{ .width = .grow, .height = .grow, .align_x = .center, .align_y = .center });
+            defer layout.close();
+            layout.empty(.{
+                .width = .fixed(60),
+                .height = .fixed(60),
+                .shadow = .{ .color = .hex(0xFF8000), .blur = 16 },
+            });
+        }
+    }.declare) orelse return error.SkipZigTest;
+    defer testing.allocator.free(pixels);
+
+    // The box is 34..94 each way.
+    const near = red(pixels, 64, 97);
+    const further = red(pixels, 64, 106);
+    try testing.expect(near > 40);
+    try testing.expect(further < near);
+    try testing.expect(red(pixels, 2, 2) < 5);
+    // Under the box: cut out.
+    try testing.expect(red(pixels, 64, 64) < 5);
+    try testing.expect(red(pixels, 40, 40) < 5);
 }
 
 test "an interface can be drawn on top of a frame rather than instead of it" {

@@ -314,6 +314,9 @@ fn systemFont(gpa: Allocator) !?[]u8 {
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        // Where Fedora keeps its fonts.
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/rsms-inter-fonts/Inter-Regular.ttf",
     };
     for (candidates) |path| {
         return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(32 << 20)) catch continue;
