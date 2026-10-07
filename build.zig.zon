@@ -19,8 +19,8 @@
         // how wide a run of text is and does not care who answers - see
         // `text.Measurer`.
         .fluxion_font = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-font#d77cb3e41a1796a650fff4c30c49f06d42a20d85",
-            .hash = "fluxion_font-0.1.0-f3pT4ramBQCNGu9qtEhIzdiA66dzjcY88RD7BQPxCrGR",
+            .url = "git+https://github.com/kisstp2006/fluxion-font#4141fa02ac9d4bc2e5138cea549a665cf1c25ca3",
+            .hash = "fluxion_font-0.1.0-f3pT4p1IBgBifdRFxQxEIQSeIHWSZnkMxkIWw2rx-BU1",
         },
 
         // What the optional `fluxion_ui_rhi` module draws with. Lazy for the
